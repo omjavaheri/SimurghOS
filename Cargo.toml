@@ -1,0 +1,206 @@
+[workspace]
+resolver = "2"
+
+members = [
+    "elf-loader",
+    "hal/hal-manifest",
+    "machine-id-core",
+    "hal/hal-core",
+    "hal/hal-direct",
+    "hal/hal-x86_64",
+    "hal/hal-arm64",
+    "hal/hal-riscv64",
+    # لایه ۲ — میکروکرنل (02-Microkernel-Layer.md §7). این کریت‌ها با hal/*
+    # در یک باینری Privileged واحد لینک می‌شوند (REPO-Simurgh-OS.md §6).
+    "kernel/kernel-cap",
+    "kernel/kernel-mm",
+    "kernel/kernel-ipc",
+    "kernel/kernel-sched",
+    "kernel/kernel-core",
+    "kernel/kernel-arch-glue",
+    "kernel/kernel",
+    # قرارداد پیام مشترک لایه ۲↔۳ (03-Kernel-Subsystems-Layer.md §3).
+    "ipc-protocol",
+    # لایه ۳ — زیرسیستم‌های user-space (03-Kernel-Subsystems-Layer.md §4).
+    # هرکدام یک پروسه‌ی ایزوله است؛ فقط از طریق syscall/IPC صحبت می‌کند.
+    "subsystems/root-task",
+    "subsystems/device-manager",
+    "subsystems/drivers/driver-framework",
+    "subsystems/drivers/driver-virtio-blk",
+    "subsystems/drivers/driver-virtio-net",
+    "subsystems/drivers/driver-i8042",
+    "subsystems/drivers/driver-mouse",
+    "subsystems/drivers/driver-nvme",
+    "subsystems/vfs-service/vfs-router",
+    "subsystems/vfs-service/fs-native",
+    "subsystems/netstack",
+    "subsystems/compositor",
+    "subsystems/mm-service",
+    "subsystems/log-collector-native",
+    "subsystems/security-broker-intermediary",
+    "kernel-stub",
+    "uefi-bootloader",
+]
+
+# فقط کریت‌های معماری-مستقل در build پیش‌فرض (بدون --target) کامپایل می‌شوند.
+# hal-x86_64 / hal-arm64 / hal-riscv64 نیاز به target سفارشی no_std دارند
+# و اگر در default-members باشند، `cargo build` ساده روی هاست fail می‌شود.
+#
+# کریت‌های لایه ۲/۳ که منطق معماری‌مستقل و تست میزبان دارند اینجا هستند تا
+# `cargo test` ساده در ریشه‌ی workspace اجرایشان کند (طبق CONTRIBUTING.md §2).
+# kernel-arch-glue / kernel / subsystems/* که به target سفارشی یا فقط لینک
+# نهایی نیاز دارند، عمداً بیرون‌اند.
+default-members = [
+    "elf-loader",
+    "hal/hal-manifest",
+    "machine-id-core",
+    "hal/hal-core",
+    "hal/hal-direct",
+    "kernel/kernel-cap",
+    "kernel/kernel-mm",
+    "kernel/kernel-ipc",
+    "kernel/kernel-sched",
+    "kernel/kernel-core",
+    "ipc-protocol",
+]
+
+[workspace.package]
+edition      = "2021"
+version      = "0.1.0"
+authors      = ["Simurgh OS Project Contributors"]
+license      = "MPL-2.0"
+repository   = "https://github.com/omjavaheri/Simurgh-OS-Layer01-HAL"
+
+# نسخه‌ی مشترک وابستگی‌ها بین همه‌ی کریت‌های no_std لایه ۱
+[workspace.dependencies]
+bitflags = { version = "2", default-features = false }
+
+# panic=abort اجباری است: کد no_std این پروژه به unwinding runtime متکی نیست
+# (طبق سند لایه ۲، بخش ۱.۱ — این قاعده به لایه ۱ هم سرایت می‌کند چون هر دو
+# در همان باینری Privileged لینک می‌شوند)
+[profile.dev]
+panic = "abort"
+
+# `device-manager`'s `subsystem_entry` module compiles its process entry
+# point into `.user_text` (the U=1-mapped, isolated-process code range —
+# see `kernel-arch-glue::spawn_process`'s doc comment). Every function it
+# reaches must be inlined into that one compiled body: a call instruction
+# targeting anything outside `.user_text` (ordinary kernel `.text`, mapped
+# U=0) faults the instant U-mode tries to fetch from it. `#[inline(always)]`
+# is a strong hint, but at `opt-level = 0` (plain `[profile.dev]`) LLVM's
+# inliner is largely disabled and can still leave a real call in the
+# object code — verified via `llvm-objdump` when this was added: the
+# default dev profile emitted a genuine `auipc`+`jalr` "far call" into
+# kernel `.text` from `Supervised::on_crash`'s inlined-in-theory body,
+# which faulted on real hardware (QEMU); `-O2` on this ONE package (still
+# under an otherwise-unoptimized `cargo build`/`xbuild-*`, so the rest of
+# the dev workflow is unaffected) makes LLVM's real inliner run and fully
+# eliminates it.
+[profile.dev.package.device-manager]
+opt-level = 2
+
+# Same rationale class as `device-manager`'s own override above, a
+# DIFFERENT symptom: `kernel`'s own `umode_root` (riscv64) issues MANY
+# sequential `raw_syscall`/`raw_syscall2` calls across one long function
+# body (the whole boot-time demo sequence). At `opt-level = 0`, LLVM's
+# naive one-stack-slot-per-variable allocation can reuse a stale slot
+# across calls that are far apart in the SAME function once enough
+# other code exists in that function — confirmed via a diagnostic print
+# (kernel-arch-glue's `fs_ipc_call`/`fs_open_result`): adding new,
+# LATER `raw_syscall` calls to `umode_root` (03-Kernel-Subsystems-
+# Layer.md §5.1's own virtio-blk demo) silently corrupted the `path_id`
+# argument of an EARLIER `FS_OPEN` call (decoded a real, well-formed
+# `BadPath` response instead of the correct path), even though the new
+# calls are semantically unrelated and conditionally skipped at
+# runtime — the SAME "stack-slot reuse" bug class `raw_syscall`'s own
+# `#[inline(never)]` and the `zero!()` macro already exist to work
+# around for LITERAL arguments, just not fully covered by those alone
+# once the function grows large enough. `opt-level = 2` makes LLVM's
+# real register allocator run (proper liveness tracking, no naive
+# reuse) — `#[inline(never)]`/`#[link_section = ".user_text"]` are
+# explicit annotations LLVM honors at any optimization level, so this
+# does not reintroduce the FAR-CALL-fault class `device-manager`'s own
+# override exists for.
+[profile.dev.package.kernel]
+opt-level = 2
+
+# A separate, confirmed instance of the same "opt-level 0 miscompiles
+# this" class `kernel`'s own override above exists for — different
+# code shape, same root cause. `VirtioBlk::wait_for_completion`'s own
+# busy-poll (`subsystems/drivers/driver-virtio-blk/src/lib.rs`) is a
+# small, genuinely bounded `for _ in 0..MAX_SPINS` loop reading one
+# volatile `u16` through `self.queue_base` each iteration; at `opt-level
+# = 0` it never terminated even with `MAX_SPINS` set as low as 2,000
+# (confirmed by temporarily shrinking the bound and observing no
+# completion within the same wall-clock budget that, at `opt-level = 2`,
+# comfortably completes it) — `opt-level = 2` fixed it. Unrelated to the
+# ACTUAL virtio-mmio bug this driver also needed diagnosed and fixed
+# separately (this host's QEMU defaults `-device virtio-blk-device` to
+# the LEGACY virtio-mmio transport, which this driver's register map
+# does not speak — see `probe`'s own `VIRTIO_MMIO_VERSION_MODERN` check
+# and IMPLEMENTATION-PLAN.md's own note on the `-global virtio-mmio.
+# force-legacy=off` QEMU flag this driver requires).
+[profile.dev.package.driver-virtio-blk]
+opt-level = 2
+
+# Same rationale/root-cause class as `driver-virtio-blk`'s own override
+# directly above — a bounded busy-poll on a virtqueue's used ring
+# (`VirtioNet::poll_rx`/the TX completion wait in `submit_tx`,
+# `subsystems/drivers/driver-virtio-net/src/lib.rs`). Applied proactively
+# here rather than re-discovering the identical opt-level-0 miscompile via
+# a fresh QEMU debugging session, since it is the same code shape
+# (`for _ in 0..MAX_SPINS { read_volatile(...) }`) driver-virtio-blk's own
+# comment already documents in full.
+[profile.dev.package.driver-virtio-net]
+opt-level = 2
+
+# `kernel-arch-glue`'s own virtio-net spawn/demo code is one of the
+# largest additions to this crate to date (`spawn_virtio_net_driver` in
+# particular). Applied defensively, alongside the enlarged riscv64 boot
+# stack (`hal/hal-riscv64/src/linker.ld`'s own `__boot_stack_bottom`/
+# `__boot_stack_top` comment) — same "opt-level 0 is sensitive to
+# incidental code-shape changes once a function grows large enough" class
+# this project has hit repeatedly (see `kernel`'s own override comment
+# above). NOT independently confirmed to fix the specific intermittent
+# hang documented in `hal/hal-riscv64/src/linker.ld`'s own comment on its
+# own (see that comment for the full, honest investigation record —
+# neither this override nor the bigger stack, alone or together,
+# reliably reproduced a fix across repeated trials); kept because it is
+# real, harmless hardening in its own right, matching this crate's
+# now-larger call graph.
+[profile.dev.package.kernel-arch-glue]
+opt-level = 2
+
+# The interactive input->display path is optimized even in the dev
+# profile, for SPEED this time (every override above is a miscompile
+# workaround): the Compositor compares and presents an 800x600 frame on
+# every commit, and the two PS/2 drivers run once per input byte/packet.
+# Unoptimized, each of those loops runs 10-50x slower under QEMU TCG,
+# which made the desktop's mouse visibly lag (2026-09-24). Same shape as
+# `Simurgh-UI-Template01`'s own `[profile.dev.package.ui-core]`: a
+# per-package override keeps each ELF at the `debug/` path
+# `kernel/kernel/build.rs` embeds from, so no build step changes, and
+# assertions/overflow checks stay on. Only these packages' own code is
+# affected — the kernel's debug build and `core`/`alloc` from build-std
+# keep their profiles.
+[profile.dev.package.compositor]
+opt-level = 2
+debug-assertions = true
+overflow-checks = true
+
+[profile.dev.package.driver-i8042]
+opt-level = 2
+debug-assertions = true
+overflow-checks = true
+
+[profile.dev.package.driver-mouse]
+opt-level = 2
+debug-assertions = true
+overflow-checks = true
+
+[profile.release]
+panic         = "abort"
+lto           = true
+codegen-units = 1
+opt-level     = "z"      # اولویت با اندازه‌ی باینری بوت، نه سرعت کامپایل
+strip         = false    # دیباگ‌پذیری روی QEMU حفظ شود؛ برای ریلیز نهایی بعداً strip می‌کنیم

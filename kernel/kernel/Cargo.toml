@@ -1,0 +1,85 @@
+# ============================================================================
+# kernel  (binary: `kernel`)
+#
+# The real bootable microkernel image — the Phase-2 successor to
+# `kernel-stub`. It is the single `[[bin]]` that links hal-core + the whole
+# `kernel/*` stack into one privileged binary (REPO-Simurgh-OS.md §6). Like
+# `kernel-stub` it selects its `hal-<arch>` crate (for `_start` + the panic
+# handler + boot assembly + linker script) via a `target_arch`-keyed
+# dependency table, so `cargo xbuild-kernel-*` style invocations build it
+# for each architecture with no feature flags.
+#
+# `kernel-stub` is kept as-is for the pure 01-HAL-Layer.md §8 smoke test;
+# this crate is what exercises the real HAL→microkernel handoff
+# (02-Microkernel-Layer.md §8.1/§8.2).
+# ============================================================================
+[package]
+name        = "kernel"
+description = "Bootable Simurgh microkernel image (02-Microkernel-Layer.md §8) — links hal-core + kernel/* into one privileged binary"
+edition.workspace    = true
+version.workspace    = true
+authors.workspace    = true
+license.workspace    = true
+repository.workspace = true
+build = "build.rs"
+
+[[bin]]
+name = "kernel"
+path = "src/main.rs"
+# Bare-metal `#![no_std] #![no_main]` image with its own `#[panic_handler]`:
+# a host `cargo test` harness would pull in `std` and collide on `panic_impl`.
+# It has no `#[cfg(test)]` tests of its own (the logic lives in kernel-core /
+# kernel-arch-glue, which ARE host-tested), so skip it under `cargo test`.
+test = false
+
+[features]
+# Interactive desktop boot (`cargo xbuild-microkernel-x86_64 --features
+# desktop`). A compile-time switch rather than a runtime flag so the
+# default image stays byte-for-byte the automated demo boot the QEMU test
+# scripts grep for (`state=Failed restarts_in_window=6`, then a real
+# POWER_CONTROL shutdown), and so nothing in the desktop image can take
+# the demo's shutdown path by accident. With it on, the Root Task skips
+# the pure benchmarks (VFS throughput, mm-service IPC fast-path bench,
+# kernel-bypass latency comparison), still spawns and wires every
+# service, driver and the framebuffer exactly as before, never spawns the
+# deliberately-faulting driver, and leaves the preemptive scheduler
+# running forever. x86_64 is the only architecture with keyboard/mouse
+# drivers today; on aarch64/riscv64 the feature still builds and simply
+# yields a boot that keeps scheduling instead of powering off.
+desktop = ["kernel-arch-glue/desktop"]
+
+[dependencies]
+hal-core         = { path = "../../hal/hal-core" }
+kernel-core      = { path = "../kernel-core" }
+kernel-cap       = { path = "../kernel-cap" }
+kernel-mm        = { path = "../kernel-mm" }
+kernel-arch-glue = { path = "../kernel-arch-glue" }
+elf-loader       = { path = "../../elf-loader" }
+# Layer-3 (subsystems as processes, IMPLEMENTATION-PLAN.md follow-up):
+# `root-task` decides WHAT to launch (`plan_boot`); `device-manager` is
+# the first real subsystem process launched.
+root-task        = { path = "../../subsystems/root-task" }
+
+[target.'cfg(target_arch = "x86_64")'.dependencies]
+hal-x86_64 = { path = "../../hal/hal-x86_64" }
+
+[target.'cfg(target_arch = "aarch64")'.dependencies]
+hal-arm64 = { path = "../../hal/hal-arm64" }
+
+[target.'cfg(target_arch = "riscv64")'.dependencies]
+hal-riscv64 = { path = "../../hal/hal-riscv64" }
+
+# NOTE: no `device-manager` dependency anywhere above, on any
+# architecture: every architecture now spawns Device Manager from its
+# OWN separately-built ELF image (`device-manager-bin`, embedded via
+# `include_bytes!` — see `DEVICE_MANAGER_ELF`'s own doc comment in
+# `src/main.rs`), loaded at runtime by `kernel_arch_glue::
+# spawn_process_from_elf`. This binary links ZERO device-manager code
+# on any target — the only trace of it is the raw embedded ELF bytes.
+
+[package.metadata.hal]
+targets = [
+    "targets/x86_64-hal.json",
+    "targets/aarch64-hal.json",
+    "targets/riscv64gc-hal.json",
+]

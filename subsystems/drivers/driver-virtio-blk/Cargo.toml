@@ -1,0 +1,37 @@
+# ============================================================================
+# driver-virtio-blk  (03-Kernel-Subsystems-Layer.md §5.1)
+#
+# The MVP block driver: virtio-blk over MMIO on QEMU. A separate process
+# that implements `driver_framework::DeviceDriver`. §5.1 names exactly this
+# device as the acceptance target (Root Task brings up "a simple block
+# driver such as virtio-blk on QEMU").
+#
+# `#![no_std]`. `rlib` for now (the process entry shim lands with the
+# layer-2 TCB-load path).
+# ============================================================================
+[package]
+name        = "driver-virtio-blk"
+description = "virtio-blk MMIO block driver for Simurgh (03-Kernel-Subsystems-Layer.md §5.1)"
+edition.workspace    = true
+version.workspace    = true
+authors.workspace    = true
+license.workspace    = true
+repository.workspace = true
+build = "build.rs"
+
+[lib]
+crate-type = ["rlib"]
+
+[[bin]]
+name = "driver-virtio-blk-bin"
+path = "src/bin/driver-virtio-blk-bin.rs"
+# Same reasoning as device-manager-bin's own `[[bin]]`: a host `cargo
+# test` harness would pull in `std` and collide on `panic_impl`.
+test = false
+
+[dependencies]
+driver-framework = { path = "../driver-framework" }
+ipc-protocol     = { path = "../../../ipc-protocol" }
+# `subsystem_entry`'s own shared-page marshalling needs `SmallMessage`
+# directly, same reasoning as fs-native's own dependency on it.
+kernel-ipc       = { path = "../../../kernel/kernel-ipc" }

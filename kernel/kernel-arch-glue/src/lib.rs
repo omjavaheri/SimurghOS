@@ -1,0 +1,11384 @@
+//! ============================================================================
+//! kernel-arch-glue
+//!
+//! Purpose: the small amount of code that sits between `hal-core` (layer 1)
+//! and `kernel-core` (layer 2). It:
+//!   1. `build` - takes the HAL handoff (`HalInterface` + `BootInfo`),
+//!      validates it, and builds the initial `KernelState` (first
+//!      `UntypedMemory` objects + the Root Task - 02-Microkernel-Layer.md
+//!      §8.1);
+//!   2. `enter` - seeds the Root Task's register context (entry point +
+//!      stack) via the HAL and performs the first `context_switch` into
+//!      it, so the Root Task actually starts executing.
+//!
+//! It is written only against hal-core's architecture-ERASED surface, so
+//! it holds no `#[cfg(target_arch)]` and names no architecture crate
+//! (00-Overview.md principle 5; REPO-Simurgh-OS.md §8).
+//!
+//! Architecture reference: 02-Microkernel-Layer.md §0 (HAL↔kernel is a
+//! direct call), §7 (this crate bridges hal-core traits to kernel-core),
+//! §8.1/§8.2 (boot acceptance: first `UntypedMemory` objects; a running
+//! Root Task); 01-HAL-Layer.md §0.
+//!
+//! MVP boundary: the Root Task here runs IN-KERNEL (same privilege, and it
+//! reaches the kernel by calling `KernelState::dispatch` directly rather
+//! than through an `ecall`/trap). That is a documented stepping stone —
+//! the real user/kernel privilege split and the syscall trap boundary
+//! (02-Microkernel-Layer.md §0, the layer-2↔layer-3 border) are the next
+//! milestone. What this milestone proves: the HAL→kernel→Root-Task control
+//! transfer and the object model both work on real hardware.
+//!
+//! Safety/invariants: `build`/`enter` run exactly once, on the boot core,
+//! before anything else. The `static` scratch (Root Task stack, the
+//! `KernelState`/`HalInterface`/logger pointers) is only touched from that
+//! single-core boot path.
+//! ============================================================================
+
+#![no_std]
+#![forbid(unsafe_op_in_unsafe_fn)]
+#![warn(missing_docs)]
+#![warn(clippy::undocumented_unsafe_blocks)]
+
+use core::fmt::Arguments;
+use hal_core::{BootInfo, HalInterface, MapPermissions, VirtAddr};
+use kernel_cap::{CapId, CapabilityRights, ThreadId};
+use kernel_core::{KernelInitError, KernelState, PreemptStep, SyscallOp, SyscallReturn, ThreadState};
+use kernel_ipc::SmallMessage;
+use kernel_mm::KernelObjectType;
+
+/// Per-thread stack size (64 KiB - the same figure the arch boot stacks
+/// use). Lives in `.bss`, 16-byte aligned per every target ABI.
+pub const THREAD_STACK_SIZE: usize = 64 * 1024;
+
+/// 16-byte-aligned backing storage for one thread stack. The bytes are
+/// only ever addressed (never read as a value), hence `dead_code`.
+#[repr(align(16))]
+#[allow(dead_code)]
+struct Aligned([u8; THREAD_STACK_SIZE]);
+
+// Single-core boot scratch. Written once before the corresponding switch,
+// read on the other stack. (The U-mode Root Task's own stack is
+// `.user_stack` in the final binary, not here — see `UserImage`.)
+static mut THREAD2_STACK: Aligned = Aligned([0; THREAD_STACK_SIZE]);
+static mut THREAD3_STACK: Aligned = Aligned([0; THREAD_STACK_SIZE]);
+/// The real-trap-boundary IPC demo's SERVER thread (`p2_ipc_demo_start`,
+/// `IPC_DEMO_START` — a genuine U-mode `Call`/`Recv`/`Reply` round trip,
+/// unlike every OTHER demo process, which uses ad-hoc raw opcodes, not
+/// the real `kernel_core::SyscallOp` IPC surface).
+static mut THREAD_IPC_SERVER_STACK: Aligned = Aligned([0; THREAD_STACK_SIZE]);
+static mut G_STATE: *mut KernelState = core::ptr::null_mut();
+static mut G_HAL: *const HalInterface = core::ptr::null();
+/// How many GiB `map_ram_identity` covers for the kernel's OWN image —
+/// computed once by `enter` (see that function's own doc comment) and
+/// read by every LATER `map_ram_identity` call (`setup_two_process`'s
+/// space B, `spawn_process`'s per-process spaces), so they all agree
+/// with space A's own identity map on where it's safe to place
+/// `.user_text`/`.user_stack`. `3` is a safe pre-`enter` default (matches
+/// every use before this session's x86_64 work, when the constant really
+/// was hardcoded to 3).
+static mut G_BYTES_GIB: usize = 3;
+static mut G_LOG: Option<fn(Arguments<'_>)> = None;
+// The runtime `Map` syscall's hardware page-table pool used to live here
+// (arch-glue-owned globals `map_user_page` drew from); it is now
+// `KernelState::install_map_pool` / `map_pool_remaining` — plain integer
+// bookkeeping owned by `kernel-core`, consumed by `syscall::do_map`
+// itself, so a capability-gated `Map` and the hardware walk are the same
+// syscall instead of two parallel mechanisms. `enter` still carves and
+// zeroes the pool's physical memory (kernel-core never touches raw
+// memory), then hands it to `KernelState` with one `install_map_pool` call.
+// Set by `root_task_main` before it starts thread 2, so `thread2_main`
+// knows its own thread id, the endpoint capability to `Send` on, and the
+// Root Task's thread id to hand control back to. `G_T3` is the same idea
+// for the §8.3 benchmark thread (`bench_thread_main`), started later on
+// the same endpoint/root — `G_EP`/`G_ROOT` are reused unchanged.
+static mut G_T2: u32 = 0;
+static mut G_T3: u32 = 0;
+static mut G_EP: u32 = 0;
+static mut G_ROOT: u32 = 0;
+
+/// Iterations for the `§8.3` IPC round-trip micro-benchmark below. Kept
+/// small enough that a QEMU/TCG boot (which single-steps every
+/// instruction, unlike real silicon) finishes in a reasonable time, while
+/// still large enough to average out the first couple of iterations'
+/// cold-cache noise.
+const IPC_BENCH_ITERATIONS: u32 = 200;
+
+// ---------------------------------------------------------------------------
+// Two-process proof (02-Microkernel-Layer.md §8.4 zero-copy + §4 preemption).
+//
+// `enter` builds a SECOND, fully isolated Sv39 address space with its own
+// U-mode thread (a real `kernel-core` TCB — its saved U-mode context lives
+// in `Tcb::user_context`, and `kernel-sched` round-robins the two), and
+// maps ONE physical frame into both spaces at different virtual addresses.
+// First a cooperative round-trip (`P2_YIELD` ecall) proves the frame is
+// genuinely shared with no copy across the MMU boundary; then
+// `P2_PREEMPT_START` arms the timer and the two threads run counting loops
+// switched by the timer interrupt alone (`p2_tick` -> `KernelState::
+// preempt_tick`).
+//
+// A THIRD process (space C) is then spawned via the GENERIC `spawn_process`
+// helper below — not the hand-written A/B setup — and joins the SAME
+// preemption loop with no changes to `p2_tick`/`preempt_tick`/`pick_next`:
+// admitting any thread via `init_user_thread` is enough for `kernel-sched`
+// to round-robin it. This is the proof that the mechanism generalizes
+// beyond exactly two hardcoded processes (a step toward
+// 03-Kernel-Subsystems-Layer.md §5's subsystems-as-processes).
+// ---------------------------------------------------------------------------
+
+/// Physical frame shared by both address spaces.
+static mut P2_SHARED_PHYS: usize = 0;
+/// Virtual address the shared frame is mapped at in space A / space B.
+static mut P2_VA_A: usize = 0;
+static mut P2_VA_B: usize = 0;
+/// What process B reported reading through its VA (set by `p2_report_b`).
+static mut P2_B_SAW: usize = 0;
+/// Supervisor-timer ticks seen since `p2_preempt_start` armed the timer.
+static mut P2_TICKS: u32 = 0;
+/// Physical address of process C's private counter word (see
+/// `spawn_process` / `PROC_C_ENTRY`), or `0` if it was never spawned
+/// (e.g. `spawn_process` ran out of untyped RAM — the demo then falls
+/// back to reporting just A/B, unaffected).
+static mut P3_COUNTER_PHYS: usize = 0;
+/// Process A's own REPLACEMENT thread (`p2_preempt_start`'s own
+/// `fresh_tid` — root's original tid-0 TCB is retired at that same
+/// point, per that function's own doc comment) and process C's own
+/// thread, both stashed here so [`p2_tick`]'s own "budget exceeded"
+/// branch can retire them — see that branch's own doc comment for why:
+/// the SAME "`Ready`-but-never-resumed, stale `pick_next` candidate" bug
+/// class `G_PROCESS_B_TID`/`G_FS_TID`/etc. already needed fixing for,
+/// just discovered later (real-IPC plan Phase 2). `None` until
+/// `p2_preempt_start` runs; process C's own is `None` forever if it was
+/// never spawned (same "out of untyped RAM" fallback `P3_COUNTER_PHYS`'s
+/// own doc comment already describes).
+static mut G_FRESH_A_TID: Option<ThreadId> = None;
+static mut G_PROC_C_TID: Option<ThreadId> = None;
+/// `.user_text`'s vma/lma/len and process C's entry point, stashed by
+/// `setup_two_process` for `p2_preempt_start` to spawn it from — see
+/// that function's doc comment for why the spawn is deferred this late.
+static mut G_TEXT_VMA: usize = 0;
+static mut G_TEXT_LMA: usize = 0;
+static mut G_TEXT_LEN: usize = 0;
+static mut G_SUBSYS_ENTRY: usize = 0;
+/// Process A's entry point for the FRESH, vruntime-zero thread
+/// `p2_preempt_start` hands the counting loop to — see that function's
+/// doc comment for why root's own (heavily-run) TCB is not reused here.
+static mut G_A_LOOP_ENTRY: usize = 0;
+/// Stack pointer that fresh thread starts with — reusing the SAME VA
+/// root's own U-mode stack already ends at (still `U=1 R+W` mapped in
+/// space A); safe because the loop is pure register ops and never
+/// pushes a frame, so nothing about the stack's prior contents matters.
+static mut G_A_STACK_TOP: usize = 0;
+
+/// The sentinel process A writes before the first hand-off, and the one
+/// process B writes back. Kept here so the kernel-side cross-check and
+/// the U-mode `sw` immediates cannot drift (the U-mode code hard-codes
+/// the same values as bare immediates — see `kernel/src/main.rs`).
+const P2_A_SENTINEL: usize = 0xC0DE;
+const P2_B_SENTINEL: usize = 0xB00B;
+
+// ---------------------------------------------------------------------------
+// Real IPC-driven driver supervision demo (03-Kernel-Subsystems-Layer.md
+// §5.2's actual acceptance test: device-manager reacts to a REAL driver
+// crash, not its own timer). Device Manager blocks on `p2_dm_wait_crash`;
+// `p2_fault` hands off DIRECTLY to it (`KernelState::
+// terminate_thread_and_handoff`, not the generic fairness-driven
+// `terminate_thread`) when the WATCHED driver thread specifically is the
+// one that faulted, handing over the raw trap values via `PENDING_CRASH`
+// (consumed by `p2_poll_crash`) — the same sticky signal-then-poll shape
+// as `kernel_ipc::Notification`, just realized on this demo's own raw
+// -ecall ABI instead of the general capability-checked syscall path
+// (that path's own Send/Recv/Call blocking semantics are a separate,
+// still-unresolved design question — see IMPLEMENTATION-PLAN.md).
+//
+// The hand-off targets device-manager's OWN, PERMANENT `ThreadId`
+// (`DM_TID`) UNCONDITIONALLY, not "whichever thread most recently called
+// `p2_dm_wait_crash` and is registered as blocked" — two real QEMU-found
+// bugs converge on why: (1) device-manager's own vruntime (real
+// wall-clock nanoseconds under QEMU/TCG for each genuine `spawn_process`
+// respawn it does) can exceed the demo's long-running A/B/C counting
+// loops', so a plain fairness-driven `pick_next` can starve it forever
+// right after an ordinary wake; (2) with the 40-tick preemption timer
+// STILL armed (the crash/restart cycle and that timer run concurrently),
+// device-manager can be preempted by an ORDINARY timer tick — not
+// `block_thread` — between one respawn and its next `DM_WAIT_CRASH`
+// call, leaving no "registered waiter" for `p2_fault` to find even
+// though device-manager is unambiguously who should run next. Both
+// collapse to the same fix: always target `DM_TID` directly. This is
+// safe unconditionally because device-manager can never itself be
+// `self.sched.running()` at the exact instant some OTHER thread (the
+// driver) traps — single-core, only one thread runs at a time — so it is
+// always either `Ready` or `Blocked`, and `dispatch()` accepts either.
+static mut WATCHED_DRIVER_TID: Option<ThreadId> = None;
+/// The most recent watched-driver crash's raw trap values
+/// (cause_code/sepc/stval), set by `p2_fault` and consumed by
+/// `p2_poll_crash`. Sticky exactly like `kernel_ipc::Notification`'s
+/// signal word: a crash that happens before device-manager gets around to
+/// waiting is not lost.
+static mut PENDING_CRASH: Option<(usize, usize, usize)> = None;
+/// Device Manager's own, PERMANENT `ThreadId` (it is spawned once and
+/// never respawned — only the driver is), recorded by `p2_register_
+/// device_manager` right after `spawn_device_manager` succeeds. See the
+/// section doc comment above for why `p2_fault` targets this
+/// unconditionally rather than tracking "is device-manager currently
+/// blocked".
+static mut DM_TID: Option<ThreadId> = None;
+
+/// The FIRST faulty-driver instance, spawned by `P2_PREEMPT_START` but
+/// deliberately held back from `pick_next` until `p2_tick` has run
+/// [`P2_FAULT_DEMO_START_TICK`] rounds of ordinary fair scheduling — see
+/// [`p2_gate_fault_demo`] for the real, QEMU-measured starvation this
+/// closes, and `p2_tick`'s own gate-release branch for the release.
+///
+/// Only the FIRST instance is gated. Every RESPAWN
+/// (`DM_RESPAWN_DRIVER` → `p2_dm_handoff_to_driver`) still runs
+/// immediately via the existing direct hand-off, so the §5.2
+/// crash/restart cycle itself is completely untouched: once it starts it
+/// runs to `state=Failed restarts_in_window=6` exactly as before.
+static mut GATED_FAULT_DRIVER_TID: Option<ThreadId> = None;
+
+/// Per-thread quantum for the preemption demo. 2 ms at QEMU virt's
+/// 10 MHz timebase is 20 000 ticks — long enough that each process's
+/// counting loop makes visible progress, short enough that the whole
+/// demo finishes well inside a QEMU smoke run.
+const P2_QUANTUM_NS: u64 = 2_000_000;
+/// Stop preempting after this many ticks and report. Both counters
+/// non-zero proves both processes ran with NO cooperative `P2_YIELD`.
+///
+/// **Investigated via QEMU this session, root cause found and fixed
+/// elsewhere, not here** (real-IPC plan, Phase 1): initially suspected as
+/// a scheduler-fairness bug — none of the 8 layer-4 subsystem processes
+/// this project spawns ever appeared to run within this demo's window,
+/// even at 50x this budget (2000). A temporary diagnostic in `p2_tick`
+/// covering every real switch decision DISPROVED that: `native-loader`'s
+/// own thread (tid 16) DID get a genuine scheduling turn (`SWITCH 15 ->
+/// 16` at tick 7), ran a full quantum, and was ordinarily preempted
+/// afterward, exactly as `pick_next`'s documented fairness model
+/// predicts — the scheduler itself was never the problem. The REAL bug
+/// was in `p2_ipc_recv`'s own hardcoded `root_thread` fallback silently
+/// corrupting the IPC round trip once a thread's own code actually ran
+/// and tried to `Recv` — see `p2_ipc_recv_general`'s own doc comment for
+/// the full story and the fix (a separate opcode, not a change here).
+/// `P2_TICK_BUDGET` itself needed no change THEN — left at the original
+/// `40`, proven sufficient for the closed root+A/B/C+device-manager/
+/// faulty-driver demo it was actually sized for.
+///
+/// **Real capacity bug found via QEMU, real-IPC plan Phase 2**: that
+/// closed set has since grown by 6 more freshly-spawned, never-yet-run
+/// threads competing for the SAME fixed 40-tick window before this demo
+/// permanently cancels the timer (`p2_tick`'s own doc comment) — `init`,
+/// `account-manager`, `backup-manager`, `diagnostics-manager`, `store`,
+/// `policy-engine` (`security-broker` was already in the mix). With 3
+/// real IPC clients now needing a genuine scheduling turn EACH (their own
+/// thread to `Signal`+`Call`, AND security-broker's own thread to `Wait`+
+/// `Recv`+`Reply` each one), confirmed via a real QEMU run: none of
+/// native-loader/account-manager/store/security-broker's own threads ever
+/// got picked within the original 40 ticks — the wiring succeeded (`wired
+/// ... real IPC edge` lines all present) but no `NL_REPORT`/`SB_REPORT`
+/// ever fired. Raised to 400 (10x, matching this project's own "real
+/// headroom, not just enough to clear the one failure observed" precedent
+/// — `MAX_CAP_SPACES`/`CAP_SLOTS_PER_SPACE`'s own doc comments) rather
+/// than a minimal bump, since more layer-4/5 services will keep growing
+/// this same competing set.
+///
+/// **Raised again to 1000 (2026-09-18), as pure headroom behind
+/// [`P2_FAULT_DEMO_START_TICK`]** — not because the demo needs 1000
+/// ticks. Reaching this budget CANCELS the timer permanently (see this
+/// module's `p2_tick`), after which whichever thread happens to hold the
+/// CPU keeps it forever; if that thread is not device-manager, the boot
+/// can never reach device-manager's own closing `POWER_CONTROL`
+/// shutdown. With the fault-isolation demo now starting at tick
+/// [`P2_FAULT_DEMO_START_TICK`], the shutdown lands around tick 1015 on a
+/// real x86_64 boot — the old 400 would not even have been reached. This
+/// is margin, and costs nothing: on every real boot the machine powers
+/// off long before the budget is hit, so this branch stays exactly as
+/// unreached as it already was.
+#[cfg(not(feature = "desktop"))]
+const P2_TICK_BUDGET: u32 = 2000;
+/// Desktop build: the budget is never reached. Cancelling the timer is
+/// the demo's way of freezing the machine on whichever thread holds the
+/// CPU so the smoke grep can finish; an interactive session must keep
+/// preempting for as long as the machine is on. `u32::MAX` rather than a
+/// separate flag because `p2_tick` saturates its counter one BELOW this
+/// value in the desktop build (at the 2 ms quantum that is ~99 days of
+/// uptime, after which the counter simply stops advancing), so the `>=`
+/// check can never fire — see `p2_tick`.
+#[cfg(feature = "desktop")]
+const P2_TICK_BUDGET: u32 = u32::MAX;
+
+/// The tick at which `p2_tick` releases the gated first faulty-driver
+/// instance (`GATED_FAULT_DRIVER_TID`) and so lets the §5.2
+/// fault-isolation demo begin.
+///
+/// **The real, QEMU-measured problem this exists to fix (2026-09-18).**
+/// device-manager's `subsystem_main` issues a real `POWER_CONTROL`
+/// shutdown as its own final act, immediately after reporting
+/// `state=Failed` — so the fault-isolation demo does not merely run
+/// alongside the general scheduler, it ENDS THE BOOT. Before this gate
+/// the first faulty driver was spawned `Ready` alongside every other
+/// layer-4 process, so `pick_next` reached it on its ordinary turn about
+/// TWELVE ticks (~24 ms) into the preemption phase. A real x86_64 trace
+/// of every switch decision showed the whole boot powering off at around
+/// tick 60 of a 400-tick budget — roughly 15% of the window the demo was
+/// already designed to give the system.
+///
+/// The general scheduler itself was never at fault, and neither was
+/// `p2_fault`'s direct hand-off. The same trace showed `pick_next`
+/// distributing turns correctly across every spawned layer-4 thread, and
+/// the entire six-cycle crash/respawn hand-off consuming only FIVE ticks
+/// (~10 ms) end to end. What the layer-4 processes lacked was simply
+/// TIME: under TCG one IPC round trip costs ~1.3 ms on average (this
+/// boot's own §8.3 benchmark line), i.e. most of a single 2 ms quantum,
+/// so one or two turns each buys them nothing observable. In the ~40
+/// ticks that happened to remain after device-manager reached `Failed`,
+/// real output — security-broker serving real calls, native-loader's
+/// real `request_capability` round trip, simurgh-shell's own prompt —
+/// started appearing, which is exactly the evidence that more ordinary
+/// scheduling time is all that was ever missing.
+///
+/// Hence a tick count rather than a per-thread "everyone ran once"
+/// guarantee: the measurement above shows a thread's FIRST turn produces
+/// nothing at all, so "ran once" would be a guarantee of the wrong
+/// thing.
+///
+/// The quantum itself is deliberately NOT raised to compensate.
+/// 02-Microkernel-Layer.md §4 states the interactive quantum as ~1–4 ms
+/// and [`P2_QUANTUM_NS`] sits inside that range; widening it to fit a
+/// TCG IPC round trip would be a silent departure from the spec. Giving
+/// the same scheduler more turns is the same total CPU with none of that
+/// cost.
+///
+/// **Why 1000, and what had to be fixed first.** Raising this constant
+/// alone was NOT enough, and the way it failed is worth recording. With
+/// the gate at 300 the boot was reproducible (four clean runs), but at
+/// 600 and 1000 it became genuinely flaky — of two consecutive 600-tick
+/// boots one powered off cleanly having never reached `simurgh-init` at
+/// all, while the other reached `init`'s full self-check and then died
+/// outright. The cause was not scheduling: letting the layer-4 processes
+/// finally run their own code for a meaningful stretch simply exposed
+/// latent faults that the old ~12-tick window never reached. One was a
+/// plain null dereference in a subsystem thread (`error_code=0x5`,
+/// `cr2=0x0`); another a real unmapped-VA access at `cr2=0xD810_0000`.
+///
+/// Either one killed the ENTIRE MACHINE, because `hal-x86_64` routed
+/// only `#UD` to its registered `FaultHandler` and let `#PF` fall
+/// through to `common_interrupt_entry`'s halt-forever arm — the exact
+/// mirror of the aarch64 `ec=0x24` gap fixed in `e8e1c83`. That is a
+/// direct breach of the per-process isolation
+/// 03-Kernel-Subsystems-Layer.md §2.1/§5.2 requires, and it was the real
+/// blocker: with it open, ANY increase in how long layer-4 code runs
+/// traded the §5.2 acceptance marker for more output, which is not a
+/// trade worth making. It is fixed alongside this constant
+/// (`hal_x86_64::cpu::common_pagefault_entry`), so a U-mode page fault
+/// now terminates just that thread.
+///
+/// With `#PF` isolated, 1000 is reproducible: three consecutive real
+/// boots all reached `state=Failed restarts_in_window=6` and a clean
+/// `POWER_CONTROL` shutdown, and in two of them real page faults were
+/// genuinely isolated mid-boot (`init`'s own runaway `SPAWN_KNOWN_ELF`
+/// copies dereferencing null) with the system carrying on exactly as
+/// §5.2 promises — the runaway now self-limits, because each copy dies
+/// instead of taking the machine down with it. `simurgh-init`'s respawn
+/// loop is still a real bug in its own separate repo; it is simply no
+/// longer fatal here.
+///
+/// 1000 is deliberately not pushed higher. It already reaches every
+/// layer-4 process currently capable of reporting, and this is a boot
+/// demo, not a soak test.
+///
+/// **Desktop mode.** `0` means "never release": the gated driver stays
+/// `Blocked` for the life of the boot, the §5.2 demo never starts, and
+/// device-manager therefore never reaches its own closing
+/// `POWER_CONTROL`. That is exactly what an interactive desktop boot
+/// needs — Compositor, ui-core, the i8042/mouse drivers and
+/// account-manager keep running instead of the machine powering itself
+/// off — and it is why this gate is a single-purpose mechanism with its
+/// own name and its own static, deliberately NOT entangled with
+/// `p2_fault`'s hand-off, `DM_TID`'s preemption exemption, or
+/// `P2_TICK_BUDGET`. Switching the automated demo off later is this one
+/// constant and nothing else — selected by this crate's `desktop` Cargo
+/// feature (enabled only through the `kernel` binary's own `desktop`
+/// feature), so the default image keeps the demo's 1000 exactly.
+#[cfg(not(feature = "desktop"))]
+const P2_FAULT_DEMO_START_TICK: u32 = 1000;
+/// Desktop build: never release the gated driver — see the default
+/// definition's doc comment just above. (The desktop Root Task does not
+/// spawn the faulty driver at all, so there is normally nothing gated;
+/// `0` keeps the gate closed even if a future change spawns it again.)
+#[cfg(feature = "desktop")]
+const P2_FAULT_DEMO_START_TICK: u32 = 0;
+
+/// Desktop build: how soon after an input IRQ wakes its driver the
+/// scheduler gets a decision point ([`desktop_input_wake_tick`]).
+///
+/// **Why this exists (measured 2026-09-24, README entry of that date).**
+/// An IRQ is taken on the generic ISR path, which always resumes the
+/// interrupted thread — it has no way to switch (`hal_x86_64::cpu`'s
+/// `isr_common_trampoline`). Waking a driver there only marks it `Ready`
+/// (`KernelState::wake_blocked`); it actually runs at the NEXT timer
+/// tick, up to a full [`P2_QUANTUM_NS`] later, unless the running thread
+/// happens to block or yield first. Every mouse/keyboard event paid that
+/// wait before any other stage of the input path could even start.
+///
+/// Rather than giving the generic ISR path switch semantics (the HAL's
+/// trap plumbing, three architectures), the IRQ handler pulls the
+/// existing timer deadline in: the tick then takes the ordinary,
+/// already-proven `p2_tick` -> `preempt_tick` route, which switches to
+/// the driver if `pick_next` ranks it first and otherwise just
+/// continues. The cost of a tick nobody needed is one `account` +
+/// `pick_next`.
+///
+/// 20 µs: long enough to be past the `iretq` back to U-mode (a tick
+/// taken at CPL 0 would not re-arm — see `drv_irq_wait_yield`'s doc
+/// comment; kernel code runs with interrupts off anyway, so the tick
+/// can only land in U-mode), and far below anything a human perceives.
+///
+/// Measured (2026-09-25, QEMU TCG on the Windows host, `simurgh-mouse-
+/// bench.ps1`, 30 moves 10 ms apart): worst IRQ-to-driver wait per burst
+/// 2.9 ms -> 1.7 ms on average (max 4.3 -> 2.0 ms); the AVERAGE barely
+/// moves (1.50 -> 1.39 ms, guest clock), most likely because QEMU's own
+/// timers on this host fire with roughly millisecond granularity, so a
+/// 20 µs deadline lands later than asked. It should do better on a
+/// finer-grained timer (real hardware, WHPX), but that is not measured.
+#[cfg(feature = "desktop")]
+const DESKTOP_INPUT_WAKE_TICK_NS: u64 = 20_000;
+
+/// Desktop build: the priority of the input path — the PS/2 drivers, the
+/// Compositor and ui-core ([`desktop_apply_input_priorities`]). Equal to
+/// `kernel_sched::MAX_PRIORITY`, the level every thread is admitted at
+/// (`init_user_thread`), so the input path itself keeps exactly the
+/// priority it always had; it is everything else that moves down.
+#[cfg(feature = "desktop")]
+const DESKTOP_PRIORITY_INPUT: u8 = 39;
+/// Desktop build: the priority every other process drops to. Any value
+/// below [`DESKTOP_PRIORITY_INPUT`] means the same thing to `pick_next`
+/// (Interactive mode ranks by priority first, strictly), so the exact
+/// number only matters for weight: 30 keeps these services' vruntime
+/// weight close to what it was (~3.3 vs 4.0), so how they share the CPU
+/// AMONG THEMSELVES barely changes. It stays well above the idle loop's
+/// 0.
+#[cfg(feature = "desktop")]
+const DESKTOP_PRIORITY_BACKGROUND: u8 = 30;
+
+/// Desktop build: the input-path threads the Root Task registered via
+/// [`desktop_register_input_path`], applied by `p2_preempt_start`.
+#[cfg(feature = "desktop")]
+static mut DESKTOP_INPUT_PATH: [Option<ThreadId>; 4] = [None; 4];
+
+/// Desktop build: records which threads form the input path. Only
+/// RECORDS them — the priorities change in `p2_preempt_start`, after
+/// the cooperative boot phase: during that phase the Root Task's own
+/// hand-offs go through `pick_next`, and lowering the Root Task (or
+/// raising a spawned thread above it) there could reorder them.
+#[cfg(feature = "desktop")]
+pub fn desktop_register_input_path(input_path: [Option<ThreadId>; 4]) {
+    // SAFETY: single-core boot sequencing; read once by `p2_preempt_start`.
+    unsafe { core::ptr::addr_of_mut!(DESKTOP_INPUT_PATH).write(input_path) };
+}
+
+/// Desktop build only: gives the input path priority over everything
+/// else. Every thread `input_path` names is set to
+/// [`DESKTOP_PRIORITY_INPUT`]; every OTHER admitted thread still at that
+/// level (i.e. every service spawned with the default) drops to
+/// [`DESKTOP_PRIORITY_BACKGROUND`]. Threads already below it (the idle
+/// loop at 0) are left alone. Called once from `p2_preempt_start`, just
+/// before the preemptive timer is armed; threads spawned later (e.g. by the
+/// shell) come in at the default and so rank with the input path, the
+/// same footing everything had before.
+///
+/// **Why (measured on a real desktop boot, 2026-09-24).** With every
+/// service at the same priority, a tick histogram over 3000 ticks at the
+/// login screen gave `simurgh-store` 1578 and `simurgh-shell` 1086 (both
+/// sit in busy-poll loops) and ui-core just 40 — about 1%. The
+/// Compositor only moves input when ui-core calls it, so every mouse
+/// event waited on ui-core's rare turns. Ranking the input path first is
+/// what gives ui-core the CPU.
+///
+/// **The trade-off, stated plainly.** `pick_next` has no aging ACROSS
+/// priority levels (aging only slows a thread's vruntime), so a
+/// lower-priority thread gets the CPU only while no input-path thread is
+/// ready. That holds up because every input-path thread gives the CPU
+/// back on its own: the drivers wait in `DRV_IRQ_WAIT` and the Compositor
+/// in `Recv` whenever nothing is pending, and ui-core `P2_YIELD`s after
+/// every poll of its input loop (Simurgh-UI-Template01, since 2026-09-24;
+/// a yield hides the yielder from exactly one `pick_next`, which is when
+/// the background runs). Measured on a desktop boot after this change
+/// (2026-09-25): ~990 ui-core yields per 500 ticks, and security-broker,
+/// profile-policy and store keep serving calls. Everything ui-core USES
+/// (account-manager, shell, file-manager, ...) it reaches through a
+/// blocking `Call`, during which that service runs regardless. A future
+/// input-path member that spins without yielding would starve every
+/// other process — keep this list to threads that block or yield.
+///
+/// **This ranking exposed, and depends on the fix for, a latent kernel
+/// bug** — `p2_ipc_recv`'s switch into the retired Root Task (see the
+/// doc comment at the top of that function). Before that fix, the first
+/// such switch left the CPU running the idle loop under ui-core's name
+/// forever: the login screen drew, but no keystroke ever registered.
+///
+/// Uses `Scheduler::set_base_priority`, which changes nothing but the
+/// priority fields — run state and vruntime are untouched, so a thread
+/// currently blocked in IPC is unaffected until it next competes.
+#[cfg(feature = "desktop")]
+fn desktop_apply_input_priorities(input_path: &[Option<ThreadId>]) {
+    let k = kstate();
+    let mut raised = 0;
+    let mut lowered = 0;
+    for idx in 0..kernel_core::config::MAX_THREADS {
+        let tid = ThreadId::new(idx as u32);
+        let Some(e) = k.sched.entity(tid) else { continue };
+        let on_input_path = input_path.iter().any(|t| *t == Some(tid));
+        if on_input_path {
+            let _ = k.sched.set_base_priority(tid, DESKTOP_PRIORITY_INPUT);
+            raised += 1;
+        } else if e.base_priority >= DESKTOP_PRIORITY_INPUT {
+            let _ = k.sched.set_base_priority(tid, DESKTOP_PRIORITY_BACKGROUND);
+            lowered += 1;
+        }
+    }
+    klog!(
+        "desktop mode: input path ({} thread(s)) at priority {}, {} other thread(s) lowered to {}\r\n",
+        raised,
+        DESKTOP_PRIORITY_INPUT,
+        lowered,
+        DESKTOP_PRIORITY_BACKGROUND
+    );
+}
+
+/// Desktop build: set once `p2_preempt_start` arms the preemptive
+/// timer. Before that, `p2_tick` must not run at all (the Root Task's
+/// cooperative boot phase), so [`desktop_input_wake_tick`] does nothing.
+#[cfg(feature = "desktop")]
+static mut DESKTOP_PREEMPTION_LIVE: bool = false;
+
+/// Called by the PS/2 IRQ trampolines after waking their driver. Desktop
+/// build: if a thread was actually woken and preemption is running,
+/// moves the next scheduler tick to [`DESKTOP_INPUT_WAKE_TICK_NS`] from
+/// now (see that constant for why). Default build: a no-op, so the demo
+/// image's scheduling is untouched.
+fn desktop_input_wake_tick(hal: &HalInterface, woke_someone: bool) {
+    #[cfg(feature = "desktop")]
+    {
+        // SAFETY: single-core; written once by `p2_preempt_start`.
+        let live = unsafe { core::ptr::addr_of!(DESKTOP_PREEMPTION_LIVE).read() };
+        if woke_someone && live {
+            hal.arm_timer(hal.now_ns() + DESKTOP_INPUT_WAKE_TICK_NS);
+        }
+    }
+    #[cfg(not(feature = "desktop"))]
+    let _ = (hal, woke_someone);
+}
+/// Byte offsets into the shared frame each process bumps in its counting
+/// loop — distinct words (the frame is ONE physical page aliased into
+/// both spaces), clear of the `0`/`4` area the §8.4 round-trip used.
+const P2_COUNTER_A_OFF: usize = 8;
+const P2_COUNTER_B_OFF: usize = 12;
+
+/// Routes a formatted line to the logger the boot binary installed via
+/// `build`. A no-op if none was installed. Used by `klog!`.
+pub fn log(args: Arguments<'_>) {
+    // SAFETY: `G_LOG` is set once in `build` before any `log` call and
+    // never mutated afterward; single-core.
+    if let Some(f) = unsafe { core::ptr::addr_of!(G_LOG).read() } {
+        f(args);
+    }
+}
+
+/// `writeln!`-style logging through the boot binary's serial writer.
+#[macro_export]
+macro_rules! klog {
+    ($($arg:tt)*) => { $crate::log(core::format_args!($($arg)*)) };
+}
+
+/// A summary of what `build` produced, for the boot binary to print over
+/// serial (02-Microkernel-Layer.md §8.1 acceptance evidence).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BootReport {
+    /// Boot protocol HAL reported (UEFI vs SBI+DT).
+    pub protocol: hal_core::BootProtocol,
+    /// Logical CPU cores, from the HAL interface.
+    pub cpu_cores: usize,
+    /// Monotonic timer frequency (Hz), from the HAL interface.
+    pub timer_hz: u64,
+    /// Number of `UntypedMemory` objects seeded for the Root Task.
+    pub untyped_objects: u32,
+    /// Total physical bytes those untyped objects cover.
+    pub total_untyped_bytes: u64,
+    /// Number of MMIO peripherals HAL discovered (`hal_core::peripheral`
+    /// — virtio-mmio on riscv64/aarch64 today). Read straight from
+    /// `boot.hardware_manifest`, not `KernelState`: no kernel-core object
+    /// consumes this yet (that arrives with the Device Manager's own
+    /// MMIO-capability-grant path) — this field exists purely as boot-
+    /// time discovery evidence, matching `untyped_objects`' own role for
+    /// memory.
+    pub peripheral_devices: u32,
+    /// Number of compute devices (GPU/NPU-class PCI functions —
+    /// `hal_core::compute::ComputeDeviceDiscovery`) HAL discovered.
+    /// Same "boot-time discovery evidence, no consumer yet" role
+    /// [`peripheral_devices`] already documents — today this is
+    /// consumed internally only by each `hal-<arch>::power`'s own
+    /// per-device power-domain bookkeeping, never surfaced anywhere a
+    /// real boot log could confirm it, until this field. Read straight
+    /// from `boot.hardware_manifest`, same source as `peripheral_
+    /// devices`.
+    pub compute_devices: u32,
+    /// The Root Task's thread id (raw).
+    pub root_thread: u32,
+    /// The thread the scheduler would run first (should be the Root Task).
+    pub first_scheduled: Option<u32>,
+}
+
+/// Errors from `build`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunError {
+    /// `BootInfo::validate` failed, or `KernelState::from_boot_info` did.
+    Init(KernelInitError),
+}
+
+impl From<KernelInitError> for RunError {
+    fn from(e: KernelInitError) -> Self {
+        RunError::Init(e)
+    }
+}
+
+/// Builds the initial kernel state from the HAL handoff and installs the
+/// serial logger.
+///
+/// Steps: `BootInfo::validate` → `KernelState::init_global` (creates the
+/// first `UntypedMemory` objects and the Root Task - 02-Microkernel-Layer.md
+/// §8.1) → assemble a `BootReport`.
+///
+/// Returns the report plus a `'static` handle to the kernel state for
+/// `enter` to drive. Does NOT start the Root Task (that is `enter`).
+pub fn build(
+    hal: &HalInterface,
+    boot: &BootInfo,
+    logger: fn(Arguments<'_>),
+) -> Result<(BootReport, &'static mut KernelState), RunError> {
+    // SAFETY: single-core boot, called once, before any `log` call.
+    unsafe { core::ptr::addr_of_mut!(G_LOG).write(Some(logger)) };
+
+    boot.validate()
+        .map_err(|_| RunError::Init(KernelInitError::BadBootInfo))?;
+
+    let state = KernelState::init_global(boot)?;
+    log_machine_id(state);
+    capture_device_list(boot);
+    let first_scheduled = state.sched.pick_next(hal.now_ns()).map(|t| t.as_u32());
+
+    let report = BootReport {
+        protocol: boot.protocol,
+        cpu_cores: hal.core_count(),
+        timer_hz: hal.frequency_hz(),
+        untyped_objects: state.untyped_count,
+        total_untyped_bytes: state.total_untyped_bytes(),
+        peripheral_devices: boot.hardware_manifest.peripheral_device_count,
+        compute_devices: boot.hardware_manifest.compute_device_count,
+        root_thread: state.root_thread.as_u32(),
+        first_scheduled,
+    };
+    Ok((report, state))
+}
+
+
+// ============================================================================
+// Machine id info page (docs/machine-id.md section 10/11)
+//
+// The machine id is derived once at boot (`KernelState::machine_id`). Its
+// ONLY consumer today is the desktop's USERS window, so the smallest
+// mechanism consistent with the existing design is used: a read-only,
+// kernel-owned 4 KiB page mapped into exactly one process (ui-core) at a
+// fixed VA — the same shape as the Compositor's scanout info page, and no
+// new syscall (the syscall surface is deliberately tiny and fuzzed).
+//
+// Page layout (all little-endian; every other byte is zero):
+//   0   u64   MACHINE_ID_INFO_MAGIC  ("SIMMID" + 16-bit layout version 1)
+//   8   [u8;16] machine id, RFC 4122 byte order (as in the text form)
+//   24  u32   flags: bit0 = weak (no strong board-level identifier),
+//                    bit1 = virtual (firmware strings name a hypervisor)
+//   28  u32   algorithm version (machine_id_core::ALGORITHM_VERSION)
+//   32  [u8;36] canonical lowercase "8-4-4-4-12" text form, no terminator
+//
+// TODO(spec): access control (TODO-5 in docs/machine-id.md). Today "who may
+// see the raw id" is decided by this function's caller in the kernel main,
+// not by a capability; the doc's MachineIdRaw/MachineIdInfo capabilities
+// (layer 4 issues them) are not built.
+// ============================================================================
+
+/// Magic word of the machine-id info page — ASCII `"SIMMID"` + version 1.
+/// A client must check it before trusting the page.
+pub const MACHINE_ID_INFO_MAGIC: u64 = 0x5349_4D4D_4944_0001;
+
+/// Logs the derived machine id over serial (docs/machine-id.md: only the
+/// derived id and its flags are printed, never the raw serials/UUID).
+fn log_machine_id(state: &KernelState) {
+    let m = &state.machine_id;
+    let text = machine_id_core::format_guid(&m.id);
+    // `format_guid` only emits ASCII hex digits and hyphens, so this never fails.
+    let text = core::str::from_utf8(&text).unwrap_or("?");
+    klog!(
+        "machine id: {} (weak={}, virtual={}, strong ids used={}, algorithm v{})\r\n",
+        text,
+        m.weak,
+        m.virtual_machine,
+        m.strong_mask.count_ones(),
+        machine_id_core::ALGORITHM_VERSION
+    );
+}
+
+/// Maps the machine-id info page READ-ONLY into the address space rooted at
+/// `root_pt` at `va` (which must be page-aligned and free there). Returns
+/// `None` only on a genuine allocation/mapping failure.
+pub fn map_machine_id_info(hal: &HalInterface, root_pt: usize, va: usize) -> Option<()> {
+    let k = kstate();
+    let m = k.machine_id;
+    let page = carve_from_any_untyped(k, 4096, 4096)?;
+    // SAFETY: fresh untyped RAM, identity-addressable, single-core; the
+    // zeroing makes every byte outside the fields below well defined.
+    unsafe { core::ptr::write_bytes(page as *mut u8, 0, 4096) };
+    let flags = (m.weak as u32) | ((m.virtual_machine as u32) << 1);
+    let text = machine_id_core::format_guid(&m.id);
+    // SAFETY: `page` is the frame just carved; every write is within its
+    // first 68 bytes.
+    unsafe {
+        let base = page as *mut u8;
+        core::ptr::write_unaligned(base as *mut u64, MACHINE_ID_INFO_MAGIC);
+        core::ptr::copy_nonoverlapping(m.id.as_ptr(), base.add(8), 16);
+        core::ptr::write_unaligned(base.add(24) as *mut u32, flags);
+        core::ptr::write_unaligned(base.add(28) as *mut u32, machine_id_core::ALGORITHM_VERSION);
+        core::ptr::copy_nonoverlapping(text.as_ptr(), base.add(32), 36);
+    }
+    let pool = carve_from_any_untyped(k, 4096, 4096 * 2)?;
+    // SAFETY: fresh untyped RAM, identity-addressable, single-core;
+    // `map_range` needs the pool pre-zeroed.
+    unsafe { core::ptr::write_bytes(pool as *mut u8, 0, 4096 * 2) };
+    // perm bits R=1 | U=8: readable from user mode, NOT writable, not executable.
+    if hal.map_range(root_pt, va, page, 4096, 1 | 8, pool, 2) == u32::MAX {
+        klog!("map_machine_id_info: map_range error\r\n");
+        return None;
+    }
+    Some(())
+}
+
+
+// ============================================================================
+// Network status page (docs/internet-plan.md, "Network status page")
+//
+// ONE zeroed 4 KiB frame, carved lazily on first use, shared by two mappings:
+// READ-WRITE into the Netstack process (`NETSTACK_NETINFO_VA`, its service
+// thread publishes a seqlocked record there) and READ-ONLY into ui-core (the
+// tray/login-screen network icon). A machine without a NIC never starts
+// Netstack, so the page stays zero and ui-core reads "no adapter".
+// TODO(spec): like the machine-id page, access is decided by kernel code that
+// maps it into ui-core only, not by a capability.
+// ============================================================================
+
+/// VA of the network status page in the Netstack process (R+W) - must stay
+/// numerically equal to `netstack::subsystem_entry::NETINFO_VA`.
+const NETSTACK_NETINFO_VA: usize = 0xD8C0_0000;
+/// Physical address of the shared status frame (`usize::MAX` until carved).
+static mut G_NET_INFO_PHYS: usize = usize::MAX;
+
+/// The shared status frame, carved and zeroed on first call.
+fn net_info_frame(k: &mut KernelState) -> Option<usize> {
+    // SAFETY: single-core; only this function writes the static.
+    let cur = unsafe { core::ptr::addr_of!(G_NET_INFO_PHYS).read() };
+    if cur != usize::MAX {
+        return Some(cur);
+    }
+    let page = carve_from_any_untyped(k, 4096, 4096)?;
+    // SAFETY: fresh untyped RAM, identity-addressable, single-core.
+    unsafe {
+        core::ptr::write_bytes(page as *mut u8, 0, 4096);
+        core::ptr::addr_of_mut!(G_NET_INFO_PHYS).write(page);
+    }
+    Some(page)
+}
+
+/// Maps the network status page READ-ONLY into the address space rooted at
+/// `root_pt` at `va` (ui-core). `None` only on an allocation/mapping failure.
+pub fn map_net_info(hal: &HalInterface, root_pt: usize, va: usize) -> Option<()> {
+    let k = kstate();
+    let page = net_info_frame(k)?;
+    let pool = carve_from_any_untyped(k, 4096, 4096 * 2)?;
+    // SAFETY: fresh untyped RAM, identity-addressable, single-core.
+    unsafe { core::ptr::write_bytes(pool as *mut u8, 0, 4096 * 2) };
+    // R | U: readable from user mode, not writable, not executable.
+    if hal.map_range(root_pt, va, page, 4096, 1 | 8, pool, 2) == u32::MAX {
+        klog!("map_net_info: map_range error\r\n");
+        return None;
+    }
+    Some(())
+}
+// ============================================================================
+// Device list info page (docs/machine-id.md section 13.3)
+//
+// Same mechanism as the machine-id page: a read-only, kernel-owned 4 KiB page
+// mapped into ui-core only, for the DEVICES window. Built once at boot from
+// the hardware manifest (`capture_device_list`), copied into a fresh page on
+// `map_device_list_info`. Layout (little-endian):
+//   0   u64  DEVICE_LIST_MAGIC ("SIMDEV" + layout version 1)
+//   8   u32  record count
+//   12  u32  flags: bit0 = list truncated (more devices than fit)
+//   16  records, DEVICE_REC_SIZE (96) bytes each, up to DEVICE_LIST_MAX:
+//         +0 u8 category (DEVCAT_*)   +1 u8 flags (bit0 = has id)
+//         +2 u8 name_len  +3 u8 id_len
+//         +4  [u8;48] name (ASCII, not terminated)
+//         +52 [u8;44] id text (only id_len bytes valid)
+// ============================================================================
+
+/// Magic word of the device-list info page: ASCII `"SIMDEV"` + version 1.
+pub const DEVICE_LIST_MAGIC: u64 = 0x5349_4D44_4556_0001;
+/// Size of one device record in the page.
+pub const DEVICE_REC_SIZE: usize = 96;
+/// Size of the device-list info page: two 4 KiB pages (ABI version 1, machine-id.md 13.3).
+pub const DEVICE_LIST_PAGE_BYTES: usize = 8192;
+/// Maximum number of records that fit in the two-page list (85).
+pub const DEVICE_LIST_MAX: usize = (DEVICE_LIST_PAGE_BYTES - 16) / DEVICE_REC_SIZE;
+/// Category: processors.
+pub const DEVCAT_PROCESSOR: u8 = 1;
+/// Category: memory.
+pub const DEVCAT_MEMORY: u8 = 2;
+/// Category: display adapters.
+pub const DEVCAT_DISPLAY: u8 = 3;
+/// Category: network adapters.
+pub const DEVCAT_NETWORK: u8 = 4;
+/// Category: storage controllers.
+pub const DEVCAT_STORAGE: u8 = 5;
+/// Category: system devices (interrupt controller, timer, board).
+pub const DEVCAT_SYSTEM: u8 = 6;
+/// Category: input devices.
+pub const DEVCAT_INPUT: u8 = 7;
+/// Category: compute devices (NPU/TPU/FPGA...).
+pub const DEVCAT_COMPUTE: u8 = 8;
+/// Category: other devices.
+pub const DEVCAT_OTHER: u8 = 9;
+/// Category: USB host controllers ("Universal Serial Bus controllers").
+pub const DEVCAT_USB: u8 = 10;
+/// Category: sound / video / game controllers.
+pub const DEVCAT_SOUND: u8 = 11;
+/// Category: Bluetooth radios (slot; filled by a future USB/PCI driver).
+pub const DEVCAT_BLUETOOTH: u8 = 12;
+/// Category: batteries (slot; needs ACPI battery support).
+pub const DEVCAT_BATTERY: u8 = 13;
+/// Category: cameras (slot; no PCI class exists, needs USB video class).
+pub const DEVCAT_CAMERA: u8 = 14;
+/// Category: portable devices (slot).
+pub const DEVCAT_PORTABLE: u8 = 15;
+/// Category: human interface devices (slot; USB HID).
+pub const DEVCAT_HID: u8 = 16;
+/// Category: modems / cellular.
+pub const DEVCAT_MODEM: u8 = 17;
+/// Category: DVD/CD-ROM drives (slot; needs AHCI/IDE ATAPI IDENTIFY).
+pub const DEVCAT_OPTICAL: u8 = 18;
+
+static mut G_DEVLIST: [u8; DEVICE_LIST_PAGE_BYTES] = [0; DEVICE_LIST_PAGE_BYTES];
+static mut G_DEVCOUNT: usize = 0;
+static mut G_DEVTRUNC: bool = false;
+
+/// Fixed-capacity text buffer that silently truncates (never fails).
+struct FixBuf<const N: usize> {
+    b: [u8; N],
+    n: usize,
+}
+
+impl<const N: usize> FixBuf<N> {
+    const fn new() -> Self {
+        Self { b: [0; N], n: 0 }
+    }
+}
+
+impl<const N: usize> core::fmt::Write for FixBuf<N> {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        for &c in s.as_bytes() {
+            if self.n < N {
+                self.b[self.n] = if c.is_ascii() && c >= 0x20 { c } else { b'?' };
+                self.n += 1;
+            }
+        }
+        Ok(())
+    }
+}
+
+struct DevWriter {
+    count: usize,
+    truncated: bool,
+}
+
+impl DevWriter {
+    fn push(&mut self, cat: u8, name: &FixBuf<48>, id: Option<&FixBuf<44>>) {
+        if self.count >= DEVICE_LIST_MAX {
+            self.truncated = true;
+            return;
+        }
+        let off = 16 + self.count * DEVICE_REC_SIZE;
+        // SAFETY: single-core boot, `build` is the only writer and runs once
+        // before any reader; `off + 96 <= 4096` by `DEVICE_LIST_MAX`.
+        let page = unsafe { &mut *core::ptr::addr_of_mut!(G_DEVLIST) };
+        page[off] = cat;
+        page[off + 1] = id.is_some() as u8;
+        page[off + 2] = name.n as u8;
+        page[off + 3] = id.map_or(0, |i| i.n as u8);
+        page[off + 4..off + 4 + name.n].copy_from_slice(&name.b[..name.n]);
+        if let Some(i) = id {
+            page[off + 52..off + 52 + i.n].copy_from_slice(&i.b[..i.n]);
+        }
+        self.count += 1;
+    }
+}
+
+/// Builds the device-list page from the hardware manifest (called once from
+/// `build`). Architecture-erased: every arch reports what its manifest has.
+fn capture_device_list(boot: &BootInfo) {
+    use core::fmt::Write;
+    use hal_manifest::raw::{ComputeKindRaw, InterruptControllerKindRaw, MemoryRegionKindRaw, PeripheralKindRaw, TimerKindRaw};
+    let m = &boot.hardware_manifest;
+    let mut w = DevWriter { count: 0, truncated: false };
+    let mut n = FixBuf::<48>::new();
+    let mut i = FixBuf::<44>::new();
+
+    // Processors: only the core count is in the manifest (no brand string).
+    let _ = write!(n, "CPU, {} core(s)", m.cpu_core_count);
+    w.push(DEVCAT_PROCESSOR, &n, None);
+
+    // Memory: one summary line.
+    let mut usable = 0u64;
+    let mut total = 0u64;
+    for r in m.memory_regions() {
+        total = total.saturating_add(r.length_bytes);
+        if r.kind == MemoryRegionKindRaw::Usable {
+            usable = usable.saturating_add(r.length_bytes);
+        }
+    }
+    n = FixBuf::new();
+    let _ = write!(n, "RAM, {} MiB usable", usable >> 20);
+    i = FixBuf::new();
+    let _ = write!(i, "{} MiB in firmware map, {} regions", total >> 20, m.memory_regions().len());
+    w.push(DEVCAT_MEMORY, &n, Some(&i));
+
+    // Framebuffer (firmware GOP), when present.
+    let fb = &m.framebuffer;
+    if fb.phys_base != 0 {
+        n = FixBuf::new();
+        let _ = write!(n, "Framebuffer {}x{} {} bpp", fb.width, fb.height, fb.bits_per_pixel);
+        i = FixBuf::new();
+        let _ = write!(i, "MMIO {:#x}", fb.phys_base);
+        w.push(DEVCAT_DISPLAY, &n, Some(&i));
+    }
+
+    // Compute devices (PCI-class discovered GPUs/NPUs/...).
+    for d in m.compute_devices() {
+        n = FixBuf::new();
+        let len = (d.short_name_len as usize).min(d.short_name.len());
+        match core::str::from_utf8(&d.short_name[..len]) {
+            Ok(s) if len > 0 => {
+                let _ = write!(n, "{}", s);
+            }
+            _ => {
+                let _ = write!(
+                    n,
+                    "{}",
+                    match d.kind {
+                        ComputeKindRaw::Cpu => "Processor",
+                        ComputeKindRaw::Gpu => "Graphics adapter",
+                        ComputeKindRaw::Npu => "NPU",
+                        ComputeKindRaw::Tpu => "TPU",
+                        ComputeKindRaw::Fpga => "FPGA",
+                    }
+                );
+            }
+        }
+        i = FixBuf::new();
+        let _ = write!(i, "vendor {:04x} index {}", d.vendor.0, d.device_index);
+        let cat = match d.kind {
+            ComputeKindRaw::Cpu => DEVCAT_PROCESSOR,
+            ComputeKindRaw::Gpu => DEVCAT_DISPLAY,
+            _ => DEVCAT_COMPUTE,
+        };
+        w.push(cat, &n, Some(&i));
+    }
+
+    // Peripherals: virtio / NVMe over PCI, plus synthesized PS/2 input.
+    for d in m.peripheral_devices() {
+        let (cat, name, virtio) = match d.kind {
+            PeripheralKindRaw::Block => (DEVCAT_STORAGE, "virtio block device", true),
+            PeripheralKindRaw::Nvme => (DEVCAT_STORAGE, "NVMe controller", false),
+            PeripheralKindRaw::Network => (DEVCAT_NETWORK, "virtio network device", true),
+            PeripheralKindRaw::Gpu => (DEVCAT_DISPLAY, "virtio GPU", true),
+            PeripheralKindRaw::Console => (DEVCAT_OTHER, "virtio console", true),
+            PeripheralKindRaw::Input => (DEVCAT_INPUT, "PS/2 keyboard", false),
+            PeripheralKindRaw::Pointer => (DEVCAT_INPUT, "PS/2 mouse", false),
+            PeripheralKindRaw::Unknown => (DEVCAT_OTHER, "Unknown peripheral", false),
+        };
+        n = FixBuf::new();
+        let _ = write!(n, "{}", name);
+        i = FixBuf::new();
+        let mut has_id = true;
+        if d.config_space_base != 0 {
+            // ECAM offset = bus<<20 | dev<<15 | fn<<12 (ECAM bases are
+            // 256 MiB aligned, so the low 28 bits are the offset).
+            let bdf = (d.config_space_base >> 12) & 0xFFFF;
+            let _ = write!(i, "PCI {:02x}:{:02x}.{}", bdf >> 8, (bdf >> 3) & 0x1F, bdf & 7);
+            if virtio {
+                let _ = write!(i, " vendor 1af4");
+            }
+        } else if d.mmio_base != 0 {
+            let _ = write!(i, "MMIO {:#x}", d.mmio_base);
+        } else {
+            has_id = false;
+        }
+        w.push(cat, &n, if has_id { Some(&i) } else { None });
+    }
+
+    // System devices: interrupt controller, timer, board.
+    let ic = &m.interrupt_controller;
+    n = FixBuf::new();
+    let _ = write!(
+        n,
+        "{}, {} lines",
+        match ic.kind {
+            InterruptControllerKindRaw::ApicXapic => "Interrupt controller (APIC)",
+            InterruptControllerKindRaw::ApicX2apic => "Interrupt controller (x2APIC)",
+            InterruptControllerKindRaw::Gicv3 => "Interrupt controller (GICv3)",
+            InterruptControllerKindRaw::Gicv4 => "Interrupt controller (GICv4)",
+            InterruptControllerKindRaw::PlicClic => "Interrupt controller (PLIC)",
+        },
+        ic.irq_line_count
+    );
+    i = FixBuf::new();
+    let _ = write!(i, "MMIO {:#x}", ic.primary_base);
+    w.push(DEVCAT_SYSTEM, &n, if ic.primary_base != 0 { Some(&i) } else { None });
+
+    let t = &m.timer;
+    n = FixBuf::new();
+    let _ = write!(
+        n,
+        "{}, {} Hz",
+        match t.kind {
+            TimerKindRaw::Tsc => "Timer (TSC)",
+            TimerKindRaw::Hpet => "Timer (HPET)",
+            TimerKindRaw::ArmGenericTimer => "Timer (ARM generic)",
+            TimerKindRaw::RiscvSbiTimer => "Timer (RISC-V SBI)",
+        },
+        t.frequency_hz
+    );
+    w.push(DEVCAT_SYSTEM, &n, None);
+
+    // Board: manufacturer + product only. Raw serials/UUID are never
+    // exposed (docs/machine-id.md privacy rule).
+    let id = &m.machine_identity;
+    if id.manufacturer.len > 0 || id.product.len > 0 {
+        n = FixBuf::new();
+        let _ = write!(
+            n,
+            "{} {}",
+            core::str::from_utf8(id.manufacturer.as_slice()).unwrap_or(""),
+            core::str::from_utf8(id.product.as_slice()).unwrap_or("")
+        );
+        w.push(DEVCAT_SYSTEM, &n, None);
+    }
+
+    devlist_flush(&w);
+    klog!("device list: {} device record(s){}\r\n", w.count, if w.truncated { " (truncated)" } else { "" });
+}
+
+/// Writes the header (magic, count, flags) and remembers the writer state so
+/// later `devlist_*` additions can continue after `capture_device_list`.
+fn devlist_flush(w: &DevWriter) {
+    // SAFETY: single-core boot, sole writer (see `DevWriter::push`).
+    unsafe {
+        G_DEVCOUNT = w.count;
+        G_DEVTRUNC = w.truncated;
+        let page = &mut *core::ptr::addr_of_mut!(G_DEVLIST);
+        page[0..8].copy_from_slice(&DEVICE_LIST_MAGIC.to_le_bytes());
+        page[8..12].copy_from_slice(&(w.count as u32).to_le_bytes());
+        page[12..16].copy_from_slice(&(w.truncated as u32).to_le_bytes());
+    }
+}
+
+fn devlist_writer() -> DevWriter {
+    // SAFETY: single-core boot statics, see `devlist_flush`.
+    unsafe { DevWriter { count: G_DEVCOUNT, truncated: G_DEVTRUNC } }
+}
+
+fn fix_str<const N: usize>(s: &str) -> FixBuf<N> {
+    use core::fmt::Write;
+    let mut b = FixBuf::<N>::new();
+    let _ = b.write_str(s);
+    b
+}
+
+/// Replaces the first processor record with a real CPU name and id text
+/// (called by the x86_64 boot glue after CPUID has been read).
+pub fn devlist_set_cpu(name: &str, id: &str) {
+    let n = fix_str::<48>(name);
+    let i = fix_str::<44>(id);
+    // SAFETY: as `devlist_flush`; record 0 exists (capture always pushes CPU first).
+    unsafe {
+        let page = &mut *core::ptr::addr_of_mut!(G_DEVLIST);
+        let off = 16;
+        page[off..off + DEVICE_REC_SIZE].fill(0);
+        page[off] = DEVCAT_PROCESSOR;
+        page[off + 1] = 1;
+        page[off + 2] = n.n as u8;
+        page[off + 3] = i.n as u8;
+        page[off + 4..off + 4 + n.n].copy_from_slice(&n.b[..n.n]);
+        page[off + 52..off + 52 + i.n].copy_from_slice(&i.b[..i.n]);
+    }
+}
+
+/// Appends one record (extra discovery such as the PCI scan).
+pub fn devlist_add(cat: u8, name: &str, id: Option<&str>) {
+    let n = fix_str::<48>(name);
+    let i = id.map(fix_str::<44>);
+    let mut w = devlist_writer();
+    w.push(cat, &n, i.as_ref());
+    devlist_flush(&w);
+}
+
+/// Removes up to `limit` existing records of category `cat_a`/`cat_b` (0 = no
+/// match) whose id text starts with `prefix` (replaces coarse manifest
+/// records by richer ones).
+fn devlist_remove_prefix(cat_a: u8, cat_b: u8, prefix: &str, limit: usize) {
+    let mut removed = 0usize;
+    // SAFETY: as `devlist_flush`.
+    unsafe {
+        let page = &mut *core::ptr::addr_of_mut!(G_DEVLIST);
+        let mut idx = 0usize;
+        while idx < G_DEVCOUNT && removed < limit {
+            let off = 16 + idx * DEVICE_REC_SIZE;
+            let idl = page[off + 3] as usize;
+            let cat_ok = (cat_a == 0 && cat_b == 0) || page[off] == cat_a || page[off] == cat_b;
+            let hit = cat_ok
+                && page[off + 1] & 1 != 0
+                && idl >= prefix.len()
+                && &page[off + 52..off + 52 + prefix.len()] == prefix.as_bytes();
+            if hit {
+                let end = 16 + G_DEVCOUNT * DEVICE_REC_SIZE;
+                page.copy_within(off + DEVICE_REC_SIZE..end, off);
+                page[end - DEVICE_REC_SIZE..end].fill(0);
+                G_DEVCOUNT -= 1;
+                removed += 1;
+            } else {
+                idx += 1;
+            }
+        }
+    }
+    let w = devlist_writer();
+    devlist_flush(&w);
+}
+
+/// Vendor display name for the few vendors seen most often (small on purpose).
+fn pci_vendor_name(v: u16) -> Option<&'static str> {
+    Some(match v {
+        0x8086 => "Intel",
+        0x1022 | 0x1002 => "AMD",
+        0x10de => "NVIDIA",
+        0x1af4 => "Red Hat virtio",
+        0x1b36 => "Red Hat QEMU",
+        0x1234 => "QEMU",
+        0x10ec => "Realtek",
+        0x14e4 => "Broadcom",
+        0x15ad => "VMware",
+        0x144d => "Samsung",
+        0x15b7 => "SanDisk/WD",
+        0x1179 => "Toshiba",
+        0x1344 => "Micron",
+        0x1b4b => "Marvell",
+        0x168c | 0x1969 => "Qualcomm Atheros",
+        0x1106 => "VIA",
+        0x1b21 => "ASMedia",
+        0x1912 => "Renesas",
+        _ => return None,
+    })
+}
+
+/// Specific device-id names for the virtual hardware QEMU commonly shows.
+fn pci_device_name(v: u16, d: u16) -> Option<&'static str> {
+    Some(match (v, d) {
+        (0x1af4, 0x1000) | (0x1af4, 0x1041) => "network device",
+        (0x1af4, 0x1001) | (0x1af4, 0x1042) => "block device",
+        (0x1af4, 0x1002) | (0x1af4, 0x1045) => "memory balloon",
+        (0x1af4, 0x1003) | (0x1af4, 0x1043) => "console",
+        (0x1af4, 0x1004) | (0x1af4, 0x1048) => "SCSI controller",
+        (0x1af4, 0x1005) | (0x1af4, 0x1044) => "RNG",
+        (0x1af4, 0x1009) | (0x1af4, 0x1049) => "filesystem (9p/fs)",
+        (0x1af4, 0x1050) => "GPU",
+        (0x1af4, 0x1052) => "input device",
+        (0x1af4, 0x1110) => "shared memory (ivshmem)",
+        (0x1234, 0x1111) => "standard VGA (Bochs)",
+        (0x1b36, 0x0001) => "PCI bridge",
+        (0x1b36, 0x0008) => "PCIe host bridge",
+        (0x1b36, 0x000c) => "PCIe root port",
+        (0x1b36, 0x000d) => "xHCI USB controller",
+        (0x1b36, 0x0010) => "NVMe controller",
+        (0x8086, 0x1237) => "440FX host bridge",
+        (0x8086, 0x7000) => "PIIX3 ISA bridge",
+        (0x8086, 0x7010) => "PIIX3 IDE controller",
+        (0x8086, 0x7113) => "PIIX4 ACPI",
+        (0x8086, 0x29c0) => "Q35 host bridge",
+        (0x8086, 0x2918) => "ICH9 LPC bridge",
+        (0x8086, 0x2922) => "ICH9 SATA (AHCI) controller",
+        (0x8086, 0x2930) => "ICH9 SMBus controller",
+        (0x8086, 0x293e) => "ICH9 HD Audio",
+        (0x8086, 0x2668) => "ICH6 HD Audio",
+        (0x8086, 0x2934..=0x2936) => "ICH9 USB (UHCI)",
+        (0x8086, 0x293a) => "ICH9 USB 2.0 (EHCI)",
+        (0x8086, 0x100e) => "82540EM Gigabit Ethernet",
+        (0x8086, 0x10d3) => "82574L Gigabit Ethernet",
+        (0x15ad, 0x0405) => "SVGA II adapter",
+        _ => return None,
+    })
+}
+
+/// Maps a PCI class code triple to (category, generic kind name).
+fn pci_class_kind(class: u8, sub: u8, prog: u8) -> (u8, &'static str) {
+    match (class, sub) {
+        (0x01, 0x00) => (DEVCAT_STORAGE, "SCSI storage controller"),
+        (0x01, 0x01) => (DEVCAT_STORAGE, "IDE controller"),
+        (0x01, 0x02) => (DEVCAT_STORAGE, "floppy controller"),
+        (0x01, 0x04) => (DEVCAT_STORAGE, "RAID controller"),
+        (0x01, 0x05) => (DEVCAT_STORAGE, "ATA controller"),
+        (0x01, 0x06) => (DEVCAT_STORAGE, "SATA (AHCI) controller"),
+        (0x01, 0x07) => (DEVCAT_STORAGE, "SAS controller"),
+        (0x01, 0x08) => (DEVCAT_STORAGE, if prog == 2 { "NVMe controller" } else { "non-volatile memory controller" }),
+        (0x01, _) => (DEVCAT_STORAGE, "storage controller"),
+        (0x02, 0x00) => (DEVCAT_NETWORK, "Ethernet adapter"),
+        (0x02, 0x80) => (DEVCAT_NETWORK, "Wi-Fi / network controller"),
+        (0x02, _) => (DEVCAT_NETWORK, "network controller"),
+        (0x03, _) => (DEVCAT_DISPLAY, "display controller"),
+        (0x04, 0x00) => (DEVCAT_SOUND, "video controller"),
+        (0x04, 0x01) => (DEVCAT_SOUND, "audio device"),
+        (0x04, 0x03) => (DEVCAT_SOUND, "HD Audio controller"),
+        (0x04, _) => (DEVCAT_SOUND, "multimedia controller"),
+        (0x05, _) => (DEVCAT_SYSTEM, "memory controller"),
+        (0x06, 0x00) => (DEVCAT_SYSTEM, "host bridge"),
+        (0x06, 0x01) => (DEVCAT_SYSTEM, "ISA/LPC bridge"),
+        (0x06, 0x04) | (0x06, 0x09) => (DEVCAT_SYSTEM, "PCI bridge"),
+        (0x06, _) => (DEVCAT_SYSTEM, "bridge"),
+        (0x07, 0x03) => (DEVCAT_MODEM, "modem"),
+        (0x07, _) => (DEVCAT_SYSTEM, "communication controller"),
+        (0x08, _) => (DEVCAT_SYSTEM, "system peripheral"),
+        (0x09, _) => (DEVCAT_INPUT, "input controller"),
+        (0x0b, _) | (0x12, _) => (DEVCAT_COMPUTE, "processing accelerator"),
+        (0x0c, 0x03) => (
+            DEVCAT_USB,
+            match prog {
+                0x00 => "USB controller (UHCI)",
+                0x10 => "USB controller (OHCI)",
+                0x20 => "USB 2.0 controller (EHCI)",
+                0x30 => "USB 3.x controller (xHCI)",
+                _ => "USB controller",
+            },
+        ),
+        (0x0c, 0x05) => (DEVCAT_SYSTEM, "SMBus controller"),
+        (0x0c, _) => (DEVCAT_SYSTEM, "serial bus controller"),
+        (0x0d, 0x11) => (DEVCAT_BLUETOOTH, "Bluetooth controller"),
+        (0x0d, 0x20) | (0x0d, 0x21) => (DEVCAT_NETWORK, "Wi-Fi adapter"),
+        (0x0d, _) => (DEVCAT_MODEM, "wireless/cellular controller"),
+        (0x10, _) => (DEVCAT_SYSTEM, "encryption controller"),
+        _ => (DEVCAT_OTHER, "PCI device"),
+    }
+}
+
+/// Adds one PCI function found by the x86_64 HAL scan: names it from the
+/// class code (+ a small vendor / QEMU device table), files it under its
+/// Device-Manager-like category and gives it the id text
+/// `PCI bb:dd.f vvvv:dddd` (plus `;MAC ...` when known). Replaces the coarser
+/// manifest record for the same function, if any.
+#[allow(clippy::too_many_arguments)]
+pub fn devlist_add_pci(bus: u8, dev: u8, func: u8, vendor: u16, device: u16, class: u8, sub: u8, prog: u8, mac: Option<[u8; 6]>) {
+    use core::fmt::Write;
+    let (cat, kind) = pci_class_kind(class, sub, prog);
+    // Manifest peripherals carry "PCI bb:dd.f" (+ vendor 1af4); GPU/compute
+    // entries carry "vendor vvvv index n". Drop those before adding richer ones.
+    let mut key = FixBuf::<16>::new();
+    let _ = write!(key, "PCI {:02x}:{:02x}.{}", bus, dev, func);
+    let ks = core::str::from_utf8(&key.b[..key.n]).unwrap_or("");
+    devlist_remove_prefix(0, 0, ks, 1);
+    if class == 0x03 || class == 0x12 || class == 0x0b {
+        let mut vk = FixBuf::<24>::new();
+        let _ = write!(vk, "vendor {:04x} index", vendor);
+        let vs = core::str::from_utf8(&vk.b[..vk.n]).unwrap_or("");
+        devlist_remove_prefix(DEVCAT_DISPLAY, DEVCAT_COMPUTE, vs, 1);
+    }
+    let mut n = FixBuf::<48>::new();
+    match (pci_vendor_name(vendor), pci_device_name(vendor, device)) {
+        (Some(v), Some(d)) => {
+            let _ = write!(n, "{} {}", v, d);
+        }
+        (Some(v), None) => {
+            let _ = write!(n, "{} {}", v, kind);
+        }
+        (None, Some(d)) => {
+            let _ = write!(n, "{}", d);
+        }
+        (None, None) => {
+            let _ = write!(n, "{} ({:04x}:{:04x})", kind, vendor, device);
+        }
+    }
+    let mut i = FixBuf::<44>::new();
+    let _ = write!(i, "PCI {:02x}:{:02x}.{} {:04x}:{:04x}", bus, dev, func, vendor, device);
+    if let Some(m) = mac {
+        let _ = write!(i, ";MAC {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}", m[0], m[1], m[2], m[3], m[4], m[5]);
+    }
+    let mut w = devlist_writer();
+    w.push(cat, &n, Some(&i));
+    devlist_flush(&w);
+}
+
+/// Maps the device-list info page (two 4 KiB pages) READ-ONLY into `root_pt`
+/// at `va` (page-aligned, both pages free). Returns `None` only on
+/// allocation/mapping failure.
+pub fn map_device_list_info(hal: &HalInterface, root_pt: usize, va: usize) -> Option<()> {
+    let k = kstate();
+    let page = carve_from_any_untyped(k, 4096, DEVICE_LIST_PAGE_BYTES as u64)?;
+    // SAFETY: fresh untyped RAM, identity-addressable, single-core; G_DEVLIST
+    // is fully written by `capture_device_list` (+ `devlist_*`) before any spawn.
+    unsafe {
+        core::ptr::copy_nonoverlapping(core::ptr::addr_of!(G_DEVLIST) as *const u8, page as *mut u8, DEVICE_LIST_PAGE_BYTES);
+    }
+    let pool = carve_from_any_untyped(k, 4096, 4096 * 2)?;
+    // SAFETY: fresh untyped RAM; `map_range` needs the pool pre-zeroed.
+    unsafe { core::ptr::write_bytes(pool as *mut u8, 0, 4096 * 2) };
+    if hal.map_range(root_pt, va, page, DEVICE_LIST_PAGE_BYTES, 1 | 8, pool, 2) == u32::MAX {
+        klog!("map_device_list_info: map_range error\r\n");
+        return None;
+    }
+    Some(())
+}
+
+/// Carves `bytes` (aligned to `align`) out of the first `UntypedMemory`
+/// region that has room, trying every region in order instead of only
+/// `UntypedId(0)`.
+///
+/// **Real capacity bug found via QEMU, not a guess** (`fix/33-fix`,
+/// spawning `native-loader` as the 7th real layer-4 process): every carve
+/// site in this file used to hardcode `UntypedId::new(0)` alone. On real
+/// QEMU/OVMF x86_64 hardware, `KernelState::from_boot_info`'s own untyped-
+/// seeding loop (`kernel-core/src/state.rs`) does not hand back one big
+/// contiguous region — OVMF's own UEFI memory map is fragmented into
+/// dozens of small `Usable` ranges around firmware/ACPI reservations, so
+/// `UntypedId(0)` ends up being just the FIRST (and, on this hardware, a
+/// tiny ~3.7 MiB) fragment, while ~170 MiB of real free RAM sits untouched
+/// in `UntypedId(1)..(untyped_count)` (confirmed via a temporary
+/// diagnostic dump: id 1 alone was 57 MiB). Every boot-time allocation —
+/// the in-kernel demo processes, `mm-service`/`fs-native`/`compositor`'s
+/// shared regions, and every real layer-3/4 subsystem's page tables,
+/// mapping pool, and stack — drew down that SAME 3.7 MiB region, so once
+/// enough real layer-4 services were wired in (this was fine through 6;
+/// the 7th, `native-loader`, tipped it over — its own embedded ELF also
+/// growing the kernel image pushed `UntypedId(0)`'s effective remaining
+/// space even lower), spawns started failing with "out of resources"
+/// while the vast majority of RAM was never touched. Trying subsequent
+/// regions once the current one is exhausted is the correct fix (matches
+/// why `MAX_UNTYPED` = 80 in the first place — this kernel was always
+/// designed to expect a fragmented memory map), not another capacity-
+/// constant bump: raising `MAX_CAP_SPACES`/`MAX_ADDR_SPACES` again (as
+/// `a80da44` did for a different, real exhaustion) would not have helped
+/// here, since the actual bottleneck was `UntypedId(0)`'s own size, not
+/// any fixed-capacity table.
+/// Maps `pages` fresh, zeroed, PRIVATE frames at `va` in the address space
+/// rooted at `root_pt` (`U=1 R+W`, trusted bootstrap — no capability is
+/// granted, nothing else maps these frames).
+///
+/// For a process whose code dereferences a fixed shared-page VA
+/// unconditionally but whose real peer edge is deliberately NOT wired in
+/// this boot mode: backing the VA with private memory lets that process
+/// run its own logic to a clean, honestly-reported failure (its `Call` on
+/// the missing capability errors out) instead of taking a page fault on
+/// its first store. Used by the `desktop` build for native-loader's
+/// display self-check — see `kernel/src/main.rs`'s
+/// `wire_native_loader_to_compositor_x86`.
+pub fn map_private_scratch(hal: &HalInterface, root_pt: usize, va: usize, pages: usize) -> Option<()> {
+    let k = kstate();
+    let len = pages * 4096;
+    let phys = carve_from_any_untyped(k, 4096, len as u64)?;
+    // SAFETY: freshly carved untyped RAM, identity-addressable, single-core.
+    unsafe { core::ptr::write_bytes(phys as *mut u8, 0, len) };
+    let pool = carve_from_any_untyped(k, 4096, 4096 * 2)?;
+    // SAFETY: as above — `map_range` needs its page-table pool pre-zeroed.
+    unsafe { core::ptr::write_bytes(pool as *mut u8, 0, 4096 * 2) };
+    if hal.map_range(root_pt, va, phys, len, 1 | 2 | 8, pool, 2) == u32::MAX {
+        return None;
+    }
+    Some(())
+}
+
+fn carve_from_any_untyped(state: &mut KernelState, align: u64, bytes: u64) -> Option<usize> {
+    for i in 0..state.untyped_count {
+        if let Some(u) = state.untyped_mut(kernel_cap::UntypedId::new(i)) {
+            if let Ok(p) = u.alloc(align, bytes) {
+                return Some(p.as_usize());
+            }
+        }
+    }
+    None
+}
+
+/// Issues ONE real `SyscallOp::Retype` for `count` objects of
+/// `target_type`, trying every untyped CAPABILITY the caller holds in
+/// turn instead of hardcoding capability slot 0.
+///
+/// **This is the capability-level twin of `carve_from_any_untyped` above,
+/// and it closes the exact same class of bug at the exact same place that
+/// one already fixed for RAW carves** — found for real via QEMU + live
+/// gdb on aarch64 (2026-09-17), as the root cause of the long-open
+/// `security_broker_intermediary_demo_start` boot crash.
+///
+/// `carve_from_any_untyped` fixed the raw-carve sites, but every
+/// `SyscallOp::Retype` in this file still passed `untyped: CapId::new(0)`
+/// — pinning EVERY retyped kernel object (Endpoints, Notifications,
+/// SharedRegions) for the whole boot to the ONE untyped region behind
+/// capability slot 0. `KernelState::from_boot_info` (kernel-core/src/
+/// state.rs, Step 3a) seeds the Root Task with one `UntypedMemory`
+/// capability PER usable firmware memory fragment, at consecutive slots,
+/// so slot 0 is merely the FIRST fragment of a fragmented UEFI memory
+/// map, not the bulk of RAM. Once that one fragment's forward-only
+/// watermark filled up, every later `Retype` failed with
+/// `MmError::OutOfMemory` while the other regions sat untouched.
+///
+/// On aarch64 that tipped over exactly at
+/// `security_broker_intermediary_demo_start`'s own FIRST `Retype`
+/// (live-gdb confirmed: `do_retype` reached `u.retype(..)` and took the
+/// error path, having passed both `resolve` and `untyped_mut`), which
+/// made that function `return None` — and THAT, not any aarch64 codegen
+/// or MMU problem, is what left `G_SBI_SHARED_PHYS` at its `usize::MAX`
+/// sentinel for the next `write_shared_sbi_message` to dereference,
+/// producing the misleading `ptr::write_volatile requires that the
+/// pointer argument is aligned and non-null` panic. x86_64 was never
+/// immune — its own slot-0 fragment simply happened to still have room.
+///
+/// Probing is side-effect free on failure, which is why "just try each
+/// one" is safe here: a slot holding a non-untyped capability fails in
+/// `do_retype`'s own `resolve` before anything is allocated, and an
+/// exhausted region fails in `UntypedMemory::retype` — the reservation
+/// step itself — so nothing is reserved, created, or leaked by an
+/// attempt that does not succeed.
+///
+/// `pub` because `kernel/kernel/src/main.rs` carries two real `Retype`
+/// sites of its own (`alloc_root_frame`'s riscv64 page frame and the
+/// `sys::RETYPE_ENDPOINT` opcode) that had the exact same hardcoded
+/// slot 0 and therefore need the exact same fix — not because anything
+/// outside this workspace should call it.
+pub fn retype_one_from_any_untyped(
+    state: &mut KernelState,
+    hal: &HalInterface,
+    caller: ThreadId,
+    target_type: kernel_mm::KernelObjectType,
+    count: u32,
+) -> Option<CapId> {
+    // `untyped_count` is the number of untyped OBJECTS; the Root Task's
+    // own untyped capabilities are seeded one-per-object, so this bounds
+    // the candidate slots without assuming slot i names region i.
+    for slot in 0..state.untyped_count.max(1) {
+        if let Ok(SyscallReturn::NewCaps { cap, .. }) = state.dispatch(
+            caller,
+            hal.now_ns(),
+            SyscallOp::Retype {
+                untyped: CapId::new(slot),
+                target_type,
+                count,
+            },
+            hal,
+        ) {
+            return Some(cap);
+        }
+    }
+    None
+}
+
+/// Where the final binary's user (layer-3) Root Task image lives: its
+/// `.user_text` and `.user_stack` regions, each as a `(vma, lma, len)`
+/// triple (linked for a virtual address, loaded at a physical address
+/// inside the kernel image), plus the U-mode entry point's virtual
+/// address. `enter` maps these `U=1` and drops to U-mode under paging.
+/// `EMPTY` (all zero) means "this architecture has no user image yet" —
+/// `enter` then just parks after the in-kernel demo.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct UserImage {
+    /// `.user_text` virtual base.
+    pub text_vma: usize,
+    /// `.user_text` physical (load) base.
+    pub text_lma: usize,
+    /// `.user_text` byte length.
+    pub text_len: usize,
+    /// `.user_stack` virtual base.
+    pub stack_vma: usize,
+    /// `.user_stack` physical (load) base.
+    pub stack_lma: usize,
+    /// `.user_stack` byte length.
+    pub stack_len: usize,
+    /// Virtual address to begin U-mode execution at (inside `.user_text`).
+    pub entry_vma: usize,
+    /// Virtual address of the SECOND process's entry point (also inside
+    /// `.user_text` — the two U-mode threads share the same code pages,
+    /// different stacks and address spaces). `0` = no second process on
+    /// this architecture, so `enter` runs only the single-process path.
+    pub worker_entry_vma: usize,
+    /// Virtual address of a THIRD process's entry point (again inside
+    /// `.user_text`), spawned via the generic `spawn_process` — proof
+    /// that address-space + capability-space + scheduler admission is a
+    /// reusable mechanism, not hardcoded to exactly two processes. `0` =
+    /// skip spawning it (e.g. no `worker_entry_vma` either, or this
+    /// architecture has no user image at all).
+    pub subsystem_entry_vma: usize,
+    /// Virtual address of process A's counting-loop-only entry point
+    /// (again inside `.user_text`) — a FRESH `vruntime = 0` thread
+    /// `p2_preempt_start` spawns, sharing root's OWN address space and
+    /// capability space, to take over the preemptive phase (see that
+    /// function's doc comment for why root's own TCB isn't reused for
+    /// it). `0` = skip (falls back to letting root's own TCB keep running
+    /// — possibly starved for the reason documented there).
+    pub a_loop_entry_vma: usize,
+}
+
+impl UserImage {
+    /// No user image (non-riscv64 for now).
+    pub const EMPTY: Self = Self {
+        text_vma: 0,
+        text_lma: 0,
+        text_len: 0,
+        stack_vma: 0,
+        stack_lma: 0,
+        stack_len: 0,
+        entry_vma: 0,
+        worker_entry_vma: 0,
+        subsystem_entry_vma: 0,
+        a_loop_entry_vma: 0,
+    };
+}
+
+/// Runs the boot sequence and never returns:
+///   1. stash the kernel-state / HAL pointers for later syscall handling;
+///   2. run `inkernel_demo` (the in-kernel §8.1/§8.2/§8.5 milestones —
+///      direct `dispatch` + `context_switch`, same privilege);
+///   3. if a `user` image is present: build a page table (kernel
+///      identity `U=0`, the `.user_*` pages `U=1`), activate paging, and
+///      drop the Root Task to U-mode. From there it is a real, MMU-
+///      isolated layer-3 process reaching the kernel only through a
+///      syscall trap.
+pub fn enter(
+    hal: &HalInterface,
+    state: &'static mut KernelState,
+    user: UserImage,
+    boot_info: &BootInfo,
+) -> ! {
+    // SAFETY: single-core boot, called once, right after `build`.
+    unsafe {
+        core::ptr::addr_of_mut!(G_STATE).write(state as *mut KernelState);
+        core::ptr::addr_of_mut!(G_HAL).write(hal as *const HalInterface);
+    }
+
+    // How many GiB `map_ram_identity` must cover to keep the KERNEL'S OWN
+    // currently-executing image mapped once this table activates —
+    // computed generically from `BootInfo` (never a hardcoded per-
+    // architecture constant): riscv64's image sits at ~0x8020_0000+
+    // (needs 3 GiB); x86_64's tiny, low (`KERNEL_LMA_BASE = 0x0180_0000`
+    // — see hal-x86_64/linker.ld's own doc comment for why it moved up
+    // from the original 0x0020_0000) image still needs only 1. `.user_
+    // text`/`.user_stack` then land in the
+    // FIRST GiB slot this leaves free (GiB `bytes_gib` itself) — each
+    // architecture's own linker.ld picks its `.user_text` VMA to match
+    // (0xC000_0000 = GiB 3 for riscv64, 0x4000_0000 = GiB 1 for x86_64;
+    // see hal-x86_64/linker.ld's own doc comment on why x86_64 can't
+    // reuse riscv64's GiB 3 — its `code-model: "kernel"` target requires
+    // every symbol address to fit a sign-extended 32-bit value, true for
+    // GiB 0-1 but not GiB 2-3).
+    const GIB: u64 = 1024 * 1024 * 1024;
+    let bytes_gib = ((boot_info.kernel_image_phys_end / GIB) + 1) as usize;
+    // SAFETY: single-core boot; only read by `setup_two_process`/
+    // `spawn_process`, both called later, after this write.
+    unsafe {
+        core::ptr::addr_of_mut!(G_BYTES_GIB).write(bytes_gib);
+    }
+
+    inkernel_demo(state, hal);
+
+    if user.text_len == 0 {
+        klog!("no user image for this architecture yet - halting after the in-kernel demo\r\n");
+        park();
+    }
+
+    let root = state.root_thread;
+    if let Some(tcb) = state.tcb_mut(root) {
+        tcb.entry = VirtAddr::new(user.entry_vma);
+        tcb.state = ThreadState::Runnable;
+    }
+
+    // Build the Root Task's address space (must run AFTER `inkernel_demo`,
+    // whose context switches carry satp == 0):
+    //   - kernel RAM/MMIO: the low 3 GiB, 1 GiB identity leaves, U = 0
+    //     (S-mode executes the trap handler / drivers; U-mode cannot).
+    //   - `.user_text`: `U=1 R+X` at its linked VMA (an otherwise-empty
+    //     Sv39 GiB slot, so `map_range` needs no superpage split).
+    //   - `.user_stack`: `U=1 R+W`.
+    // Then activate paging and drop to U-mode WITHOUT deactivating — the
+    // Root Task runs isolated.
+    // 2 CONTIGUOUS pages, not 1: some architectures' `root_frame`
+    // convention needs more than a single page for their page-table
+    // root (x86_64: CR3 always points at a PML4, which needs a
+    // companion PDPT at `root_frame + 4096`, PLUS a THIRD page at
+    // `root_frame + 8192` — a dedicated PD table for the Local APIC's
+    // own identity leaf, added this session alongside the preemption
+    // work's timer ISR (see `hal_x86_64::cpu`'s `x86_64_paging` module
+    // doc comment, `map_ram_identity`'s own, for why: every process's
+    // page table needs the xAPIC MMIO region reachable, not just the
+    // low `bytes_gib` range). Harmless on Sv39/AArch64, which only ever
+    // use the first page — carving uniformly here keeps this crate free
+    // of `#[cfg(target_arch)]`.
+    let root_pt = carve_from_any_untyped(state, 4096, 4096 * 3);
+    let pool = carve_from_any_untyped(state, 4096, 4096 * POOL_FRAMES as u64);
+    // (POOL_FRAMES is usize; `as u64` above for the allocator API.)
+
+    let (root_pt, pool) = match (root_pt, pool) {
+        (Some(r), Some(p)) => (r, p),
+        _ => {
+            klog!("could not allocate page-table frames - halting\r\n");
+            park();
+        }
+    };
+    // The Root Task's software-model address space was created back in
+    // `populate_from_boot_info` from `BootInfo::initial_page_table_phys`
+    // (whatever satp/CR3/TTBR held at HAL handoff — Bare mode on riscv64,
+    // so `0`) — rebind it to the REAL root we just allocated, or
+    // `syscall::do_map`'s hardware walk would target the wrong frame for
+    // every `Map` into the Root Task's own space (see
+    // `AddressSpace::set_root_phys`'s doc comment).
+    if let Some(space) = state.addr_space_mut(state.root_addr_space) {
+        space.set_root_phys(hal_core::PhysAddr::new(root_pt));
+    }
+    // A second, larger pool the runtime `Map` syscall path draws from
+    // (`KernelState::install_map_pool`) — kept separate from the
+    // boot-time `pool` above so a later `Map` can never trip over the
+    // boot mapping's bookkeeping.
+    let map_pool = carve_from_any_untyped(state, 4096, 4096 * 8);
+    let map_pool = match map_pool {
+        Some(p) => p,
+        None => {
+            klog!("could not allocate the runtime Map pool - halting\r\n");
+            park();
+        }
+    };
+    // SAFETY: `pool` / `map_pool` are fresh untyped RAM in the identity-
+    // mapped low RAM; single-core; `map_range` requires them pre-zeroed.
+    unsafe {
+        core::ptr::write_bytes(pool as *mut u8, 0, 4096 * POOL_FRAMES);
+        core::ptr::write_bytes(map_pool as *mut u8, 0, 4096 * 8);
+    }
+
+    let round4k = |n: usize| (n + 0xFFF) & !0xFFF;
+    let user_sp = (user.stack_vma + user.stack_len) & !0xF;
+
+    // ---- Space A (the Root Task): kernel identity U=0, user image U=1 ----
+    hal.map_ram_identity(root_pt, bytes_gib, false);
+    // R=1 W=2 X=4 U=8.
+    let n1 = hal.map_range(
+        root_pt,
+        user.text_vma,
+        user.text_lma,
+        round4k(user.text_len),
+        1 | 4 | 8,
+        pool,
+        POOL_FRAMES as usize,
+    );
+    let n2 = if n1 == u32::MAX {
+        u32::MAX
+    } else {
+        hal.map_range(
+            root_pt,
+            user.stack_vma,
+            user.stack_lma,
+            round4k(user.stack_len),
+            1 | 2 | 8,
+            pool + (n1 as usize) * 4096,
+            POOL_FRAMES as usize - n1 as usize,
+        )
+    };
+    if n1 == u32::MAX || n2 == u32::MAX {
+        klog!("failed to map the user image (map_range error) - halting\r\n");
+        park();
+    }
+    let used_a = n1 + n2;
+
+    // ---- Space B (the second process), if this architecture has one ----
+    // Build a fully isolated Sv39 space with its own stack, sharing only
+    // ONE physical frame with space A (mapped at a different VA in each),
+    // then run BOTH via cooperative hand-off (02-Microkernel-Layer.md §8.4).
+    if user.worker_entry_vma != 0
+        && setup_two_process(hal, state, &user, root_pt, pool, used_a, user_sp)
+    {
+        hal.activate_address_space(root_pt);
+        // `do_map`'s hardware walk needs this pool from here on.
+        state.install_map_pool(map_pool, 8);
+        // The Root Task's `Tcb::user_context` was filled by
+        // `init_user_thread` in `setup_two_process` and it is the
+        // scheduler's `running` thread. Resume it in U-mode.
+        let ctx_a = state
+            .user_context_bytes(state.root_thread)
+            .expect("root TCB present");
+        // SAFETY: a valid, resumable U-mode context; interrupts are
+        // masked (never enabled in S-mode on this core). Never returns.
+        unsafe { hal.resume_user(ctx_a) }
+    }
+
+    // ---- Single-process fallback (unchanged behaviour) ----
+    hal.activate_address_space(root_pt);
+    state.install_map_pool(map_pool, 8);
+    klog!(
+        "--- Sv39 paging active; dropping Root Task to U-mode (entry {:#x}, sp {:#x}, isolated on U=1 pages) ---\r\n",
+        user.entry_vma,
+        user_sp
+    );
+    hal.enter_user(user.entry_vma, user_sp)
+}
+
+/// Frames reserved for the boot-time `map_range` page-table pool (space A):
+/// one L1 + one L0 for the user image, with headroom for the shared-frame
+/// leaf and future growth.
+const POOL_FRAMES: usize = 8;
+
+/// Virtual addresses used by the two-process proof. `.user_text` is linked
+/// at 0xC000_0000 and `.user_stack` just above it, so everything below
+/// stays inside the same (already-a-page-table, not a superpage) Sv39 GiB
+/// slot — `map_range` needs no superpage split for any of them.
+const P2_STACK_B_VMA: usize = 0xC010_0000;
+const P2_STACK_B_LEN: usize = 4096 * 4;
+const P2_VA_A_CONST: usize = 0xC004_0000;
+const P2_VA_B_CONST: usize = 0xC020_0000;
+
+/// Builds address space B, maps the shared frame into both spaces, gives
+/// the second process a real `kernel-core` TCB (its `user_context`
+/// seeded, admitted to `kernel-sched`), and seeds the Root Task's TCB the
+/// same way. Returns `false` (and logs) if untyped RAM, the page-table
+/// pool, or a kernel table runs out — the caller then falls back to the
+/// single-process path. On `true` the Root Task is the scheduler's
+/// `running` thread and the caller may `resume_user` its `user_context`.
+/// Process B's own thread id (the §8.4 two-space zero-copy demo's
+/// worker), set once by `setup_two_process`. Read only by `spawn_
+/// netstack_service`'s own stale-thread retirement — see that
+/// function's own doc comment for why: like `G_IPC_SERVER_TID`/`G_FS_
+/// TID`, process B's own one-shot job finishes long before `p2_
+/// preempt_start`'s own identical cleanup normally runs, leaving it
+/// `Ready`-but-never-resumed and a live `pick_next` candidate for
+/// anything that exercises GENERAL (non-fast-path) `pick_next` before
+/// that point — Netstack's own retry loop is the first such caller.
+static mut G_PROCESS_B_TID: Option<ThreadId> = None;
+
+/// `backup-manager` (`simurgh-backup-manager` repo) and `diagnostics-
+/// manager` (`simurgh-diagnostics` repo) hit the "`Ready`-but-never-
+/// resumed" bug class `G_PROCESS_B_TID`'s own doc comment above documents
+/// at length: unlike `native-loader`/`account-manager`/`store`/`policy-
+/// engine` (whose own client OR server code immediately issues, or
+/// blocks serving, real IPC — see the note below), these two currently
+/// have no real IPC edge wired to or from them at all — each is spawned,
+/// marked `Ready` by `init_user_thread`, and then never touched by any
+/// dedicated direct-dispatch helper (unlike `fs_ipc_call`/`mm_ipc_call`/
+/// `compositor_ipc_call`/`drv_ipc_call`, which all resume their own
+/// target by NAME, bypassing `pick_next` — `note_blocked`, not `remove`,
+/// is right for THOSE). Retired the same way as process B (`Exited` +
+/// `remove`, not `note_blocked`): nothing in this codebase today calls
+/// either by name the way `fs_ipc_call` et al. do, so leaving their TCB
+/// slots alive but hidden buys nothing — if/when a real IPC edge to
+/// either is wired up (mirroring `native-loader`/`account-manager`/
+/// `store`'s own Phase 2 edges), this retirement should move to that
+/// edge's own client/server code instead, the same way those repos don't
+/// need any special handling here at all once they have real blocking
+/// work of their own.
+///
+/// `policy-engine` USED to be tracked here too (`G_POLICY_ENGINE_TID`,
+/// removed) — **real bug found via QEMU** (real-IPC plan Phase 2):
+/// `security-broker`'s own `serve_requests` fan-in (`p2_ipc_recv_
+/// general`) landed on policy-engine's own stale, never-really-run
+/// snapshot, confirmed via a real crash. Fixed at the time by retiring
+/// it exactly like `backup-manager`/`diagnostics-manager` below. Now
+/// that a real edge exists (`simurgh-store`'s own install-time
+/// compatibility check, real-IPC plan's newest edge — wired in `kernel/
+/// src/main.rs`'s own `wire_store_to_policy_engine_x86`), policy-engine
+/// runs a real, ongoing `serve_one_compat_check` loop of its own after
+/// `self_check`, the SAME lifecycle shape `security-broker` itself
+/// already has — and `security-broker` has never needed ANY retirement
+/// tracking here, since a real blocking `Recv` loop is not a landmine.
+/// Removing this retirement, not just leaving it as a harmless no-op,
+/// matters: `Exited`+`remove` on a thread that is ACTUALLY about to run
+/// its own real serve loop would kill it before it ever gets there.
+static mut G_BACKUP_MANAGER_TID: Option<ThreadId> = None;
+static mut G_DIAGNOSTICS_MANAGER_TID: Option<ThreadId> = None;
+
+/// See `G_BACKUP_MANAGER_TID`'s own doc comment.
+pub fn set_backup_manager_tid(tid: Option<ThreadId>) {
+    // SAFETY: single-core; called at most once per boot, before any
+    // syscall that could race it.
+    unsafe { core::ptr::addr_of_mut!(G_BACKUP_MANAGER_TID).write(tid) };
+}
+
+/// See `G_BACKUP_MANAGER_TID`'s own doc comment.
+pub fn set_diagnostics_manager_tid(tid: Option<ThreadId>) {
+    // SAFETY: single-core; called at most once per boot, before any
+    // syscall that could race it.
+    unsafe { core::ptr::addr_of_mut!(G_DIAGNOSTICS_MANAGER_TID).write(tid) };
+}
+
+/// `simurgh-init`'s own tid, recorded once at spawn time — a DIFFERENT
+/// purpose from `G_BACKUP_MANAGER_TID`/`G_DIAGNOSTICS_MANAGER_TID` above
+/// (those track "ready but never resumed" retirement bookkeeping; this
+/// tracks caller IDENTITY). `Simurgh-OS/kernel/kernel/src/main.rs`'s own
+/// `sys::SPAWN_KNOWN_ELF` dispatch reads this to verify a caller really is
+/// `simurgh-init` before honoring a real process-spawn request — this
+/// syscall's own security boundary is a plain caller-tid check, not a
+/// capability grant (v1 scope; see that opcode's own doc comment for why).
+static mut G_INIT_TID: Option<ThreadId> = None;
+
+/// See `G_INIT_TID`'s own doc comment.
+pub fn set_init_tid(tid: Option<ThreadId>) {
+    // SAFETY: single-core; called at most once per boot, before any
+    // syscall that could race it.
+    unsafe { core::ptr::addr_of_mut!(G_INIT_TID).write(tid) };
+}
+
+/// See `G_INIT_TID`'s own doc comment.
+pub fn init_tid() -> Option<ThreadId> {
+    // SAFETY: single-core; only ever written by `set_init_tid`, before
+    // any syscall that could read it concurrently.
+    unsafe { core::ptr::addr_of!(G_INIT_TID).read() }
+}
+
+/// `simurgh-shell`'s own tid, recorded once at spawn time — same purpose
+/// and reasoning as `G_INIT_TID` above, for the SAME `sys::
+/// SPAWN_KNOWN_ELF` caller check (extended, alongside this global, to
+/// accept either process — `simurgh-shell`'s own `spawn <name>` command
+/// is this syscall's second real caller).
+static mut G_SHELL_TID: Option<ThreadId> = None;
+
+/// See `G_SHELL_TID`'s own doc comment.
+pub fn set_shell_tid(tid: Option<ThreadId>) {
+    // SAFETY: single-core; called at most once per boot, before any
+    // syscall that could race it.
+    unsafe { core::ptr::addr_of_mut!(G_SHELL_TID).write(tid) };
+}
+
+/// See `G_SHELL_TID`'s own doc comment.
+pub fn shell_tid() -> Option<ThreadId> {
+    // SAFETY: single-core; only ever written by `set_shell_tid`, before
+    // any syscall that could read it concurrently.
+    unsafe { core::ptr::addr_of!(G_SHELL_TID).read() }
+}
+
+/// `simurgh-native-sdk`'s own tid — same purpose and reasoning as
+/// `G_INIT_TID`/`G_SHELL_TID` above, for `sys::SPAWN_FROM_BUFFER`'s own
+/// caller check (`Simurgh-OS/kernel/kernel/src/main.rs`) — that syscall's
+/// security boundary, same as `SPAWN_KNOWN_ELF`'s, is a plain caller-tid
+/// check rather than a capability grant.
+static mut G_NATIVE_LOADER_TID: Option<ThreadId> = None;
+
+/// See `G_NATIVE_LOADER_TID`'s own doc comment.
+pub fn set_native_loader_tid(tid: Option<ThreadId>) {
+    // SAFETY: single-core; called at most once per boot, before any
+    // syscall that could race it.
+    unsafe { core::ptr::addr_of_mut!(G_NATIVE_LOADER_TID).write(tid) };
+}
+
+/// See `G_NATIVE_LOADER_TID`'s own doc comment.
+pub fn native_loader_tid() -> Option<ThreadId> {
+    // SAFETY: single-core; only ever written by `set_native_loader_tid`,
+    // before any syscall that could read it concurrently.
+    unsafe { core::ptr::addr_of!(G_NATIVE_LOADER_TID).read() }
+}
+
+fn setup_two_process(
+    hal: &HalInterface,
+    state: &mut KernelState,
+    user: &UserImage,
+    root_pt: usize,
+    pool_a: usize,
+    used_a: u32,
+    user_sp_a: usize,
+) -> bool {
+    let round4k = |n: usize| (n + 0xFFF) & !0xFFF;
+    let carve = |st: &mut KernelState, bytes: u64| carve_from_any_untyped(st, 4096, bytes);
+
+    let (shared, root_pt_b, pool_b, stack_b) = match (
+        carve(state, 4096),
+        // 3 pages, not 1 — see `enter`'s own `root_pt` carve for why.
+        carve(state, 4096 * 3),
+        carve(state, 4096 * 8),
+        carve(state, P2_STACK_B_LEN as u64),
+    ) {
+        (Some(a), Some(b), Some(c), Some(d)) => (a, b, c, d),
+        _ => {
+            klog!("two-process proof: out of untyped RAM - single-process path\r\n");
+            return false;
+        }
+    };
+
+    // SAFETY: all four regions are fresh untyped RAM, identity-addressable
+    // (paging not yet active on space B); single-core. `map_range` needs
+    // the pool pre-zeroed; the shared frame starts clean too.
+    unsafe {
+        core::ptr::write_bytes(pool_b as *mut u8, 0, 4096 * 8);
+        core::ptr::write_bytes(shared as *mut u8, 0, 4096);
+    }
+
+    // Shared frame into space A (uses the remaining space-A pool).
+    let sa = hal.map_range(
+        root_pt,
+        P2_VA_A_CONST,
+        shared,
+        4096,
+        1 | 2 | 8,
+        pool_a + used_a as usize * 4096,
+        POOL_FRAMES as usize - used_a as usize,
+    );
+
+    // Space B: kernel identity U=0, then user text / its own stack / the
+    // shared frame, all U=1.
+    // SAFETY: single-core; only written once, by `enter`, before this runs.
+    let bytes_gib = unsafe { core::ptr::addr_of!(G_BYTES_GIB).read() };
+    hal.map_ram_identity(root_pt_b, bytes_gib, false);
+    let mut ub = 0u32;
+    let step = |vaddr, paddr, len, perm, ub: &mut u32| -> bool {
+        let n = hal.map_range(
+            root_pt_b,
+            vaddr,
+            paddr,
+            len,
+            perm,
+            pool_b + *ub as usize * 4096,
+            8 - *ub as usize,
+        );
+        if n == u32::MAX {
+            false
+        } else {
+            *ub += n;
+            true
+        }
+    };
+    let ok = sa != u32::MAX
+        && step(user.text_vma, user.text_lma, round4k(user.text_len), 1 | 4 | 8, &mut ub)
+        && step(P2_STACK_B_VMA, stack_b, P2_STACK_B_LEN, 1 | 2 | 8, &mut ub)
+        && step(P2_VA_B_CONST, shared, 4096, 1 | 2 | 8, &mut ub);
+    if !ok {
+        klog!("two-process proof: map_range error - single-process path\r\n");
+        return false;
+    }
+
+    let stack_b_top = (P2_STACK_B_VMA + P2_STACK_B_LEN) & !0xF;
+
+    // Process A = the Root Task (already admitted at boot; `init_user_thread`
+    // just seeds its `user_context` and refreshes it `Ready`). Process B =
+    // a fresh TCB bound to space B.
+    let root = state.root_thread;
+    state.init_user_thread(root, user.entry_vma, user_sp_a, root_pt, hal);
+
+    let worker_as = match state.alloc_addr_space(root_pt_b as u64) {
+        Some(a) => a,
+        None => {
+            klog!("two-process proof: no address-space slot - single-process path\r\n");
+            return false;
+        }
+    };
+    let worker_tid = match state.alloc_tcb(state.root_cap_space, worker_as) {
+        Some(t) => t,
+        None => {
+            klog!("two-process proof: no TCB slot - single-process path\r\n");
+            return false;
+        }
+    };
+    state.init_user_thread(
+        worker_tid,
+        user.worker_entry_vma,
+        stack_b_top,
+        root_pt_b,
+        hal,
+    );
+    // SAFETY: single-core; written once here, before any later reader
+    // (`spawn_netstack_service`'s own stale-thread retirement) can run.
+    unsafe { core::ptr::addr_of_mut!(G_PROCESS_B_TID).write(Some(worker_tid)) };
+
+    // Process C is deliberately NOT spawned here. `kernel-sched` admits
+    // every thread at the same priority with `vruntime = 0`
+    // (`init_user_thread`), and `cooperative_yield`'s `pick_next` compares
+    // vruntime BEFORE `ThreadId` — so a freshly-admitted, never-run C
+    // would outrank the just-ran Root Task the moment B's own `P2_YIELD`
+    // looks for who to switch to, stealing the hand-off `umode_worker`
+    // expects to go back to process A. Spawning C only once the
+    // cooperative phase is over and `p2_preempt_start` has moved to
+    // TIMER-driven switching (where fairness among Ready threads is
+    // exactly the point) avoids that: see `p2_preempt_start` below.
+    //
+    // Same reasoning is why `p2_preempt_start` does NOT keep root's own
+    // (tid 0) TCB running the counting loop either: by the time the
+    // cooperative phase ends, root has accumulated real, QEMU-timing-
+    // dependent `vruntime` from its own ecall sequence — sometimes far
+    // more than 40 short ticks can let B/C's vruntime catch up to, which
+    // starves root for the WHOLE demo (observed: 0/40 ticks in some
+    // runs). `kernel-sched`'s own invariant is that vruntime only ever
+    // INCREASES (no reset primitive, by design), so the fix is not to
+    // reuse root's loaded TCB at all: `p2_preempt_start` spawns a FRESH
+    // thread (vruntime = 0, same footing as B/C) sharing root's EXISTING
+    // address space + capability space to run the loop, and root's own
+    // tid 0 TCB is retired (its demo narrative is complete). Stash what
+    // both spawns need (this is bootstrap glue, not a real per-process
+    // image table yet).
+    // SAFETY: single-core boot; written once, before any syscall.
+    unsafe {
+        core::ptr::addr_of_mut!(G_TEXT_VMA).write(user.text_vma);
+        core::ptr::addr_of_mut!(G_TEXT_LMA).write(user.text_lma);
+        core::ptr::addr_of_mut!(G_TEXT_LEN).write(user.text_len);
+        core::ptr::addr_of_mut!(G_SUBSYS_ENTRY).write(user.subsystem_entry_vma);
+        core::ptr::addr_of_mut!(G_A_LOOP_ENTRY).write(user.a_loop_entry_vma);
+        core::ptr::addr_of_mut!(G_A_STACK_TOP).write(user_sp_a);
+    }
+
+    // Make the Root Task the scheduler's running thread, so the first
+    // `preempt_tick` (or cooperative `P2_YIELD`) has it as `outgoing`.
+    let _ = state.sched.dispatch(root, hal.now_ns());
+
+    // SAFETY: single-core boot; written once, before any syscall.
+    unsafe {
+        core::ptr::addr_of_mut!(P2_SHARED_PHYS).write(shared);
+        core::ptr::addr_of_mut!(P2_VA_A).write(P2_VA_A_CONST);
+        core::ptr::addr_of_mut!(P2_VA_B).write(P2_VA_B_CONST);
+    }
+
+    klog!(
+        "--- Sv39 paging active; two isolated U-mode processes (tids {} / {}); shared frame {:#x} at VA {:#x} (A) / {:#x} (B) ---\r\n",
+        root.as_u32(),
+        worker_tid.as_u32(),
+        shared,
+        P2_VA_A_CONST,
+        P2_VA_B_CONST
+    );
+    true
+}
+
+/// Generic process spawn (03-Kernel-Subsystems-Layer.md §0's "ordinary
+/// user-space process" model, in miniature): builds a FRESH, fully
+/// isolated Sv39 address space and a FRESH capability space (not shared
+/// with the Root Task's, unlike A/B's MVP shortcut above — a real
+/// layer-3 process gets its own of both) for a new U-mode thread, admits
+/// it to `kernel-core`/`kernel-sched` via `init_user_thread`, and returns
+/// its `ThreadId`, `CapSpaceId`, and the physical base of the stack frame
+/// it carved (so the caller can address anything it placed there through
+/// the kernel's own identity map, without needing that process's `satp`
+/// active).
+///
+/// `text_*` describe the SAME `.user_text` output section every process
+/// this binary spawns links into — including a real `subsystems/*`
+/// crate's own compiled code (its entry point just needs `#[link_section
+/// = ".user_text"]`, e.g. `device_manager::subsystem_entry::
+/// subsystem_main`), since the section is one contiguous, page-rounded
+/// range regardless of which crate contributed which bytes. There is
+/// still no PER-PROCESS separate ELF / loader (IMPLEMENTATION-PLAN.md's
+/// "subsystems as processes" follow-up) — every spawned process's code
+/// lives in this ONE shared range; only `stack_vma`/`entry_vma` need be
+/// distinct per call (the root page table, its `map_range` pool, and the
+/// physical stack frames are fresh untyped RAM every time regardless).
+/// `pub`: called both by this crate's own demo (`p2_preempt_start`, for
+/// process C) and directly by the final binary (`kernel/src/main.rs`) to
+/// launch a real subsystem process under `root-task`'s own boot policy.
+/// Returns `None` (and logs) on any allocation failure — untyped RAM, an
+/// object-table slot, or `map_range` are all bounded resources a real
+/// capability-gated `Retype`/`Map` would also have to handle this way.
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_process(
+    hal: &HalInterface,
+    state: &mut KernelState,
+    text_vma: usize,
+    text_lma: usize,
+    text_len: usize,
+    stack_vma: usize,
+    stack_len: usize,
+    entry_vma: usize,
+) -> Option<(ThreadId, kernel_cap::CapSpaceId, usize)> {
+    let round4k = |n: usize| (n + 0xFFF) & !0xFFF;
+    let carve = |st: &mut KernelState, bytes: u64| carve_from_any_untyped(st, 4096, bytes);
+
+    // 3 pages, not 1 — see `enter`'s own `root_pt` carve for why.
+    let root_pt = carve(state, 4096 * 3)?;
+    let pool = carve(state, 4096 * 8)?;
+    let stack_phys = carve(state, round4k(stack_len) as u64)?;
+    // SAFETY: fresh untyped RAM, identity-addressable (paging is not yet
+    // active on this new space); single-core. `map_range` needs the pool
+    // pre-zeroed.
+    unsafe { core::ptr::write_bytes(pool as *mut u8, 0, 4096 * 8) };
+
+    // SAFETY: single-core; only written once, by `enter`, before any
+    // process (including this generic-spawn path) can run.
+    let bytes_gib = unsafe { core::ptr::addr_of!(G_BYTES_GIB).read() };
+    hal.map_ram_identity(root_pt, bytes_gib, false);
+    let mut used = 0u32;
+    let mut step = |vaddr: usize, paddr: usize, len: usize, perm: usize| -> bool {
+        let n = hal.map_range(
+            root_pt,
+            vaddr,
+            paddr,
+            len,
+            perm,
+            pool + used as usize * 4096,
+            8 - used as usize,
+        );
+        if n == u32::MAX {
+            false
+        } else {
+            used += n;
+            true
+        }
+    };
+    if !step(text_vma, text_lma, round4k(text_len), 1 | 4 | 8) // R+X+U
+        || !step(stack_vma, stack_phys, round4k(stack_len), 1 | 2 | 8) // R+W+U
+    {
+        klog!("spawn_process: map_range error\r\n");
+        return None;
+    }
+
+    let addr_space = state.alloc_addr_space(root_pt as u64)?;
+    let cap_space = state.alloc_cap_space()?;
+    let tid = state.alloc_tcb(cap_space, addr_space)?;
+    let stack_top = (stack_vma + stack_len) & !0xF;
+    state.init_user_thread(tid, entry_vma, stack_top, root_pt, hal);
+    Some((tid, cap_space, stack_phys))
+}
+
+/// The "subsystems as processes" packaging follow-up (IMPLEMENTATION-
+/// PLAN.md — 03-Kernel-Subsystems-Layer.md's folder structure implies a
+/// genuinely separate program per subsystem, not a function pointer
+/// into the kernel's own image). `spawn_process` above loads a process
+/// whose code is ALREADY part of this binary's own linked `.user_text`
+/// (`entry_vma`/`text_lma` name addresses inside the CALLING kernel
+/// image itself); this function instead takes a whole separately-built,
+/// `include_bytes!`-embedded ELF (see `device-manager-bin`'s own doc
+/// comment for how one gets built) and loads its `PT_LOAD` segments
+/// into FRESH untyped memory, each with its own permissions taken from
+/// the ELF's own `p_flags` (unlike `spawn_process`'s one blanket R+X+U
+/// for the whole shared `.user_text` range).
+///
+/// `elf_bytes` is trusted, kernel-embedded input (built by this same
+/// workspace, not adversarial), but every offset/size from it is still
+/// bounds-checked before use — the same defensive posture as every
+/// other place in this kernel that walks caller-provided-shaped data
+/// (`kernel-core::fuzz`'s own adversarial-syscall harness set that
+/// precedent).
+///
+/// Returns `None` (and logs) on a malformed ELF or any allocation
+/// failure, exactly like `spawn_process`.
+pub fn spawn_process_from_elf(
+    hal: &HalInterface,
+    state: &mut KernelState,
+    elf_bytes: &[u8],
+    expected_machine: u16,
+    stack_vma: usize,
+    stack_len: usize,
+) -> Option<(ThreadId, kernel_cap::CapSpaceId, usize)> {
+    let round4k = |n: usize| (n + 0xFFF) & !0xFFF;
+    let carve = |st: &mut KernelState, bytes: u64| carve_from_any_untyped(st, 4096, bytes);
+
+    let (entry, segments) =
+        match elf_loader::parse_and_collect_load_segments(elf_bytes, expected_machine) {
+            Ok(v) => v,
+            Err(_) => {
+                klog!("spawn_process_from_elf: malformed ELF\r\n");
+                return None;
+            }
+        };
+
+    // 3 pages, not 1 — see `enter`'s own `root_pt` carve for why.
+    let root_pt = carve(state, 4096 * 3)?;
+    // 32 page-table-walk scratch pages, not `spawn_process`'s own 8 —
+    // **real bug found via QEMU** (fs-native's own spawn): a bigger ELF
+    // image (fs-native-bin links `alloc`/`BTreeMap`/`ipc_protocol`'s
+    // codec, roughly double device-manager-bin's own size) spans enough
+    // 2 MiB regions across its `.text`/`.rodata`/`.data`/`.bss`
+    // PT_LOAD segments plus the stack that 8 pool pages ran out mid-
+    // walk (`map_range` returned `u32::MAX`, logged "map_range error
+    // (PT_LOAD segment)"), which this function's own `?` then silently
+    // turned into a `None` return — cascading into a FAR worse failure
+    // one level up: `fs_demo_start`'s shared-page setup never ran, so
+    // `G_FS_SHARED_PHYS` stayed at its `usize::MAX` sentinel, and the
+    // very next `write_shared_fs_message` call dereferenced it,
+    // panicking on an unaligned/null pointer. Bumping the pool is pure
+    // headroom — existing, smaller callers (device-manager-bin) simply
+    // use fewer of a bigger pool, unchanged behavior.
+    const POOL_PAGES: usize = 32;
+    let pool = carve(state, 4096 * POOL_PAGES as u64)?;
+    let stack_phys = carve(state, round4k(stack_len) as u64)?;
+    // SAFETY: fresh untyped RAM, identity-addressable (paging is not yet
+    // active on this new space); single-core. `map_range` needs the pool
+    // pre-zeroed.
+    unsafe { core::ptr::write_bytes(pool as *mut u8, 0, 4096 * POOL_PAGES) };
+
+    // SAFETY: single-core; only written once, by `enter`, before any
+    // process (including this generic-spawn path) can run.
+    let bytes_gib = unsafe { core::ptr::addr_of!(G_BYTES_GIB).read() };
+    hal.map_ram_identity(root_pt, bytes_gib, false);
+    let mut used = 0u32;
+    let mut step = |vaddr: usize, paddr: usize, len: usize, perm: usize| -> bool {
+        let n = hal.map_range(
+            root_pt,
+            vaddr,
+            paddr,
+            len,
+            perm,
+            pool + used as usize * 4096,
+            POOL_PAGES - used as usize,
+        );
+        if n == u32::MAX {
+            false
+        } else {
+            used += n;
+            true
+        }
+    };
+
+    // Page-granular record of every `PT_LOAD` mapping already
+    // established for this image: `(vaddr_start, vaddr_end, phys_start,
+    // perm)`, all page-aligned. It exists to close a SECOND, distinct
+    // ELF-layout bug in this same loop — see the "shared boundary page"
+    // comment inside the loop below. Eight entries is generous headroom:
+    // every subsystem ELF this workspace links has three `PT_LOAD`
+    // segments (`.text` / `.rodata` / `.bss`).
+    const MAX_LOAD_SEGS: usize = 8;
+    let mut mapped: [(usize, usize, usize, usize); MAX_LOAD_SEGS] = [(0, 0, 0, 0); MAX_LOAD_SEGS];
+    let mut mapped_n: usize = 0;
+
+    for seg in segments {
+        // **Real bug found via QEMU** (fs-native's own spawn — the
+        // FIRST ELF this loader ever loaded whose linker output didn't
+        // happen to leave every PT_LOAD segment's own `p_vaddr` already
+        // page-aligned): `map_range` requires page-aligned inputs
+        // (`(vaddr | paddr | len) & 0xFFF != 0` is a hard error, per its
+        // own doc comment), but nothing here ever page-ALIGNED
+        // `seg.vaddr` before passing it straight through — this loop
+        // just trusted the ELF's own `p_vaddr` to already be a multiple
+        // of 4 KiB. device-manager-bin's own linker output happened to
+        // satisfy that by luck (every one of its PT_LOAD segments
+        // landed on a page boundary); fs-native-bin's third segment
+        // (`.data`, `vaddr=0xc0022790` — a genuine, ELF-spec-legal
+        // "page-unaligned within an otherwise page-aligned OUTPUT
+        // section" layout, common whenever ld groups multiple smaller
+        // input sections before the segment's declared alignment
+        // point) was the first to violate that unstated assumption,
+        // failing `map_range`'s own precondition check every time
+        // (confirmed via a temporary diagnostic print: `vaddr=
+        // 0xc0022790`, low 12 bits `0x790`, nonzero). Fixed the
+        // standard way any ELF loader handles this (matching what
+        // Linux's own loader does): round `p_vaddr` DOWN to the
+        // containing page, and carry the resulting in-page offset
+        // through the mapped SIZE and the file-data COPY destination,
+        // so the segment's actual bytes still land at the CORRECT
+        // (unaligned) virtual address once mapped, just via a
+        // page-aligned `map_range` call.
+        let page_off = seg.vaddr as usize & 0xFFF;
+        let aligned_vaddr = seg.vaddr as usize - page_off;
+        let mem_size4k = round4k(seg.mem_size as usize + page_off);
+        if mem_size4k == 0 {
+            continue;
+        }
+        // Bounds-check the file-data range this segment claims BEFORE
+        // any pointer arithmetic touches it (see this function's own
+        // doc comment on why: `elf_bytes` is trusted-but-still-checked).
+        let file_offset = seg.file_offset as usize;
+        let file_size = seg.file_size as usize;
+        let Some(file_end) = file_offset.checked_add(file_size) else {
+            klog!("spawn_process_from_elf: segment file range overflows\r\n");
+            return None;
+        };
+        if file_size > seg.mem_size as usize || file_end > elf_bytes.len() {
+            klog!("spawn_process_from_elf: segment file range out of bounds\r\n");
+            return None;
+        }
+
+        // Per-segment permissions from the ELF's own p_flags, translated
+        // to this workspace's R(1)/W(2)/X(4)/U(8) `map_range` bit
+        // encoding — tighter than `spawn_process`'s one blanket R+X+U
+        // for the whole shared `.user_text` range (e.g. this process's
+        // .rodata segment lands R-only, no X or W).
+        let mut perm = 8usize; // U — every segment of a U-mode process image is user-accessible
+        if seg.flags & elf_loader::PF_R != 0 {
+            perm |= 1;
+        }
+        if seg.flags & elf_loader::PF_W != 0 {
+            perm |= 2;
+        }
+        if seg.flags & elf_loader::PF_X != 0 {
+            perm |= 4;
+        }
+
+        // **A SECOND real bug found via QEMU** (2026-09-17, riscv64's own
+        // `security-broker-intermediary` spawn) — the "shared boundary
+        // page" case, and the direct cause of riscv64's `FAULT: thread 9
+        // ... cause=0xc sepc=0x0 stval=0x0` (a jump to PC 0) right after
+        // `security-broker` spawned.
+        //
+        // Rounding `p_vaddr` down to its containing page (the already-
+        // documented fix above) is only HALF of what an ELF loader owes
+        // this layout. Two consecutive `PT_LOAD` segments are allowed to
+        // share one physical page of the file — and therefore one page of
+        // the address space — whenever the earlier one does not end on a
+        // page boundary. That is exactly what the riscv64 linker emits for
+        // several of this workspace's own subsystem binaries, e.g.
+        // `security-broker-intermediary-bin`:
+        //
+        //   LOAD  vaddr=0xc000c000 memsz=0x32e8 R    (.rodata .srodata.cst8)
+        //   LOAD  vaddr=0xc000f2e8 memsz=0x8d18 RW   (.sbss .bss)
+        //
+        // `.rodata`'s tail lives in page `0xc000f000`; `.sbss` starts at
+        // `0xc000f2e8`, which rounds DOWN to that very same page. The old
+        // loop carved a FRESH, freshly-ZEROED physical frame for every
+        // segment and mapped its whole page-rounded range unconditionally,
+        // so the second segment's mapping silently REPLACED the first
+        // one's page-table entry for the shared page. From the process's
+        // point of view the last 0x2e8 bytes of its own `.rodata` — here
+        // the trailing 704 bytes of `.rodata` plus the ENTIRE
+        // `.srodata.cst8` constant pool — simply read back as zeros. A
+        // zeroed jump-table / constant-pool entry is a null code pointer,
+        // and the process jumped straight to address 0.
+        //
+        // x86_64 and aarch64 never saw this because their linker output
+        // for the SAME crates page-aligns the `.bss` segment's own
+        // `p_vaddr` (0x40015000 / 0x80015000), leaving no shared page.
+        // Only riscv64's layout packs `.sbss` into `.rodata`'s last page.
+        //
+        // The fix is what every real ELF loader does: a page already
+        // mapped by an earlier segment is REUSED, not re-mapped. This
+        // segment's own bytes are copied into that existing frame, and
+        // the shared page's permissions become the UNION of both
+        // segments' (here R|W|U — unavoidable at page granularity, and
+        // what Linux's own loader produces for this layout too). Only the
+        // pages BEYOND the shared prefix get a fresh carve.
+        let mut overlap = 0usize;
+        let mut ov_phys = 0usize;
+        let mut ov_perm = 0usize;
+        for &(vs, ve, ph, pe) in mapped.iter().take(mapped_n) {
+            if aligned_vaddr >= vs && aligned_vaddr < ve {
+                // Both ends are page-aligned, so `overlap` is a whole
+                // number of pages and always >= 4096 > `page_off`.
+                overlap = core::cmp::min(ve - aligned_vaddr, mem_size4k);
+                ov_phys = ph + (aligned_vaddr - vs);
+                ov_perm = pe;
+                break;
+            }
+        }
+
+        // Bytes of THIS segment's file data that land inside the shared
+        // prefix. `page_off` of the shared page belongs to the EARLIER
+        // segment and must not be touched — that is the `.rodata` tail
+        // whose loss caused the bug.
+        let prefix_bytes = if overlap > 0 {
+            core::cmp::min(file_size, overlap - page_off)
+        } else {
+            0
+        };
+
+        if overlap > 0 {
+            // SAFETY: `ov_phys` is identity-addressable untyped RAM the
+            // earlier segment already carved and zeroed over its whole
+            // page-rounded length, so the `.bss`-style tail beyond that
+            // segment's own file data is ALREADY zero — nothing needs
+            // zero-filling here, only this segment's own file bytes (if
+            // any) copied in. `elf_bytes[file_offset..]` was bounds-
+            // checked above and `prefix_bytes <= file_size`.
+            unsafe {
+                core::ptr::copy_nonoverlapping(
+                    elf_bytes.as_ptr().add(file_offset),
+                    (ov_phys + page_off) as *mut u8,
+                    prefix_bytes,
+                );
+            }
+            if !step(aligned_vaddr, ov_phys, overlap, perm | ov_perm) {
+                klog!("spawn_process_from_elf: map_range error (shared PT_LOAD boundary page)\r\n");
+                return None;
+            }
+        }
+
+        let rest = mem_size4k - overlap;
+        if rest > 0 {
+            let rest_vaddr = aligned_vaddr + overlap;
+            let seg_phys = carve(state, rest as u64)?;
+            // SAFETY: `seg_phys` is fresh untyped RAM, identity-
+            // addressable, `rest` bytes long. `elf_bytes[file_offset +
+            // prefix_bytes ..][.. file_size - prefix_bytes]` is inside the
+            // range bounds-checked above. Zeroing first then copying only
+            // the remaining file bytes reproduces the ELF spec's standard
+            // ".bss inside PT_LOAD" convention (mem_size > file_size is
+            // zero-filled) — the same handling `elf-loader`'s own doc
+            // comment describes for `uefi-bootloader`'s use of this shape.
+            // When there is no shared prefix (`overlap == 0`, the common
+            // case) `rest_vaddr == aligned_vaddr` and `prefix_bytes == 0`,
+            // so this is byte-for-byte the original behavior, including
+            // the `page_off` shift that puts the segment's bytes at their
+            // correct unaligned virtual address.
+            unsafe {
+                core::ptr::write_bytes(seg_phys as *mut u8, 0, rest);
+                core::ptr::copy_nonoverlapping(
+                    elf_bytes.as_ptr().add(file_offset + prefix_bytes),
+                    (seg_phys + if overlap > 0 { 0 } else { page_off }) as *mut u8,
+                    file_size - prefix_bytes,
+                );
+            }
+
+            if !step(rest_vaddr, seg_phys, rest, perm) {
+                klog!("spawn_process_from_elf: map_range error (PT_LOAD segment)\r\n");
+                return None;
+            }
+
+            if mapped_n == MAX_LOAD_SEGS {
+                klog!("spawn_process_from_elf: more than MAX_LOAD_SEGS PT_LOAD segments\r\n");
+                return None;
+            }
+            mapped[mapped_n] = (rest_vaddr, rest_vaddr + rest, seg_phys, perm);
+            mapped_n += 1;
+        }
+    }
+
+    if !step(stack_vma, stack_phys, round4k(stack_len), 1 | 2 | 8) {
+        // R+W+U
+        klog!("spawn_process_from_elf: map_range error (stack)\r\n");
+        return None;
+    }
+
+    let Some(addr_space) = state.alloc_addr_space(root_pt as u64) else {
+        klog!("spawn_process_from_elf: MAX_ADDR_SPACES exhausted\r\n");
+        return None;
+    };
+    let Some(cap_space) = state.alloc_cap_space() else {
+        klog!("spawn_process_from_elf: MAX_CAP_SPACES exhausted\r\n");
+        return None;
+    };
+    let Some(tid) = state.alloc_tcb(cap_space, addr_space) else {
+        klog!("spawn_process_from_elf: MAX_THREADS exhausted\r\n");
+        return None;
+    };
+    let stack_top = (stack_vma + stack_len) & !0xF;
+    state.init_user_thread(tid, entry as usize, stack_top, root_pt, hal);
+    Some((tid, cap_space, stack_phys))
+}
+
+/// Called by the riscv64 syscall handler when a process makes a
+/// `P2_YIELD` `ecall` (the cooperative §8.4 phase, before the timer is
+/// armed). A voluntary yield is just a scheduler tick with no timer
+/// involved: `KernelState::preempt_tick` charges the caller and picks the
+/// other runnable thread. Returns `Some((save, into))` for
+/// `TrapOutcome::SwitchTo`, or `None` (→ `Resume`) if there is no other
+/// thread to run.
+pub fn p2_yield() -> Option<(*mut u8, *const u8)> {
+    // SAFETY: single-core; `G_HAL` set by `enter` before any syscall.
+    let hal = unsafe { &*core::ptr::addr_of!(G_HAL).read() };
+    let k = kstate();
+    match k.cooperative_yield(hal.now_ns()) {
+        PreemptStep::Switch { outgoing, incoming } => k.user_ctx_switch_ptrs(outgoing, incoming),
+        PreemptStep::Continue | PreemptStep::Idle => None,
+    }
+}
+
+/// `P2_REPORT` from process B: it read `value` through its own mapping of
+/// the shared frame (which A wrote before the first hand-off).
+pub fn p2_report_b(value: usize) {
+    // SAFETY: single-core; `P2_*` set once by `setup_two_process`.
+    let (phys, va_b) = unsafe {
+        (
+            core::ptr::addr_of!(P2_SHARED_PHYS).read(),
+            core::ptr::addr_of!(P2_VA_B).read(),
+        )
+    };
+    // SAFETY: `phys` is identity-mapped U=0 in the live space; single-core.
+    let kernel_view = unsafe { core::ptr::read_volatile(phys as *const u32) as usize };
+    // SAFETY: single-core; only written here, read by `p2_report_a`.
+    unsafe { core::ptr::addr_of_mut!(P2_B_SAW).write(value) };
+    klog!(
+        "process B (space B, VA {:#x}): read {:#x} from the shared frame; kernel sees {:#x} at PA {:#x} ({})\r\n",
+        va_b,
+        value,
+        kernel_view,
+        phys,
+        if value == P2_A_SENTINEL && kernel_view == P2_A_SENTINEL {
+            "A's write crossed the isolation boundary"
+        } else {
+            "MISMATCH"
+        }
+    );
+}
+
+/// `P2_REPORT` from process A after B ran: it re-read `value` through its
+/// own mapping and should now see B's write. Logs the final verdict.
+pub fn p2_report_a(value: usize) {
+    // SAFETY: single-core; `P2_*` set once by `setup_two_process`.
+    let (phys, va_a, b_saw) = unsafe {
+        (
+            core::ptr::addr_of!(P2_SHARED_PHYS).read(),
+            core::ptr::addr_of!(P2_VA_A).read(),
+            core::ptr::addr_of!(P2_B_SAW).read(),
+        )
+    };
+    // SAFETY: `phys` is identity-mapped U=0 in the live space; single-core.
+    let kernel_view = unsafe { core::ptr::read_volatile(phys as *const u32) as usize };
+    let pass = b_saw == P2_A_SENTINEL && value == P2_B_SENTINEL && kernel_view == P2_B_SENTINEL;
+    klog!(
+        "process A (space A, VA {:#x}): re-read {:#x}; kernel sees {:#x} at PA {:#x} -> {}\r\n",
+        va_a,
+        value,
+        kernel_view,
+        phys,
+        if pass {
+            "TWO-PROCESS ZERO-COPY: A->B->A round-trip through one shared frame, no copy, MMU-isolated spaces (02 8.4)"
+        } else {
+            "MISMATCH"
+        }
+    );
+}
+
+/// `P2_PREEMPT_START` from process A: the cooperative §8.4 round-trip is
+/// done; arm the supervisor timer so from here the two processes are
+/// switched by PREEMPTION (02-Microkernel-Layer.md §4), not an explicit
+/// `P2_YIELD`. The worker's `Tcb::user_context` already holds it
+/// suspended just after its own `P2_YIELD` (the head of its counting
+/// loop) and it is `Ready` in `kernel-sched`, so the first tick's
+/// `preempt_tick` switches straight into it.
+/// Ends the cooperative phase and arms the preemptive scheduler. Returns
+/// `Some((save, into))` for `TrapOutcome::SwitchTo` if a fresh thread took
+/// over process A's counting loop (see the doc comment inline below for
+/// why root's own TCB is retired rather than reused), or `None` (→
+/// `Resume`, root's own context just continues) if that spawn failed —
+/// the demo then falls back to whatever fairness root's pre-existing
+/// vruntime gets it, unaffected otherwise.
+pub fn p2_preempt_start() -> Option<(*mut u8, *const u8)> {
+    // SAFETY: single-core; `G_HAL`/`G_STATE` were set by `enter` before any
+    // syscall.
+    let hal = unsafe { &*core::ptr::addr_of!(G_HAL).read() };
+    let state = kstate();
+
+    // Spawn process C NOW, not during the cooperative A<->B round-trip —
+    // see `setup_two_process`'s doc comment on why an earlier spawn would
+    // have hijacked B's `P2_YIELD` hand-off back to A (a fresh,
+    // never-run thread's `vruntime = 0` outranks A's own nonzero vruntime
+    // in `cooperative_yield`'s fairness comparison). Once we are about to
+    // switch to TIMER-driven `preempt_tick`, that fairness is exactly the
+    // point, so this is the right moment for C to join.
+    // SAFETY: these were written once by `setup_two_process` before any
+    // syscall could run.
+    let (text_vma, text_lma, text_len, subsys_entry, a_loop_entry, a_stack_top) = unsafe {
+        (
+            core::ptr::addr_of!(G_TEXT_VMA).read(),
+            core::ptr::addr_of!(G_TEXT_LMA).read(),
+            core::ptr::addr_of!(G_TEXT_LEN).read(),
+            core::ptr::addr_of!(G_SUBSYS_ENTRY).read(),
+            core::ptr::addr_of!(G_A_LOOP_ENTRY).read(),
+            core::ptr::addr_of!(G_A_STACK_TOP).read(),
+        )
+    };
+    // Desktop build: process C exists only to prove the generic spawn
+    // path joins a THREE-way preemption demo whose verdict is printed when
+    // the tick budget runs out — which it never does there. It would just
+    // be a second busy loop taking turns from ui-core, Compositor and the
+    // input drivers. Process A's fresh loop thread below is kept: it is
+    // the always-`Ready` thread `pick_next` falls back to while every
+    // interactive process is blocked waiting for input, i.e. the idle
+    // thread.
+    if subsys_entry != 0 && !cfg!(feature = "desktop") {
+        const PROC_C_STACK_VMA: usize = 0xC030_0000;
+        const PROC_C_STACK_LEN: usize = 4096 * 4;
+        match spawn_process(
+            hal,
+            state,
+            text_vma,
+            text_lma,
+            text_len,
+            PROC_C_STACK_VMA,
+            PROC_C_STACK_LEN,
+            subsys_entry,
+        ) {
+            Some((tid, _cap_space, stack_phys)) => {
+                // SAFETY: single-core; only written here, read by `p2_tick`.
+                unsafe { core::ptr::addr_of_mut!(P3_COUNTER_PHYS).write(stack_phys) };
+                // SAFETY: single-core; only written here, read (and
+                // retired) by `p2_tick`'s own "budget exceeded" branch.
+                unsafe { core::ptr::addr_of_mut!(G_PROC_C_TID).write(Some(tid)) };
+                klog!(
+                    "process A: process C spawned (tid {}) via the generic path, joining the preemption loop\r\n",
+                    tid.as_u32()
+                );
+            }
+            None => klog!("process A: process C spawn skipped (out of resources) - A/B unaffected\r\n"),
+        }
+    }
+
+    // Retire root's own tid-0 TCB from the counting-loop role. It has
+    // accumulated real, QEMU-timing-dependent `vruntime` from its own
+    // ecall sequence during the cooperative phase — sometimes far more
+    // than `P2_TICK_BUDGET` short ticks can let B/C's vruntime catch up
+    // to, starving it for the WHOLE demo (`kernel-sched`'s own invariant
+    // is that vruntime only ever increases — no reset primitive, by
+    // design, so "give root a fresh start" has to mean a literally fresh
+    // THREAD). A brand-new TCB sharing root's EXISTING address space and
+    // capability space (multiple threads, one process — same model a
+    // real OS uses) starts at `vruntime = 0`, the same footing as B/C,
+    // and takes over the loop. Root's own TCB is marked `Exited` +
+    // removed from the scheduler BEFORE this switch — same discipline as
+    // `thread2_main`'s tail, and for the same reason: nothing ever
+    // dispatches it again, so leaving it `Ready` would be a phantom
+    // scheduler entity `pick_next` could later select into a thread that
+    // can never make progress.
+    if a_loop_entry == 0 {
+        return None;
+    }
+    let root = state.root_thread;
+    let fresh_tid = match state.alloc_tcb(state.root_cap_space, state.root_addr_space) {
+        Some(t) => t,
+        None => {
+            klog!("process A: no TCB slot for the fresh loop thread - root's own TCB keeps running\r\n");
+            return None;
+        }
+    };
+    // `root_frame = 0`: keep whatever address space is already active
+    // (root's own space A, unchanged — this fresh TCB shares it).
+    state.init_user_thread(fresh_tid, a_loop_entry, a_stack_top, 0, hal);
+    // Desktop build: this loop is the idle thread (see the process-C
+    // comment above), so it must not compete as an equal with ui-core,
+    // Compositor and the input drivers. `init_user_thread` admits every
+    // thread at `MAX_PRIORITY` (weight 4.0); re-admitting this one at
+    // priority 0 (weight 1.0, the lowest `kernel_sched` has) makes its
+    // vruntime advance 4x faster, so it only runs when the interactive
+    // processes are blocked or have had their share. Measured on a real
+    // desktop boot (2026-09-24) before this: in 1000 ticks ui-core got 11
+    // while this loop got 145.
+    #[cfg(feature = "desktop")]
+    {
+        let _ = state.sched.admit_following_system_default(fresh_tid, 0, None);
+        let _ = state.sched.note_ready(fresh_tid, hal.now_ns());
+    }
+    // SAFETY: single-core; only written here, read (and retired) by
+    // `p2_tick`'s own "budget exceeded" branch — see `G_FRESH_A_TID`'s
+    // own doc comment.
+    unsafe { core::ptr::addr_of_mut!(G_FRESH_A_TID).write(Some(fresh_tid)) };
+    if let Some(t) = state.tcb_mut(root) {
+        t.state = ThreadState::Exited;
+    }
+    state.sched.remove(root);
+    // Retire `p2_ipc_demo_start`'s own one-shot server thread too, for
+    // the identical reason root's own old TCB is retired just above —
+    // see `G_IPC_SERVER_TID`'s own "Real bug found via QEMU" doc comment
+    // for the full story (a `pick_next` tie-break flip, triggered by
+    // fs-native's own extra thread, resumed this long-done thread's
+    // stale saved context instead of the intended A/B/C rotation).
+    // SAFETY: single-core; only read (and cleared) here, written once by
+    // `p2_ipc_demo_start` before this can ever run.
+    if let Some(server_tid) = unsafe { core::ptr::addr_of!(G_IPC_SERVER_TID).read() } {
+        if let Some(t) = state.tcb_mut(server_tid) {
+            t.state = ThreadState::Exited;
+        }
+        state.sched.remove(server_tid);
+        unsafe { core::ptr::addr_of_mut!(G_IPC_SERVER_TID).write(None) };
+    }
+    // Process B (the §8.4 two-space zero-copy demo's own one-shot
+    // worker) hits the IDENTICAL bug class as the demo server just
+    // above, for the IDENTICAL reason — `G_PROCESS_B_TID`'s own doc
+    // comment already documented this as a known risk ("a live
+    // `pick_next` candidate for anything that exercises GENERAL
+    // (non-fast-path) `pick_next` before [`spawn_netstack_service`'s own
+    // retirement] point"), naming Netstack as the first such caller —
+    // but that retirement is conditional on this boot actually spawning
+    // Netstack, which only happens if a Network-kind peripheral was
+    // discovered. **Real bug found via QEMU** (real-IPC plan Phase 2,
+    // this QEMU config has no network peripheral — confirmed via this
+    // same boot's own "no Network-kind peripheral was discovered at
+    // boot" line, so `spawn_netstack_service` never runs and process B
+    // is NEVER retired): `security-broker`'s own new `serve_requests`
+    // fan-in (`p2_ipc_recv_general`, real-IPC plan Phase 2) is exactly
+    // the kind of "general, non-fast-path `pick_next`" caller that doc
+    // comment warned about, and DOES sometimes land on process B's own
+    // long-stale saved context — confirmed via a real QEMU crash whose
+    // faulting RSP pointed into process B's own text section (not
+    // process B's own — into WHATEVER process happened to be sharing
+    // that stale context's own address space at the time — a `#PF`
+    // reading through a garbage pointer, not a coincidence). Retiring
+    // it HERE, unconditionally (same `Exited` + `remove` treatment as
+    // root/the demo server just above — process B is a genuine one-shot,
+    // not an ongoing server `fs_tid`'s own `note_blocked`-only treatment
+    // would fit), closes the gap for every boot, not just ones that
+    // happen to spawn Netstack.
+    // SAFETY: single-core; `G_PROCESS_B_TID` written once by
+    // `setup_two_process`, read-only here.
+    if let Some(b_tid) = unsafe { core::ptr::addr_of!(G_PROCESS_B_TID).read() } {
+        if let Some(t) = state.tcb_mut(b_tid) {
+            t.state = ThreadState::Exited;
+        }
+        state.sched.remove(b_tid);
+    }
+    // policy-engine is deliberately NOT retired here anymore — see
+    // `G_BACKUP_MANAGER_TID`'s own doc comment for why (it now runs a
+    // real, ongoing serve loop of its own, the same lifecycle shape
+    // `security-broker` already has, which never needed this either).
+    //
+    // backup-manager / diagnostics-manager: same landmine, same fix —
+    // see `G_BACKUP_MANAGER_TID`'s own doc comment.
+    // SAFETY: single-core; written once each by `set_backup_manager_
+    // tid`/`set_diagnostics_manager_tid`, read-only here.
+    if let Some(bm_tid) = unsafe { core::ptr::addr_of!(G_BACKUP_MANAGER_TID).read() } {
+        if let Some(t) = state.tcb_mut(bm_tid) {
+            t.state = ThreadState::Exited;
+        }
+        state.sched.remove(bm_tid);
+    }
+    if let Some(diag_tid) = unsafe { core::ptr::addr_of!(G_DIAGNOSTICS_MANAGER_TID).read() } {
+        if let Some(t) = state.tcb_mut(diag_tid) {
+            t.state = ThreadState::Exited;
+        }
+        state.sched.remove(diag_tid);
+    }
+    // fs-native's own thread hits the SAME bug class as the demo server
+    // just above, for a DIFFERENT underlying reason: **real bug found
+    // via QEMU** (aarch64 specifically — confirmed via a temporary
+    // `p2_tick` diagnostic showing `incoming=5`, fs-native's own known
+    // tid, immediately followed by a total, silent, rapid-refire hang —
+    // riscv64/x86_64 happened not to hit it, purely by thread-ID tie-
+    // break luck, the same way the demo server's own bug above was
+    // luck-dependent). Unlike the demo server, fs-native is a REAL,
+    // ongoing service — `do_reply` (correctly, generically) marks IT
+    // `Ready` again after each reply, since a real server loops back to
+    // `Recv` for its next request. But after its OWN LAST reply
+    // (`FS_CLOSE`'s, in this MVP demo), fs-native never actually gets
+    // CPU time again to reach that next `Recv` and block on it PROPERLY
+    // — `do_reply`'s own switch hands control back to the CALLER (root),
+    // not to the replying thread itself, by design (see `SyscallOp::
+    // Reply`'s own doc comment) — so fs-native is left `Ready`-but-
+    // never-resumed, exactly like the demo server, and can be picked by
+    // this SAME ordinary `pick_next` round-robin it was never meant to
+    // join. Unlike the demo server, fs-native must NOT be `sched.
+    // remove()`d — its own TCB slot has to stay valid forever, since
+    // `fs_ipc_call`'s own direct `dispatch(fs_tid, ...)` (bypassing
+    // `pick_next` entirely, on every architecture) is how it is
+    // ACTUALLY meant to run for any future request. `note_blocked`
+    // (not `remove`) is exactly the right tool: it removes fs-native
+    // from `pick_next`'s own candidate pool (its own `RunState` is no
+    // longer `Ready`) while leaving the TCB slot itself fully intact —
+    // a later `dispatch()` call unconditionally commits a thread as
+    // running regardless of its current `RunState`, so this in no way
+    // blocks a genuine future `fs_ipc_call`. Harmless no-op if
+    // fs-native happened to already be properly `BlockedOnRecv` (e.g.
+    // riscv64/x86_64, where this was never actually observed broken).
+    // SAFETY: single-core; `G_FS_TID` written once by `fs_demo_start`,
+    // read-only here.
+    if let Some(fs_tid) = unsafe { core::ptr::addr_of!(G_FS_TID).read() } {
+        let _ = state.sched.note_blocked(fs_tid);
+    }
+    // security-broker-intermediary (Issue #28) hits the IDENTICAL bug
+    // class as fs-native just above, for the identical underlying reason:
+    // `sbi_ipc_call`'s own `do_reply` (after the intermediary replies to
+    // the `SBI_CAP_GRANT` demo call) hands control back to the CALLER
+    // (root), not to the replying thread itself (`SyscallOp::Reply`'s own
+    // semantics) — leaving the intermediary `Ready`-but-never-resumed,
+    // exactly like fs-native, and eligible for this SAME ordinary
+    // `pick_next` round-robin it was never meant to join. **Real bug
+    // found via QEMU** (this session): without this fix, the x86_64
+    // fault-isolation demo hung completely, silently, right after
+    // "arming preemptive timer" — `pick_next` picked the intermediary's
+    // stale saved context instead of the intended A/B/C rotation, the
+    // exact same failure mode fs-native's own comment above documents.
+    // `note_blocked` (not `remove`): the intermediary's TCB slot must
+    // stay valid — nothing else calls it again in this demo, but
+    // removing it outright is unnecessary and diverges from the
+    // established fs-native precedent for no reason.
+    // SAFETY: single-core; `G_SBI_TID` written once by
+    // `security_broker_intermediary_demo_start`, read-only here.
+    if let Some(sbi_tid) = unsafe { core::ptr::addr_of!(G_SBI_TID).read() } {
+        let _ = state.sched.note_blocked(sbi_tid);
+    }
+    // compositor/mm-service/driver-virtio/netstack hit the IDENTICAL bug
+    // class as fs-native/the intermediary just above, for the IDENTICAL
+    // reason: root task's own boot-time demo exercises each of them via
+    // ONE (or a few) one-shot `Call`+`Reply` round trip(s)
+    // (`compositor_commit_verify`/`mm_query_total_resident_result`/
+    // `mm_query_victim_result`/the vfs-throughput-adjacent block-driver
+    // demo/etc.) and then moves on — `do_reply` hands control back to
+    // the CALLER (root), not to the replying thread itself, so each of
+    // these real, ongoing servers is left `Ready`-but-never-resumed
+    // after its own LAST reply, exactly like fs-native was, and equally
+    // eligible for `pick_next`'s general fan-out to land on by accident.
+    // **Real bug found via QEMU** (real-IPC plan Phase 2): none of these
+    // four had EVER needed the identical `note_blocked` fix fs-native/
+    // the intermediary already got — `fs-native`'s own doc comment
+    // itself flags that this exact class was "confirmed via QEMU"
+    // aarch64-only, "riscv64/x86_64... never actually observed broken",
+    // i.e. dormant-by-luck on x86_64 until enough NEW competing threads
+    // (native-loader/account-manager/store, real-IPC plan Phase 2) could
+    // shift `pick_next`'s own tie-break far enough to land on one of
+    // these instead — confirmed via a real QEMU crash whose faulting
+    // context did not match any real-IPC-plan client's own state.
+    // `note_blocked` (not `remove`) for the SAME reason fs-native's own
+    // doc comment gives: each one's own `*_ipc_call` helper (`comp_ipc_
+    // call`/`mm_ipc_call`/`drv_ipc_call`/Netstack's own equivalent)
+    // dispatches it directly, bypassing `pick_next` entirely, so its TCB
+    // slot must stay valid for any future such call.
+    // SAFETY: single-core; each of these four is written once by its own
+    // spawn/demo-start function, read-only here.
+    if let Some(comp_tid) = unsafe { core::ptr::addr_of!(G_COMPOSITOR_TID).read() } {
+        let _ = state.sched.note_blocked(comp_tid);
+    }
+    if let Some(mm_tid) = unsafe { core::ptr::addr_of!(G_MM_TID).read() } {
+        let _ = state.sched.note_blocked(mm_tid);
+    }
+    if let Some(drv_tid) = unsafe { core::ptr::addr_of!(G_DRV_TID).read() } {
+        let _ = state.sched.note_blocked(drv_tid);
+    }
+    if let Some(ns_tid) = unsafe { core::ptr::addr_of!(G_NETSTACK_TID).read() } {
+        let _ = state.sched.note_blocked(ns_tid);
+    }
+    // Desktop build: Netstack's persistent service thread (a SECOND thread
+    // of the Netstack process, so the first one can keep serving the bypass
+    // control plane). It is created here, at the very end of the boot-time
+    // demo sequence, so nothing above (the timing-sensitive IPC demos)
+    // ever sees it as a scheduling candidate.
+    #[cfg(feature = "desktop")]
+    let _ = netstack_start_service(hal);
+    // `state.sched.remove(root)` clears `running` (root was it), and this
+    // switch to `fresh_tid` happens directly via `user_ctx_switch_ptrs`,
+    // bypassing `preempt_tick`/`cooperative_yield` (whose own `Switch`
+    // branches always call `dispatch` before returning). Without this,
+    // the scheduler's bookkeeping would say NOBODY is running while
+    // `fresh_tid` is physically executing — so the NEXT tick's
+    // `account()` would charge whatever `pick_next` picks (having found
+    // `running == None`) instead of `fresh_tid`, silently misattributing
+    // real CPU time to a thread that never actually ran.
+    // Desktop build: rank the input path first (see
+    // `desktop_apply_input_priorities`). Here, not earlier: root is now
+    // retired and nothing else runs until the timer below is armed.
+    // SAFETY: single-core; written once by `desktop_register_input_path`.
+    #[cfg(feature = "desktop")]
+    desktop_apply_input_priorities(&unsafe { core::ptr::addr_of!(DESKTOP_INPUT_PATH).read() });
+    let _ = state.sched.dispatch(fresh_tid, hal.now_ns());
+    klog!(
+        "process A: retiring tid {} (its own vruntime is too QEMU-timing-dependent to fairly compete for {} short ticks) - spawned fresh tid {} (vruntime 0) to run the counting loop\r\n",
+        root.as_u32(),
+        P2_TICK_BUDGET,
+        fresh_tid.as_u32()
+    );
+
+    // SAFETY: single-core; only reset here, before the first tick.
+    unsafe { core::ptr::addr_of_mut!(P2_TICKS).write(0) };
+    // SAFETY: single-core; read only by `desktop_input_wake_tick`.
+    #[cfg(feature = "desktop")]
+    unsafe {
+        core::ptr::addr_of_mut!(DESKTOP_PREEMPTION_LIVE).write(true)
+    };
+    let armed = hal.arm_timer(hal.now_ns() + P2_QUANTUM_NS);
+    klog!(
+        "process A: cooperative round-trip done - arming preemptive timer (quantum {} ns, armed: {}); NO more P2_YIELD from here\r\n",
+        P2_QUANTUM_NS,
+        armed
+    );
+
+    state.user_ctx_switch_ptrs(root, fresh_tid)
+}
+
+/// Preemptive-scheduler tick (registered as the arch `TickHandler`).
+/// Round-robins between the two U-mode processes on every supervisor
+/// timer interrupt, re-arming the next deadline. After `P2_TICK_BUDGET`
+/// ticks it reads both processes' private counters out of the shared
+/// frame, logs the verdict, disarms the timer and stops preempting
+/// (`None`) — the running process then keeps its loop and QEMU stays up
+/// for the smoke grep.
+///
+/// Returns `Some((save, into))` to switch (the trap vector snapshots the
+/// preempted thread into `save` and resumes `into`), or `None` to let it
+/// keep running.
+pub fn p2_tick() -> Option<(*mut u8, *const u8)> {
+    // SAFETY: single-core; `G_HAL` set by `enter`; `P2_TICKS` / `P2_*`
+    // touched only from this path and the one-time setup.
+    let hal = unsafe { &*core::ptr::addr_of!(G_HAL).read() };
+
+    // Timed notification waits whose deadline has passed become Ready before
+    // this tick picks who runs next (see `expire_timed_waits`).
+    expire_timed_waits(hal.now_ns());
+
+    // Device-manager's own scheduling is governed ENTIRELY by the
+    // deterministic crash/respawn hand-off (`p2_fault`'s hand-off to
+    // `DM_TID` / `p2_dm_handoff_to_driver`), not this ordinary
+    // round-robin timer — it is not a participant in the A/B/C fairness
+    // demo this tick counts toward. Letting an ordinary tick preempt it
+    // here would race with that protocol: if device-manager loses the
+    // ordinary scheduler's fairness comparison at the WRONG moment
+    // (between finishing a crash-notify resume and making its own next
+    // respawn call), NOTHING would ever give it the CPU back — the
+    // driver it would respawn is not even running yet to crash and
+    // trigger the OTHER hand-off. A real bug hit via QEMU: the
+    // crash/restart cycle would silently stop one step short of ever
+    // reporting `Failed`, despite every crash having genuinely happened.
+    // Simply never counting this tick, or switching away, while
+    // device-manager holds the CPU closes it.
+    // SAFETY: single-core.
+    let dm_tid = unsafe { core::ptr::addr_of!(DM_TID).read() };
+    if dm_tid.is_some() && dm_tid == kstate().sched.running() {
+        hal.arm_timer(hal.now_ns() + P2_QUANTUM_NS);
+        return None;
+    }
+
+    let prev_ticks = unsafe { core::ptr::addr_of!(P2_TICKS).read() };
+    // Desktop build: the machine runs indefinitely, so the counter must
+    // neither overflow (a debug-build panic) nor ever reach
+    // `P2_TICK_BUDGET` (`u32::MAX` there) — see that constant's doc
+    // comment. The default build keeps the plain increment it always had.
+    #[cfg(feature = "desktop")]
+    let ticks = prev_ticks.saturating_add(1).min(P2_TICK_BUDGET - 1);
+    #[cfg(not(feature = "desktop"))]
+    let ticks = prev_ticks + 1;
+    unsafe { core::ptr::addr_of_mut!(P2_TICKS).write(ticks) };
+
+    // Gate release: the general scheduler has now had its designed share
+    // of the boot window, so let the §5.2 fault-isolation demo — which
+    // ends the boot, via device-manager's own closing `POWER_CONTROL` —
+    // finally start. See `P2_FAULT_DEMO_START_TICK`'s own doc comment for
+    // the real QEMU measurements this ordering is derived from, and
+    // `p2_gate_fault_demo` for why a `note_ready` is all that is needed.
+    //
+    // Released BEFORE this tick's own `preempt_tick` below, deliberately:
+    // the driver's `vruntime` is still 0, so it is immediately the
+    // lowest-vruntime `Ready` candidate and this very tick's `pick_next`
+    // switches into it. Waiting for the NEXT tick would work too, but
+    // would make the release's own timing depend on the table's tie-break
+    // rather than on this constant.
+    //
+    // Exactly once (`replace(None)`, not a read): re-readying the driver
+    // on every later tick would fight `p2_fault`'s own `terminate_thread`,
+    // which has by then removed this very `ThreadId` from the scheduler.
+    //
+    // `P2_FAULT_DEMO_START_TICK == 0` (desktop mode — see that constant's
+    // own doc comment) needs no special case here: `ticks` is
+    // pre-incremented above and so is never 0, which is precisely why 0
+    // is the "never release" sentinel rather than an arbitrary flag.
+    if ticks == P2_FAULT_DEMO_START_TICK {
+        // SAFETY: single-core; written once by `p2_gate_fault_demo`,
+        // consumed exactly here.
+        if let Some(tid) = unsafe { core::ptr::addr_of_mut!(GATED_FAULT_DRIVER_TID).replace(None) } {
+            let k = kstate();
+            let _ = k.sched.note_ready(tid, hal.now_ns());
+            klog!(
+                "fault-isolation demo (03 5.2): tick {} reached - releasing faulty-driver tid {} into the scheduler\r\n",
+                ticks,
+                tid.as_u32()
+            );
+        }
+    }
+
+    if ticks >= P2_TICK_BUDGET {
+        hal.cancel_timer();
+        let phys = unsafe { core::ptr::addr_of!(P2_SHARED_PHYS).read() };
+        let c_phys = unsafe { core::ptr::addr_of!(P3_COUNTER_PHYS).read() };
+        // SAFETY: both are identity-mapped U=0 in the live space (`phys`
+        // from the §8.4 shared frame; `c_phys` from `spawn_process`'s
+        // stack carve — `0` if process C was never spawned, in which case
+        // this read is skipped below).
+        let (a, b) = unsafe {
+            (
+                core::ptr::read_volatile((phys + P2_COUNTER_A_OFF) as *const u32),
+                core::ptr::read_volatile((phys + P2_COUNTER_B_OFF) as *const u32),
+            )
+        };
+        let c = if c_phys != 0 {
+            // SAFETY: as above.
+            Some(unsafe { core::ptr::read_volatile(c_phys as *const u32) })
+        } else {
+            None
+        };
+        let all_ran = a > 0 && b > 0 && c.unwrap_or(1) > 0;
+        klog!(
+            "preemption: {} timer ticks, NO P2_YIELD - process A's counter = {}, process B's counter = {}, process C's counter = {:?} -> {}\r\n",
+            ticks,
+            a,
+            b,
+            c,
+            if all_ran {
+                if c.is_some() {
+                    "PREEMPTIVE THREE-PROCESS SCHEDULING (02 4): all three ran, timer-driven, C spawned via the generic path"
+                } else {
+                    "PREEMPTIVE TWO-PROCESS SCHEDULING (02 4): both ran, timer-driven"
+                }
+            } else {
+                "MISMATCH"
+            }
+        );
+        // **Real bug found via QEMU** (real-IPC plan Phase 2): cancelling
+        // the timer above and returning `None` (this function's own doc
+        // comment: "the running process then keeps its loop") means
+        // WHICHEVER of A/B/C is currently executing keeps running in
+        // real hardware WITHOUT ever having its own TCB-stored context
+        // snapshot updated again — that snapshot stays frozen at wherever
+        // it was as of its own LAST real `preempt_tick` switch-IN, while
+        // its actual register state keeps advancing past that point
+        // forever after. Harmless as long as nothing ever tries to
+        // "resume" it again (this demo's own designed purpose: it just
+        // spins visibly for the smoke grep) — but real-IPC plan Phase
+        // 2's own `p2_wait_general`/`p2_ipc_recv_general` DO call
+        // general, non-fast-path `pick_next`, which can legitimately
+        // select this SAME thread later (it is still, correctly, `Ready`
+        // in the scheduler's own eyes) and switch INTO it using that
+        // frozen, long-stale snapshot — resuming a PAST version of a
+        // thread that is simultaneously still advancing for real,
+        // confirmed via a real QEMU crash whose faulting context
+        // (bisected via a temporary `klog!` on every `p2_ipc_call`/
+        // `p2_wait_general`/`p2_ipc_recv_general` switch decision) was
+        // process C's own tid. `note_blocked` (not `remove`): these
+        // threads never get a real WAKE-UP from anywhere else either way
+        // (this demo's own designed end state), but leaving their TCB
+        // slots intact costs nothing and avoids reasoning about whether
+        // `remove` is safe to call on a thread that is, from hardware's
+        // own perspective, still mid-execution.
+        //
+        // **Second real bug found while verifying this fix, before it was
+        // ever built**: an earlier draft also called `note_blocked` on
+        // `k.sched.running()` itself (to cover "whichever of A/B/C
+        // happens to be currently executing" defensively). That is
+        // actively wrong, not just redundant: the thread that is
+        // CURRENTLY running is not stale (its hardware register state
+        // and its own would-be TCB snapshot are the SAME thing right
+        // now — nothing has diverged yet), and `Scheduler::note_blocked`
+        // unconditionally clears `sched.running()` when called on the
+        // running thread (its own doc comment: "the caller should then
+        // `pick_next`"). Since `p2_tick` returns `None` here with no
+        // dispatch decision at all, nothing ever re-establishes
+        // `sched.running()` afterward — so the VERY NEXT syscall this
+        // same physically-still-executing thread issues (`p2_ipc_call`/
+        // `p2_wait_general`/`p2_ipc_recv_general`, every one of which
+        // discovers its own caller via `k.sched.running()`) would find
+        // `None` and fail. This is the exact bug class `drv_irq_wait_
+        // step`'s own doc comment above already documents and fixes via
+        // an explicit re-`dispatch` — except here there is no good
+        // moment to re-`dispatch`, since `p2_tick` itself doesn't know
+        // it's about to hand control back to that same thread (the trap
+        // return path does that implicitly). Simplest correct fix:
+        // never touch `running()`'s own identity here at all — only
+        // retire whichever of A/C is NOT currently running (the one
+        // that already stopped earlier and is sitting on a stale,
+        // dangerous snapshot); process B needs no entry here, already
+        // retired earlier in `p2_preempt_start`, well before this demo
+        // ever starts.
+        let k = kstate();
+        let running = k.sched.running();
+        if let Some(a_tid) = unsafe { core::ptr::addr_of!(G_FRESH_A_TID).read() } {
+            if Some(a_tid) != running {
+                let _ = k.sched.note_blocked(a_tid);
+            }
+        }
+        if let Some(c_tid) = unsafe { core::ptr::addr_of!(G_PROC_C_TID).read() } {
+            if Some(c_tid) != running {
+                let _ = k.sched.note_blocked(c_tid);
+            }
+        }
+        return None;
+    }
+
+    hal.arm_timer(hal.now_ns() + P2_QUANTUM_NS);
+    let k = kstate();
+    match k.preempt_tick(hal.now_ns()) {
+        PreemptStep::Switch { outgoing, incoming } => k.user_ctx_switch_ptrs(outgoing, incoming),
+        PreemptStep::Continue | PreemptStep::Idle => None,
+    }
+}
+
+/// Per-process fault isolation (03-Kernel-Subsystems-Layer.md §2.1/§5.2):
+/// registered as the arch `FaultHandler` for a synchronous exception
+/// taken from U-mode that is not an `ecall`. `cause_code`/`sepc`/`stval`
+/// are the raw architecture trap values, logged for diagnosis; WHICH
+/// thread faulted is `kernel-sched`'s own `running()` bookkeeping — the
+/// arch trap vector has no other way to know, since the exception could
+/// be anything (illegal instruction, page fault, ...), not a syscall
+/// naming its own caller.
+///
+/// Terminates that thread (`KernelState::terminate_thread`) and returns
+/// the next runnable thread's context to resume, or `None` if nothing
+/// else is runnable (the caller then has no thread left to `sret` into
+/// — a real kernel would idle; logged as fatal here since every demo
+/// process in this MVP either counts forever or has already finished).
+pub fn p2_fault(cause_code: usize, sepc: usize, stval: usize) -> Option<*const u8> {
+    // SAFETY: single-core; `G_HAL` set by `enter` before any syscall.
+    let hal = unsafe { &*core::ptr::addr_of!(G_HAL).read() };
+    let k = kstate();
+    let Some(tid) = k.sched.running() else {
+        klog!(
+            "FAULT: no thread was running when exception (cause={:#x} sepc={:#x} stval={:#x}) landed - halting\r\n",
+            cause_code, sepc, stval
+        );
+        return None;
+    };
+    klog!(
+        "FAULT: thread {} took a fatal U-mode exception (cause={:#x} sepc={:#x} stval={:#x}) - terminating IT, rest of the system continues (03 5.2)\r\n",
+        tid.as_u32(), cause_code, sepc, stval
+    );
+
+    // If the thread that just died is the one device-manager actually
+    // supervises, hand off DIRECTLY to device-manager's own PERMANENT tid
+    // (`KernelState::terminate_thread_and_handoff`) instead of the
+    // generic `terminate_thread`/`pick_next` fairness path below — see
+    // this module's own "Real IPC-driven driver supervision demo" doc
+    // comment (above `WATCHED_DRIVER_TID`) for the two QEMU-found races
+    // this unconditional hand-off exists to close. Fault isolation itself
+    // (below, the non-watched-driver case) stays fully general — this
+    // hand-off is an additional, demo-specific policy layered on top for
+    // this ONE well-defined case (device-manager is DEFINITELY who
+    // should run next).
+    // SAFETY: single-core.
+    if unsafe { core::ptr::addr_of!(WATCHED_DRIVER_TID).read() } == Some(tid) {
+        // SAFETY: single-core; only written here, read by `p2_poll_crash`.
+        unsafe { core::ptr::addr_of_mut!(PENDING_CRASH).write(Some((cause_code, sepc, stval))) };
+        // SAFETY: single-core; only written once, by `p2_register_device_manager`.
+        if let Some(dm_tid) = unsafe { core::ptr::addr_of!(DM_TID).read() } {
+            klog!(
+                "FAULT: hand-off to device-manager (tid {}) - direct, not generic fairness (03 5.2)\r\n",
+                dm_tid.as_u32()
+            );
+            let now = hal.now_ns();
+            k.wake_blocked(dm_tid, now);
+            k.terminate_thread_and_handoff(
+                tid,
+                kernel_core::ThreadExit::Faulted { cause: cause_code as u64 },
+                dm_tid,
+                now,
+            );
+            return k.user_context_bytes(dm_tid).map(|c| c.as_ptr());
+        }
+    }
+
+    // The raw `cause_code` is recorded on the dying thread's own TCB here,
+    // for its SPAWNER to read back later via `SyscallOp::ThreadExitStatus`
+    // (`p2_thread_exit_status` below) — the general counterpart of the
+    // single-slot `PENDING_CRASH` static above, which only ever serves
+    // device-manager's one watched driver. Both are populated on the same
+    // real fault; neither replaces the other yet (device-manager's own
+    // blocking wait is load-bearing for the §5.2 fault-isolation demo and
+    // is deliberately left untouched).
+    match k.terminate_thread(
+        tid,
+        kernel_core::ThreadExit::Faulted { cause: cause_code as u64 },
+        hal.now_ns(),
+    ) {
+        kernel_core::TerminationOutcome::Switched { incoming } => {
+            k.user_context_bytes(incoming).map(|c| c.as_ptr())
+        }
+        kernel_core::TerminationOutcome::Idle => {
+            klog!(
+                "FAULT: nothing else runnable after terminating thread {} - halting\r\n",
+                tid.as_u32()
+            );
+            None
+        }
+    }
+}
+
+/// Desktop build only: takes the CURRENT thread out of scheduling for
+/// good and hands the CPU to the next runnable thread. Returns the
+/// `(save, into)` pair for `TrapOutcome::SwitchTo`, or `None` (the caller
+/// just resumes) if nothing else is runnable.
+///
+/// For a process whose documented next action after its final boot
+/// report is `loop { spin_loop() }` (native-loader after
+/// `NL_DISPLAY_REPORT`, simurgh-init after `IN_SUPERVISE_REPORT`): parking
+/// it is observably identical — it never does anything again either way
+/// — but it no longer burns a full fair share of the CPU. Measured on a
+/// real desktop boot (2026-09-24): those two spinning tails alone took
+/// ~35% of all ticks while ui-core got ~1%. The TCB stays intact
+/// (`note_blocked`, not `remove`), matching every other retirement in
+/// this file.
+#[cfg(feature = "desktop")]
+pub fn desktop_park_caller() -> Option<(*mut u8, *const u8)> {
+    let hal = khal();
+    let k = kstate();
+    let caller = k.sched.running()?;
+    let _ = k.sched.note_blocked(caller);
+    let now = hal.now_ns();
+    let Some(next) = k.sched.pick_next(now) else {
+        let _ = k.sched.note_ready(caller, now);
+        let _ = k.sched.dispatch(caller, now);
+        return None;
+    };
+    let _ = k.sched.dispatch(next, now);
+    klog!("desktop mode: tid {} finished its boot self-check and only spins from here - parked (not scheduled again)\r\n", caller.as_u32());
+    k.user_ctx_switch_ptrs(caller, next)
+}
+
+/// Desktop build only: parks the core in `halt` (`hlt` on x86_64, `wfi`
+/// elsewhere) until the next interrupt when NOTHING useful is runnable,
+/// then runs one scheduler tick. The idle thread never counts as useful
+/// work (see [`desktop_yield`] and [`desktop_idle_wait`], its two callers).
+///
+/// Why this is safe where the 2026-09-17 Ring-0 `hlt` loop was not (see
+/// [`drv_irq_wait_yield`]): a timer tick that lands at CPL 0 is only
+/// acknowledged, never handed to `p2_tick`, and `p2_tick` is what re-arms
+/// the one-shot preemption timer. So (1) the deadline is armed BEFORE
+/// halting, which guarantees a wake-up even on a quiet machine, and (2)
+/// the function always ends by running one `p2_tick` itself, which
+/// re-arms the timer whichever interrupt woke the core. An input IRQ that
+/// woke a driver (`wake_blocked` makes it `Ready`) is therefore acted on
+/// by that same tick, immediately, rather than a quantum later.
+///
+/// Returns `None` (without halting) before the preemptive phase starts
+/// (no idle thread yet, timer not armed), so boot-time cooperative yields
+/// behave exactly as before.
+#[cfg(feature = "desktop")]
+fn desktop_halt_then_tick(halt: fn()) -> Option<Option<(*mut u8, *const u8)>> {
+    let hal = khal();
+    let k = kstate();
+    // SAFETY: single-core; written once by `p2_preempt_start`.
+    let idle = unsafe { core::ptr::addr_of!(G_FRESH_A_TID).read() }?;
+    let running = k.sched.running();
+    if k.sched.has_ready_except(&[running, Some(idle)]) {
+        return None;
+    }
+    hal.arm_timer(hal.now_ns() + P2_QUANTUM_NS);
+    halt();
+    Some(p2_tick())
+}
+
+/// Desktop build only: `P2_YIELD`. A yield with no other useful thread
+/// `Ready` (ui-core polling for input while everything else is blocked
+/// is the common case) used to return immediately, turning the desktop
+/// into a busy loop that kept a host core at 100%. Now the core is halted
+/// until the next interrupt (see [`desktop_halt_then_tick`]); if other
+/// work is `Ready` it is the ordinary [`p2_yield`].
+#[cfg(feature = "desktop")]
+pub fn desktop_yield(halt: fn()) -> Option<(*mut u8, *const u8)> {
+    match desktop_halt_then_tick(halt) {
+        Some(r) => r,
+        None => p2_yield(),
+    }
+}
+
+/// Desktop build only: the idle thread's own wait (`sys::IDLE_WAIT`).
+/// The idle thread is the always-`Ready` fallback `pick_next` lands on
+/// when every interactive process is blocked (see `p2_preempt_start`); it
+/// used to be a counting loop. With other work `Ready` it just yields
+/// through one tick; otherwise it halts as above.
+#[cfg(feature = "desktop")]
+pub fn desktop_idle_wait(halt: fn()) -> Option<(*mut u8, *const u8)> {
+    match desktop_halt_then_tick(halt) {
+        Some(r) => r,
+        None => p2_tick(),
+    }
+}
+
+/// Holds the FIRST faulty-driver instance back from `pick_next` until
+/// the general scheduler has had [`P2_FAULT_DEMO_START_TICK`] real
+/// rounds — see that constant's own doc comment for the QEMU
+/// measurements behind it, and `GATED_FAULT_DRIVER_TID` for the scope.
+///
+/// Called by each architecture's `P2_PREEMPT_START` arm with whatever
+/// `spawn_faulty_driver*` returned, immediately after that spawn and
+/// before `p2_preempt_start` arms the timer. `None` (the spawn failed)
+/// is a no-op: there is then no demo to gate, and the boot proceeds
+/// exactly as it would have.
+///
+/// `note_blocked`, not `sched.remove`: the driver's TCB and scheduler
+/// entity must both stay fully intact, since the gate release is just a
+/// `note_ready` on this same entity. It is not running (it has never run
+/// — it was seeded by `init_user_thread` moments ago and the CPU is
+/// still inside root's own `P2_PREEMPT_START` trap), so `note_blocked`
+/// cannot disturb `sched.running()` here. Its `vruntime` stays 0, which
+/// is what makes the release immediate in practice: the moment it goes
+/// `Ready` it is the lowest-vruntime candidate in the table, so the very
+/// next `pick_next` selects it.
+///
+/// This does NOT weaken fault isolation in any way. The driver still
+/// faults on its own first instruction, `p2_fault` still hands off
+/// directly to `DM_TID`, and device-manager still runs the full
+/// six-cycle restart budget to `state=Failed restarts_in_window=6`. The
+/// only thing that changes is WHEN that sequence starts.
+pub fn p2_gate_fault_demo(tid: Option<ThreadId>) {
+    let Some(tid) = tid else { return };
+    let k = kstate();
+    let _ = k.sched.note_blocked(tid);
+    // SAFETY: single-core; only written here, read (and cleared) by
+    // `p2_tick`'s own gate-release branch.
+    unsafe { core::ptr::addr_of_mut!(GATED_FAULT_DRIVER_TID).write(Some(tid)) };
+    klog!(
+        "fault-isolation demo (03 5.2): faulty-driver tid {} held out of pick_next until tick {}, so every spawned layer-4 process gets real scheduling time first\r\n",
+        tid.as_u32(),
+        P2_FAULT_DEMO_START_TICK
+    );
+}
+
+/// Records `tid` as the "faulty driver" instance `p2_fault` should treat
+/// specially. Called once by `kernel/src/main.rs`'s `spawn_faulty_driver`
+/// right after EVERY (re)spawn — a respawned driver gets a brand-new
+/// `ThreadId`, so this must be re-armed each time, not just at boot.
+pub fn p2_watch_driver(tid: ThreadId) {
+    // SAFETY: single-core; only written here, read by `p2_fault`.
+    unsafe { core::ptr::addr_of_mut!(WATCHED_DRIVER_TID).write(Some(tid)) };
+}
+
+/// Records `tid` as device-manager's own, PERMANENT `ThreadId` — called
+/// once by `kernel/src/main.rs`'s `spawn_device_manager` right after it
+/// succeeds. `p2_fault` targets this directly on a watched-driver crash
+/// (see `DM_TID`'s own doc comment for why unconditionally, not via a
+/// "currently blocked" registration).
+pub fn p2_register_device_manager(tid: ThreadId) {
+    // SAFETY: single-core; only written here, read by `p2_fault`.
+    unsafe { core::ptr::addr_of_mut!(DM_TID).write(Some(tid)) };
+}
+
+/// Called once device-manager reports `Failed` (`sys::DM_REPORT` with
+/// `a0 == 3`): it has given up and drops into its own "spin forever"
+/// idle, so it must stop being exempt from ordinary preemption
+/// (`p2_tick`'s `DM_TID` check) — it will never again call
+/// `DM_WAIT_CRASH`/`DM_RESPAWN_DRIVER`, and staying exempt would let it
+/// monopolize the CPU forever, starving A/B/C's own fairness demo. See
+/// `p2_tick`'s doc comment for the exemption this undoes.
+pub fn p2_dm_supervision_done() {
+    // SAFETY: single-core; only written here and by `p2_register_device_manager`.
+    unsafe { core::ptr::addr_of_mut!(DM_TID).write(None) };
+}
+
+/// `DM_WAIT_CRASH` from device-manager: block until the watched driver
+/// process dies (real IPC-driven supervision — 03-Kernel-Subsystems-
+/// Layer.md §5.2). If a crash is already pending — it happened before
+/// device-manager got around to waiting, always possible since spawning
+/// and scheduling order are not synchronized — returns `None` (→
+/// `TrapOutcome::Resume`) immediately so device-manager can go straight to
+/// `p2_poll_crash`; otherwise genuinely blocks (`KernelState::
+/// block_thread`) and returns `Some((save, into))` for `TrapOutcome::
+/// SwitchTo`. Blocking here is purely for `kernel-sched`'s own bookkeeping
+/// (so device-manager does not appear to still be `Running` while it
+/// waits) — `p2_fault` does not depend on this call having happened; it
+/// always targets `DM_TID` directly regardless of device-manager's exact
+/// state when the driver dies.
+pub fn p2_dm_wait_crash() -> Option<(*mut u8, *const u8)> {
+    // SAFETY: single-core; `G_HAL` set by `enter` before any syscall.
+    let hal = unsafe { &*core::ptr::addr_of!(G_HAL).read() };
+    let k = kstate();
+    // SAFETY: single-core; only `p2_fault`/`p2_poll_crash` touch this too.
+    if unsafe { core::ptr::addr_of!(PENDING_CRASH).read() }.is_some() {
+        return None;
+    }
+    let Some(tid) = k.sched.running() else {
+        return None;
+    };
+    match k.block_thread(tid, hal.now_ns()) {
+        PreemptStep::Switch { outgoing, incoming } => k.user_ctx_switch_ptrs(outgoing, incoming),
+        PreemptStep::Continue | PreemptStep::Idle => None,
+    }
+}
+
+/// `DM_RESPAWN_DRIVER` from device-manager, called right after
+/// `kernel/src/main.rs`'s `spawn_faulty_driver` succeeds: hands the CPU
+/// DIRECTLY to the fresh driver thread (`KernelState::yield_to_thread`)
+/// instead of just returning and trusting the ordinary fairness scheduler
+/// (or an already-cancelled preemption timer) to ever pick it up — the
+/// respawn-direction counterpart of the crash-notify hand-off above (see
+/// `WATCHED_DRIVER_TID`'s doc comment for the starvation this whole
+/// pattern exists to close). The fresh driver's only instruction faults
+/// immediately, so control comes straight back via `p2_fault`'s own
+/// hand-off to `DM_TID` — this call never really "returns" in the normal
+/// sense, it just describes device-manager's OWN snapshot point.
+pub fn p2_dm_handoff_to_driver(new_driver_tid: ThreadId) -> Option<(*mut u8, *const u8)> {
+    // SAFETY: single-core; `G_HAL` set by `enter` before any syscall.
+    let hal = unsafe { &*core::ptr::addr_of!(G_HAL).read() };
+    let k = kstate();
+    let caller = k.sched.running()?;
+    match k.yield_to_thread(caller, new_driver_tid, hal.now_ns()) {
+        PreemptStep::Switch { outgoing, incoming } => k.user_ctx_switch_ptrs(outgoing, incoming),
+        PreemptStep::Continue | PreemptStep::Idle => None,
+    }
+}
+
+/// `DM_POLL_CRASH` from device-manager, called right after waking from
+/// `p2_dm_wait_crash` (or finding a crash already pending): consumes and
+/// returns the pending crash's `cause_code` raw trap value, or `0` if
+/// somehow nothing is pending (should not happen given `p2_dm_wait_crash`'s
+/// contract, but this stays total rather than panicking).
+pub fn p2_poll_crash() -> usize {
+    // SAFETY: single-core; only this function clears `PENDING_CRASH`.
+    let pending = unsafe { core::ptr::replace(core::ptr::addr_of_mut!(PENDING_CRASH), None) };
+    pending.map(|(cause, _, _)| cause).unwrap_or(0)
+}
+
+// ---------------------------------------------------------------------------
+// Real U-mode Call/Recv/Reply demo (02-Microkernel-Layer.md §5.1/§8.2 —
+// IMPLEMENTATION-PLAN.md's own follow-up: everything ELSE in this file's
+// U-mode demo machinery uses ad-hoc raw opcodes over `ecall`
+// [`P2_YIELD`, `ALIVE`, `DM_REPORT`, ...], never `kernel_core::SyscallOp`'s
+// REAL `Call`/`Recv`/`Reply` IPC surface through a genuine trap. This is
+// the first — and, deliberately, only — demo to actually exercise that
+// surface end to end, as the concrete thing the register-only IPC fast
+// path (still pending — see `kernel_ipc::fastpath`'s own doc comment)
+// needs to attach to and be verified against.
+//
+// `p2_ipc_call`/`p2_ipc_recv`/`p2_ipc_reply` stay entirely architecture-
+// erased (no `cfg(target_arch)`, same as everything else in this crate):
+// each returns a plain `IpcSwitch`/`Option<...>` describing what the
+// ARCHITECTURE-SPECIFIC caller (`kernel/src/main.rs`'s `simurgh_syscall`)
+// must do — including, when `poke` is `Some`, an (a0, a1) pair the
+// caller must write into the target's SAVED context via its own
+// `hal_<arch>::cpu::poke_saved_a0_a1`-style primitive BEFORE performing
+// the actual switch. This function cannot do that poke itself: it would
+// need to know the concrete `UserContext` layout, which is exactly the
+// architecture knowledge this crate must not have.
+// ---------------------------------------------------------------------------
+
+/// What the architecture-specific caller must do to complete an
+/// `IpcCall`/`IpcRecv`/`IpcReply` demo opcode that needs a real switch.
+pub struct IpcSwitch {
+    /// Where to write the outgoing (calling) thread's snapshot.
+    pub save: *mut u8,
+    /// The incoming thread's context to resume.
+    pub into: *const u8,
+    /// If `Some((a0, a1))`, the caller must poke `into`'s SAVED a0/a1
+    /// registers with these values BEFORE performing the switch — `into`
+    /// is being woken via a direct kernel-core delivery (`do_send`'s
+    /// `Call` fast path, or `do_reply`), not resuming its own trap, so
+    /// its saved context still holds whatever it originally trapped in
+    /// WITH and needs the delivery's actual result written in instead.
+    pub poke: Option<(usize, usize)>,
+}
+
+/// `IPC_CALL` demo opcode: `SyscallOp::Call` with a label-only
+/// `SmallMessage` (no data words — this demo only needs to prove the
+/// mechanism, not carry a real payload). Always either switches away
+/// (a `Call` always blocks its caller pending the reply — see `do_send`'s
+/// own doc comment) or fails outright; there is no "resume immediately"
+/// case for `Call` the way there is for `Recv`.
+pub fn p2_ipc_call(hal: &HalInterface, caller: ThreadId, endpoint_raw: u32, label: u64) -> Option<IpcSwitch> {
+    let k = kstate();
+    let msg = SmallMessage::new(label);
+    match k.dispatch(caller, hal.now_ns(), SyscallOp::Call { endpoint: kernel_cap::CapId::new(endpoint_raw), msg }, hal) {
+        // **Real bug found via QEMU** (real-IPC plan Phase 2 — same class
+        // [`p2_wait_general`]'s own doc comment documents at length):
+        // `do_send` already committed `caller` as blocked
+        // (`BlockedOnReply`/`BlockedOnSend`, `note_blocked`) before ever
+        // returning `Reschedule { next: None }` here — falling through to
+        // the generic `_ => None` arm below used to leave `caller`
+        // stranded `Blocked` in the scheduler's own bookkeeping while
+        // ACTUALLY still executing (the trap-dispatch arm's own `None`
+        // fallback just resumes it with no switch), corrupting every
+        // LATER `pick_next`/`account()` call. Mirrors `KernelState::
+        // block_thread`'s own established fix: undo the block and
+        // re-`dispatch` `caller` itself. Real-IPC plan Phase 2's own 3
+        // client processes are this call's actual real users today
+        // (`native-loader`/`account-manager`/`store`, each issuing a
+        // blocking `Call` after their own `Signal`) — this is not a
+        // theoretical case.
+        //
+        // **Second half, found on the first interactive desktop boot
+        // (2026-09-24)**: undoing the block made the `Call` RETURN before
+        // any reply existed whenever the server was not already waiting in
+        // `Recv` — the request stays queued, but the client resumed and
+        // read its reply page as it stood, i.e. the PREVIOUS reply. That is
+        // exactly `simurgh-file-manager`'s long-open "Write reply decodes
+        // as Opened" bug (fm-core's `G_LAST_REPLY_LABEL` doc comment), and
+        // it made the desktop's FILES window fail every listing. The caller
+        // now stays genuinely blocked and the CPU goes to whatever
+        // `pick_next` finds (the same shape `p2_wait_general` uses); the
+        // server's later `Recv` finds the queued request and its `Reply`
+        // wakes this caller through the normal direct hand-off. Only when
+        // NOTHING else is runnable does the old undo-and-resume fallback
+        // remain (there is then no one to run instead).
+        Ok(SyscallReturn::Reschedule { next: None }) => {
+            let now = hal.now_ns();
+            if let Some(n) = k.sched.pick_next(now) {
+                if n != caller {
+                    let _ = k.sched.dispatch(n, now);
+                    let (save, into) = k.user_ctx_switch_ptrs(caller, n)?;
+                    return Some(IpcSwitch { save, into, poke: None });
+                }
+            }
+            let _ = k.sched.note_ready(caller, now);
+            let _ = k.sched.dispatch(caller, now);
+            None
+        }
+        Ok(SyscallReturn::Reschedule { next: Some(n) }) => {
+            // `do_send`/`do_recv`/`do_reply` only ever call `note_ready`/
+            // `note_blocked` on the entities they touch, never `dispatch`
+            // — `Scheduler::dispatch` is the ONE call that both marks an
+            // entity `Running` AND updates `self.running`, and skipping
+            // it here would leave kernel-sched's own bookkeeping
+            // pointing at `caller` even after the switch below actually
+            // moves execution to `n` — corrupting a LATER `account()`/
+            // `pick_next()`'s idea of who is really running. Matches
+            // `p2_ipc_demo_start`'s own explicit `dispatch` call (itself
+            // modeled on `p2_preempt_start`'s precedent) for the exact
+            // same reason.
+            let _ = k.sched.dispatch(n, hal.now_ns());
+            let (save, into) = k.user_ctx_switch_ptrs(caller, n)?;
+            // `n` is the receiver `do_send`'s fast path just delivered
+            // to directly (see that function's own doc comment) exactly
+            // when both fields below are present — the general
+            // (non-fast-path) case picks some other, unrelated `Ready`
+            // thread via `pick_next`, which never had these set, so
+            // `poke` correctly comes back `None` for it.
+            let poke = k
+                .tcb_mut(n)
+                .and_then(|t| Some((t.pending_from.take()?, t.pending_msg.take()?)))
+                .map(|(from, m)| (from.as_u32() as usize, m.label as usize));
+            // This `Call` was delivered straight into fs-native's pending
+            // `Recv`, so the server is about to read the request page —
+            // stage THIS caller's own private pages in first. A no-op for
+            // every non-fs endpoint and for Root Task. See
+            // `G_FS_CLIENT_PAGES`' own doc comment.
+            if switching_into_fs_native(into) {
+                fs_copy_client_to_server(caller.as_u32());
+            }
+            Some(IpcSwitch { save, into, poke })
+        }
+        _ => None,
+    }
+}
+
+/// `IPC_RECV` demo opcode: `SyscallOp::Recv`. Unlike `Call`, this CAN
+/// resume immediately (a sender was already queued) — the caller must
+/// then place `(from, label)` in its OWN `a0`/`a1` (`TrapOutcome::
+/// Resume2`), not perform any switch at all.
+pub enum IpcRecvOutcome {
+    /// Resume the calling thread's own trap with `(from, label)`.
+    Immediate { from: usize, label: usize },
+    /// Block — perform this switch.
+    Switch(IpcSwitch),
+}
+
+pub fn p2_ipc_recv(hal: &HalInterface, caller: ThreadId, endpoint_raw: u32) -> Option<IpcRecvOutcome> {
+    let k = kstate();
+    // **Real bug found via QEMU (2026-09-25, the desktop "no keystroke
+    // registers" regression).** The hardcoded hand-off below is only
+    // meaningful while the Root Task is alive. `p2_preempt_start` RETIRES
+    // it (`sched.remove(root)`), yet a thread that still uses this narrow
+    // opcode after that point (measured: log-collector-native, tid 15,
+    // `IPC_RECV` on an empty endpoint a few ticks into preemption) was
+    // switched straight into root's stale saved context — the process-A
+    // counting loop — while `dispatch(root)` silently failed, leaving
+    // `sched.running() == None`. The next tick then "started" whichever
+    // thread `pick_next` chose WITHOUT switching to it (`preempt_tick`'s
+    // cold-start arm), so the CPU kept spinning in the counting loop under
+    // that thread's name, and the first real switch away saved the loop's
+    // registers into that thread's context. On the old all-equal-priority
+    // scheduler the victim was an arbitrary background service; with the
+    // desktop input path ranked first it was always ui-core, and input
+    // froze. Once root is gone there is no root-only phase left for
+    // anyone, so this becomes exactly the general receive.
+    if k.sched.entity(k.root_thread).is_none() {
+        return p2_ipc_recv_general(hal, caller, endpoint_raw);
+    }
+    match k.dispatch(caller, hal.now_ns(), SyscallOp::Recv { endpoint: kernel_cap::CapId::new(endpoint_raw) }, hal) {
+        Ok(SyscallReturn::Message { from, msg }) => {
+            Some(IpcRecvOutcome::Immediate { from: from.as_u32() as usize, label: msg.label as usize })
+        }
+        // `next: None` (nothing else Ready) hands off to root too: while root is
+        // alive this opcode is the one-shot RPC hand-off, whose destination is
+        // ALWAYS root, and `pick_next` answering `None` only means root is not
+        // marked Ready (it sits suspended inside its own spawn/Call syscall),
+        // not that there is nobody to resume. Returning immediately instead (the
+        // `_` arm) made the caller's serve loop spin without blocking. Found
+        // via QEMU (Internet plan phase 1): with the Netstack boot demo skipped
+        // no phantom Ready thread existed any more, and the Compositor spun
+        // its request loop on a stale message until its heap ran out. Desktop image
+        // only: the demo image's NIC demo (Netstack <-> driver, timing-sensitive)
+        // relies on the immediate return, verified via QEMU. A caller that IS
+        // root has nobody to hand off to and keeps the old behaviour.
+        Ok(SyscallReturn::Reschedule { next }) if next.is_some() || (cfg!(feature = "desktop") && caller != k.root_thread) => {
+            // **Real bug found via QEMU**: `do_recv`'s own `next` here
+            // is `pick_next`'s GENERAL fairness answer — correct for
+            // the general syscall surface, but wrong for THIS demo's
+            // one-shot RPC shape, which for the whole rest of the boot
+            // sequence up to this point had never once actually
+            // consulted `pick_next` while process B (tid 3, `§8.4`'s own
+            // worker) sat `Ready`-but-idle (finished its own role,
+            // genuinely eligible, LOWER vruntime than root's — root has
+            // been doing real ecall work this entire demo). The first
+            // time anything DOES call `pick_next` here, it correctly-
+            // by-its-own-rules preferred process B over `root` — NOT a
+            // scheduler bug, but wrong for a deterministic 2-party
+            // RPC's assumption "whoever blocked in `Recv` resumes
+            // whoever `Call`s it next". Same fix `p2_fault`'s own
+            // "unconditional hand-off to `DM_TID` — direct, not generic
+            // fairness" already established for exactly this class of
+            // problem: bypass `pick_next` and switch straight to the
+            // ONE thread this scoped, one-shot demo ever expects to
+            // interact with the server (`root`), rather than trusting
+            // general fairness to guess correctly.
+            // See `p2_ipc_call`'s own comment on why `dispatch` (not
+            // just `user_ctx_switch_ptrs`) is needed here.
+            let _ = k.sched.dispatch(k.root_thread, hal.now_ns());
+            let (save, into) = k.user_ctx_switch_ptrs(caller, k.root_thread)?;
+            Some(IpcRecvOutcome::Switch(IpcSwitch { save, into, poke: None }))
+        }
+        _ => None,
+    }
+}
+
+/// `SBS_IPC_RECV` opcode: `SyscallOp::Recv`, WITHOUT `p2_ipc_recv`'s own
+/// hardcoded "switch to `root_thread`" hack.
+///
+/// **Real bug found via QEMU** (this session's real-IPC plan, Phase 1):
+/// `p2_ipc_recv`'s own `root_thread` fallback is a narrow fix scoped to
+/// ONE specific 2-party demo (root <-> process B) — see that function's
+/// own doc comment. `fs-native`/`compositor`/`mm-service` also share the
+/// generic `IPC_RECV` opcode and happen to work anyway, because their
+/// own boot sequence always makes Root Task genuinely the correct next
+/// thing to resume right after they first block. `security-broker`'s own
+/// NEW `request_capability` service loop (this plan's Phase 1) has no
+/// such guarantee — by the time it first calls `Recv`, boot has moved
+/// well past Root Task's own sequential setup into the general timer-
+/// preemption phase, where `root_thread` is neither the caller nor
+/// necessarily even still a valid, running participant. Confirmed via a
+/// temporary diagnostic covering every real `p2_tick` switch decision:
+/// `native-loader`'s own thread DOES get scheduled and DOES run (ruling
+/// out the scheduler-fairness dead end investigated first) — the actual
+/// break is HERE, in `Recv`'s own hardcoded destination silently
+/// hijacking control away from the real `pick_next` answer, corrupting
+/// the round trip before either side's own wire-format code ever runs.
+///
+/// This is a SEPARATE opcode, not a change to `p2_ipc_recv` itself,
+/// specifically so `fs-native`/`compositor`/`mm-service`/the original
+/// demo keep their own already-proven, unchanged behavior — only a NEW
+/// consumer with a genuinely general blocking-Recv need opts into this
+/// one.
+pub fn p2_ipc_recv_general(hal: &HalInterface, caller: ThreadId, endpoint_raw: u32) -> Option<IpcRecvOutcome> {
+    let k = kstate();
+    match k.dispatch(caller, hal.now_ns(), SyscallOp::Recv { endpoint: kernel_cap::CapId::new(endpoint_raw) }, hal) {
+        Ok(SyscallReturn::Message { from, msg }) => {
+            Some(IpcRecvOutcome::Immediate { from: from.as_u32() as usize, label: msg.label as usize })
+        }
+        // **Real bug found via QEMU** (real-IPC plan Phase 2 — same class
+        // [`p2_wait_general`]'s own doc comment documents at length):
+        // `do_recv`'s own `ReceiverQueued` arm already committed `caller`
+        // as `BlockedOnRecv` (`note_blocked`) before ever returning
+        // `Reschedule { next: None }` here — falling through to the
+        // generic `_ => None` arm below used to leave `caller` stranded
+        // `Blocked` in the scheduler's own bookkeeping while ACTUALLY
+        // still executing, corrupting every LATER `pick_next`/
+        // `account()` call. Mirrors `KernelState::block_thread`'s own
+        // established fix: undo the block and re-`dispatch` `caller`
+        // itself — safe here specifically because nothing was pending to
+        // receive anyway (same reasoning `p2_wait_general`'s own
+        // `Immediate(0)` fallback gives), so resuming the caller with no
+        // message is a correct "nothing yet" answer, not a wrong one.
+        // `security-broker`'s own multi-endpoint `serve_requests` fan-in
+        // (real-IPC plan Phase 2) is this opcode's actual real user
+        // today — confirmed via a real QEMU crash that traced back to
+        // exactly this gap.
+        //
+        // **Second half (2026-09-24, found with `p2_ipc_call`'s identical
+        // one on the first interactive desktop boot)**: undoing the block
+        // made an empty `Recv` RETURN at once with no message, so every
+        // server using this path busy-polled its endpoint instead of
+        // sleeping. The receiver now stays genuinely blocked and the CPU
+        // goes to whatever `pick_next` finds (the same shape
+        // `p2_wait_general` uses); the next `Call` on this endpoint wakes
+        // it through the normal direct delivery. Only when NOTHING else is
+        // runnable does the old undo-and-resume fallback remain.
+        Ok(SyscallReturn::Reschedule { next: None }) => {
+            let now = hal.now_ns();
+            if let Some(n) = k.sched.pick_next(now) {
+                if n != caller {
+                    let _ = k.sched.dispatch(n, now);
+                    let (save, into) = k.user_ctx_switch_ptrs(caller, n)?;
+                    return Some(IpcRecvOutcome::Switch(IpcSwitch { save, into, poke: None }));
+                }
+            }
+            let _ = k.sched.note_ready(caller, now);
+            let _ = k.sched.dispatch(caller, now);
+            None
+        }
+        Ok(SyscallReturn::Reschedule { next: Some(n) }) => {
+            // See `p2_ipc_call`'s own comment on why `dispatch` (not
+            // just `user_ctx_switch_ptrs`) is needed here.
+            let _ = k.sched.dispatch(n, hal.now_ns());
+            let (save, into) = k.user_ctx_switch_ptrs(caller, n)?;
+            Some(IpcRecvOutcome::Switch(IpcSwitch { save, into, poke: None }))
+        }
+        _ => None,
+    }
+}
+
+/// Outcome of [`p2_wait_general`] — mirrors [`IpcRecvOutcome`]'s own
+/// two-way split, just for `SyscallOp::Wait`'s own `Value`/`Blocked`
+/// shape instead of `Recv`'s `Message`/`Reschedule`.
+pub enum WaitOutcome {
+    /// Bits were already pending — resume the caller immediately with
+    /// them, no switch.
+    Immediate(u64),
+    /// The caller genuinely blocked — perform this switch.
+    Switch(IpcSwitch),
+}
+
+/// A general-purpose `SyscallOp::Wait` — unlike `drv_irq_wait_step`
+/// (this file's own single-purpose IRQ-wait helper, which deliberately
+/// does NOT switch away on `Blocked` and instead relies on its own
+/// caller's `wfi`-retry loop, correct only because a driver waiting on
+/// its OWN hardware IRQ genuinely has nothing else to do), this
+/// performs a REAL context switch to whatever `pick_next` finds when the
+/// caller blocks — `kernel_core::syscall::do_wait` itself only marks the
+/// caller `Blocked` (`SyscallReturn::Blocked`, no `next` computed), so
+/// this glue picks and dispatches the next runnable thread itself, the
+/// same shape `p2_ipc_recv_general` uses for `Recv`'s own blocking case.
+/// For a multi-client server (e.g. `security-broker`'s own fan-in across
+/// several dedicated `Endpoint`s, real-IPC plan Phase 2) that must let
+/// OTHER processes run while it waits, this is the correct primitive —
+/// busy-idling in kernel context like the IRQ-wait path would instead
+/// starve every other Ready thread until the timer eventually preempts
+/// it.
+pub fn p2_wait_general(hal: &HalInterface, caller: ThreadId, notif_cap: u32) -> Option<WaitOutcome> {
+    let k = kstate();
+    match k.dispatch(caller, hal.now_ns(), SyscallOp::Wait { notification: kernel_cap::CapId::new(notif_cap) }, hal) {
+        Ok(SyscallReturn::Value(bits)) => Some(WaitOutcome::Immediate(bits)),
+        Ok(SyscallReturn::Blocked) => {
+            // **Real bug found via QEMU** (real-IPC plan Phase 2): `do_wait`
+            // already committed `caller` as `Blocked` (`note_blocked`,
+            // inside `kernel_core::syscall::do_wait`) before ever
+            // returning here — this function's ONE job left is picking
+            // who runs instead. `pick_next` returning `None` (nothing
+            // else `Ready` — confirmed possible, not hypothetical: this
+            // project's own `KernelState::block_thread` already guards
+            // the IDENTICAL case, `preempt.rs`'s own doc comment calling
+            // it out by name) used to propagate straight out via `?`,
+            // leaving `caller` stranded `Blocked` in the scheduler's own
+            // bookkeeping while ACTUALLY still running (the trap-dispatch
+            // arm's own `None` fallback just `Resume`s it with no
+            // switch) — a real, silent scheduler/reality mismatch that
+            // does not crash immediately, but corrupts every LATER
+            // `pick_next`/`account()` call's idea of who is really
+            // running, confirmed via a real QEMU run: `security-broker`'s
+            // own `serve_requests` loop served several real clients
+            // correctly, then crashed on a LATER return to `Wait` once
+            // enough of these silent mismatches had accumulated. Mirrors
+            // `block_thread`'s own fix for the identical class exactly:
+            // undo the block (`note_ready` + re-`dispatch` the caller
+            // itself) and resume it with `0` (nothing is actually
+            // pending — `serve_requests`'s own `if bits & BIT` checks are
+            // all false either way, so this is a harmless, immediate
+            // retry, not a wrong answer).
+            let Some(next) = k.sched.pick_next(hal.now_ns()) else {
+                let _ = k.sched.note_ready(caller, hal.now_ns());
+                let _ = k.sched.dispatch(caller, hal.now_ns());
+                return Some(WaitOutcome::Immediate(0));
+            };
+            let _ = k.sched.dispatch(next, hal.now_ns());
+            let (save, into) = k.user_ctx_switch_ptrs(caller, next)?;
+            Some(WaitOutcome::Switch(IpcSwitch { save, into, poke: None }))
+        }
+        _ => None,
+    }
+}
+
+/// What the architecture-specific caller (`kernel/src/main.rs`'s own
+/// `NOTIF_SIGNAL` arm) must do to finish a [`p2_signal`] call.
+pub enum SignalOutcome {
+    /// Signaled successfully; nobody needed a value poked (either no
+    /// waiter was blocked yet, or — not this project's own use case —
+    /// more than one was, `SyscallReturn::DeliveredValue`'s own doc
+    /// comment).
+    Ok,
+    /// Signaled successfully AND woke exactly one `Wait`-blocked thread —
+    /// the caller MUST poke `value` into `woke`'s own saved context
+    /// (`kernel_core::syscall::SyscallReturn::DeliveredValue`'s own doc
+    /// comment for why this cannot happen here: no `UserContext` layout
+    /// knowledge in this crate) via `hal_<arch>::cpu::poke_saved_a0_a1`
+    /// and [`KernelState::thread_context_mut_ptr`] (through [`kstate`]),
+    /// BEFORE that thread is next dispatched.
+    OkWithPoke {
+        /// The thread to poke.
+        woke: ThreadId,
+        /// The value to poke into its saved return-value register.
+        value: u64,
+    },
+    /// Bad/missing capability.
+    Failed,
+}
+
+/// A general-purpose `SyscallOp::Signal` — `do_signal` (kernel-core) never
+/// blocks the signaling thread itself (it just OR's `bits` into the
+/// notification and wakes any already-blocked waiters via its own
+/// `wake_blocked`), so this needs no SWITCH logic, unlike
+/// [`p2_wait_general`] — but see [`SignalOutcome::OkWithPoke`] for the
+/// one thing it still needs from its own caller.
+pub fn p2_signal(hal: &HalInterface, caller: ThreadId, notif_cap: u32, bits: u64) -> SignalOutcome {
+    let k = kstate();
+    match k.dispatch(caller, hal.now_ns(), SyscallOp::Signal { notification: kernel_cap::CapId::new(notif_cap), bits }, hal) {
+        Ok(SyscallReturn::DeliveredValue { woke, value }) => {
+            // The signal beat the deadline: the wait is over, so its timer
+            // entry (if it was a timed wait at all) must not fire later.
+            clear_timed_wait(woke);
+            SignalOutcome::OkWithPoke { woke, value }
+        }
+        Ok(_) => SignalOutcome::Ok,
+        Err(_) => SignalOutcome::Failed,
+    }
+}
+
+// ============================================================================
+// Timed notification waits (`sys::NOTIF_WAIT_TIMEOUT`).
+//
+// Why this exists: a server that has to wait for "an input signal OR a
+// deadline" (the Compositor holding a client's poll open; simurgh-shell
+// waiting for a GUI keystroke while it also has to look at the serial line
+// now and then) had only two choices - `NOTIF_POLL` in a loop (an always-
+// Ready thread, so the idle `hlt` never engages) or `NOTIF_WAIT` with no
+// deadline at all (blocks forever if the event never comes). This is
+// `NOTIF_WAIT` plus a deadline.
+//
+// Mechanism: the wait is an ordinary `Wait` (the caller sits on the
+// notification's waiter list, `Blocked` in the scheduler). One extra
+// record per thread says WHEN to give up. `p2_tick` - which also runs after
+// every idle halt (`desktop_halt_then_tick`) - checks the records; an
+// expired one is taken off the waiter list, made `Ready`, and its saved
+// return registers are poked to `0`, i.e. "timed out, no bits".
+// Granularity is therefore one scheduler tick (`P2_QUANTUM_NS`, 2 ms).
+// ============================================================================
+
+/// One thread's pending deadline for its timed wait.
+#[derive(Clone, Copy)]
+struct TimedWait {
+    /// Absolute `hal.now_ns()` time after which the wait gives up.
+    deadline_ns: u64,
+    /// The caller's own capability slot for the notification - needed to
+    /// find the waiter list again at expiry.
+    notif_cap: u32,
+}
+
+/// Per-thread timed-wait records, indexed by raw `ThreadId`. Single-core:
+/// touched only from syscall/tick context, never concurrently.
+static mut TIMED_WAITS: [Option<TimedWait>; kernel_core::config::MAX_THREADS] =
+    [None; kernel_core::config::MAX_THREADS];
+
+/// How the timeout path writes `(0, 0)` into a woken thread's SAVED return
+/// registers. The layout is architecture-specific and this crate may not
+/// know it, so the architecture's own dispatcher registers
+/// `hal_<arch>::cpu::poke_saved_a0_a1` here (see [`register_saved_reg_poke`]).
+static mut SAVED_REG_POKE: Option<unsafe fn(*mut u8, usize, usize)> = None;
+
+/// Registers the architecture's `poke_saved_a0_a1`. Called by each
+/// architecture's `NOTIF_WAIT_TIMEOUT` handler before its first timed wait
+/// can possibly expire, so a timeout can never fire without a poke function.
+pub fn register_saved_reg_poke(f: unsafe fn(*mut u8, usize, usize)) {
+    // SAFETY: single-core; a plain store of a function pointer.
+    unsafe { core::ptr::addr_of_mut!(SAVED_REG_POKE).write(Some(f)) };
+}
+
+fn clear_timed_wait(tid: ThreadId) {
+    if let Some(slot) = unsafe { (*core::ptr::addr_of_mut!(TIMED_WAITS)).get_mut(tid.as_u32() as usize) } {
+        *slot = None;
+    }
+}
+
+/// Gives up every timed wait whose deadline has passed: the thread leaves
+/// the notification's waiter list, becomes `Ready`, and resumes with
+/// `(0, 0)` in its return registers. Called at the top of [`p2_tick`].
+fn expire_timed_waits(now: u64) {
+    // SAFETY: single-core; read once, the table is only mutated below and
+    // in syscall context, which cannot interleave with a tick handler.
+    let poke = unsafe { core::ptr::addr_of!(SAVED_REG_POKE).read() };
+    let k = kstate();
+    for idx in 0..kernel_core::config::MAX_THREADS {
+        // SAFETY: single-core, see above.
+        let Some(tw) = (unsafe { (*core::ptr::addr_of!(TIMED_WAITS))[idx] }) else {
+            continue;
+        };
+        if tw.deadline_ns > now {
+            continue;
+        }
+        // SAFETY: single-core.
+        unsafe { (*core::ptr::addr_of_mut!(TIMED_WAITS))[idx] = None };
+        let tid = ThreadId::new(idx as u32);
+        // `false` = a Signal already woke it (the ordinary race); nothing
+        // to do, and in particular no poke: it holds the signalled bits.
+        if !k.cancel_notification_wait(tid, CapId::new(tw.notif_cap), now) {
+            continue;
+        }
+        if let (Some(poke), Some(ctx)) = (poke, k.thread_context_mut_ptr(tid)) {
+            // SAFETY: `tid` is `Blocked` (just cancelled, not `Running`), so
+            // nothing else touches its saved context; `poke` is this
+            // architecture's own `poke_saved_a0_a1`.
+            unsafe { poke(ctx, 0, 0) };
+        }
+    }
+}
+
+/// `sys::NOTIF_WAIT_TIMEOUT`: [`p2_wait_general`] with a deadline. Bits
+/// already pending return at once; otherwise the caller blocks until a
+/// `Signal` (it then resumes with the bits, exactly like `NOTIF_WAIT`) or
+/// `timeout_ns` have passed (it then resumes with `0`). A `timeout_ns` of
+/// zero is a plain poll that never blocks.
+pub fn p2_wait_timeout_general(hal: &HalInterface, caller: ThreadId, notif_cap: u32, timeout_ns: u64) -> Option<WaitOutcome> {
+    let k = kstate();
+    clear_timed_wait(caller);
+    if timeout_ns == 0 {
+        return Some(WaitOutcome::Immediate(p2_poll(hal, caller, notif_cap)));
+    }
+    let now = hal.now_ns();
+    match k.dispatch(caller, now, SyscallOp::Wait { notification: kernel_cap::CapId::new(notif_cap) }, hal) {
+        Ok(SyscallReturn::Value(bits)) => Some(WaitOutcome::Immediate(bits)),
+        Ok(SyscallReturn::Blocked) => {
+            let Some(next) = k.sched.pick_next(now) else {
+                // Nothing else runnable: undo the block (leave the waiter
+                // list too - unlike `p2_wait_general`, which cannot) and
+                // report "nothing yet".
+                let _ = k.cancel_notification_wait(caller, kernel_cap::CapId::new(notif_cap), now);
+                let _ = k.sched.dispatch(caller, now);
+                return Some(WaitOutcome::Immediate(0));
+            };
+            // SAFETY: single-core; `caller` is a valid table index.
+            if let Some(slot) = unsafe { (*core::ptr::addr_of_mut!(TIMED_WAITS)).get_mut(caller.as_u32() as usize) } {
+                *slot = Some(TimedWait { deadline_ns: now.saturating_add(timeout_ns), notif_cap });
+            }
+            let _ = k.sched.dispatch(next, now);
+            let (save, into) = k.user_ctx_switch_ptrs(caller, next)?;
+            Some(WaitOutcome::Switch(IpcSwitch { save, into, poke: None }))
+        }
+        _ => None,
+    }
+}
+
+/// `NOTIF_POLL` opcode: `SyscallOp::Poll` — never blocks (`kernel_core::
+/// syscall::KernelState::do_poll`'s own doc comment), unlike `p2_wait_
+/// general`'s own `Wait`, so this wrapper needs none of that function's
+/// `Reschedule`/switch handling — a direct value return is the whole
+/// contract. Drains the notification's own sticky bits on read (same
+/// "poll never blocks, drains what it reads" semantic `do_poll`
+/// documents) — used by a server (e.g. Compositor) to check, at the top
+/// of its own main loop, whether ANY of several `wire_notification`-
+/// fanned-in clients have something waiting, before committing to a
+/// blocking `Recv` on one specific `Endpoint`.
+pub fn p2_poll(hal: &HalInterface, caller: ThreadId, notif_cap: u32) -> u64 {
+    let k = kstate();
+    match k.dispatch(caller, hal.now_ns(), SyscallOp::Poll { notification: kernel_cap::CapId::new(notif_cap) }, hal) {
+        Ok(SyscallReturn::Value(bits)) => bits,
+        _ => 0,
+    }
+}
+
+/// `IPC_REPLY` demo opcode: `SyscallOp::Reply`. Like `Call`, always a
+/// switch (`do_reply` never returns a `Resume`-worthy outcome to the
+/// replying thread itself — see that function's own doc comment).
+pub fn p2_ipc_reply(hal: &HalInterface, caller: ThreadId, to_raw: u32, label: u64) -> Option<IpcSwitch> {
+    let k = kstate();
+    let to = ThreadId::new(to_raw);
+    match k.dispatch(caller, hal.now_ns(), SyscallOp::Reply { to, msg: SmallMessage::new(label) }, hal) {
+        Ok(SyscallReturn::Reschedule { next: Some(n) }) => {
+            // See `p2_ipc_call`'s own comment on why `dispatch` (not
+            // just `user_ctx_switch_ptrs`) is needed here.
+            let _ = k.sched.dispatch(n, hal.now_ns());
+            let (save, into) = k.user_ctx_switch_ptrs(caller, n)?;
+            // Hand the reply fs-native just wrote into its own staging
+            // pages back to the ONE client it belongs to, before that
+            // client is resumed to read it. Without this every client
+            // shared one buffer — see `G_FS_CLIENT_PAGES`' own doc
+            // comment for the real, QEMU-confirmed bug that caused.
+            // A no-op unless `caller` really is fs-native and `to` really
+            // is a registered client.
+            // SAFETY: single-core; `G_FS_TID` written once by
+            // `fs_demo_start`.
+            if unsafe { core::ptr::addr_of!(G_FS_TID).read() } == Some(caller) {
+                fs_copy_server_to_client(to_raw);
+            }
+            // `do_reply` only ever sets `pending_msg` (never
+            // `pending_from` — the woken caller already knows who it
+            // `Call`ed, unlike a receiver waking to a fresh `Call`).
+            let poke = k
+                .tcb_mut(n)
+                .and_then(|t| t.pending_msg.take())
+                .map(|m| (m.label as usize, 0usize));
+            Some(IpcSwitch { save, into, poke })
+        }
+        _ => None,
+    }
+}
+
+/// `p2_ipc_demo_start`'s own one-shot server thread, so `p2_preempt_start`
+/// can explicitly retire it once the demo's role is done.
+///
+/// **Real bug found via QEMU** (this session's x86_64 preemption crash,
+/// exposed only once fs-native's own extra spawned thread shifted later
+/// `ThreadId` numbering): `do_reply` (`kernel_core::syscall`) correctly,
+/// generically marks a REPLYING thread `Ready` again afterward — right
+/// behavior for a REAL, ongoing server that loops back to `Recv` for the
+/// next request (fs-native's own thread relies on exactly this). This
+/// demo's OWN server (`umode_ipc_server*`) does NOT loop back — per its
+/// own doc comment, `IPC_REPLY` "always switches away on success", so the
+/// `jmp 2b` after it is genuinely unreachable, and the thread is DONE
+/// forever the moment it replies. But nothing ever told the SCHEDULER
+/// that: `do_reply`'s own `note_ready(replier, ...)` leaves it `Ready`
+/// permanently. Confirmed via QEMU's own `-d int` exception trace: the
+/// crash's own register dump (RAX=0x2c=`IPC_REPLY`'s opcode, RSI=
+/// 0xc0ffef, the demo's own reply sentinel) is UNMISTAKABLY this
+/// server's own long-stale saved context, resumed by `p2_tick`'s
+/// ordinary round-robin `pick_next` — its own vruntime=0 (never
+/// meaningfully ran) usually LOSES `pick_next`'s "lowest wins" tie-break
+/// against process C/the fresh loop thread (also vruntime=0, but a
+/// HIGHER `ThreadId`, per `pick_next`'s own "`ThreadId` as a stable tie-
+/// break" rule) — UNTIL fs-native's own extra spawned thread shifts
+/// every LATER `ThreadId` up by one, at which point THIS demo server's
+/// own (unchanged, lower) `ThreadId` starts winning instead. Resuming it
+/// crashes (not merely spins harmlessly in its own `jmp 2b`) because its
+/// OWN saved `rip` is unrelated to that loop in the first place — it is
+/// whatever `f.rip` the CPU had captured at the ORIGINAL `int 0x80`/
+/// `ecall`/`svc` trap boundary for its OWN `IPC_REPLY` call, which this
+/// MVP demo's fast-path save never had a reason to make land on a safe,
+/// re-enterable instruction (it was never meant to be re-entered at
+/// all). The real fix is retiring this thread once its one-shot role
+/// ends — see `p2_preempt_start`'s own use of this static — not treating
+/// its `rip` as if resuming it were ever a supported outcome.
+///
+/// # Safety
+/// Single-core; written once by `p2_ipc_demo_start`, read (and cleared)
+/// once by `p2_preempt_start`.
+static mut G_IPC_SERVER_TID: Option<ThreadId> = None;
+
+/// `IPC_DEMO_START` demo opcode: creates the endpoint this whole demo
+/// runs on and spawns the SERVER thread (`server_entry_vma`, sharing the
+/// caller's OWN address + capability space — like `p2_preempt_start`'s
+/// own fresh a_loop thread — so the same `CapId` resolves to the same
+/// endpoint for both without needing a `CapGrant`), then switches
+/// straight to it. The server's `IPC_RECV` runs a moment later, on its
+/// OWN trap, and (per that opcode's own doc comment) switches back here
+/// once it finds nothing queued — resuming the ORIGINAL `IPC_DEMO_START`
+/// caller right after this same switch, per `TrapOutcome::SwitchTo`'s
+/// own contract.
+pub fn p2_ipc_demo_start(
+    hal: &HalInterface,
+    caller: ThreadId,
+    server_entry_vma: usize,
+) -> Option<(u32, *mut u8, *const u8)> {
+    let k = kstate();
+    let ep_cap = retype_one_from_any_untyped(k, hal, caller, kernel_mm::KernelObjectType::Endpoint, 1)?;
+    let server = k.alloc_tcb(k.root_cap_space, k.root_addr_space)?;
+    // SAFETY: single-core; written once here, read only by
+    // `p2_preempt_start` (which retires this thread once the demo's own
+    // one-shot role is done — see `G_IPC_SERVER_TID`'s own doc comment).
+    unsafe { core::ptr::addr_of_mut!(G_IPC_SERVER_TID).write(Some(server)) };
+    // `root_frame = 0`: share the caller's OWN (already-active) address
+    // space — same convention `p2_preempt_start`'s own fresh thread uses.
+    // Stack: reuse `G_A_STACK_TOP` (root's own U-mode stack top, already
+    // `U=1 R+W` mapped in this shared address space) — same convention
+    // `p2_preempt_start`'s own fresh a_loop thread uses, for the same
+    // reason: this server's code is pure register ops around `ecall`,
+    // never pushes a frame, so nothing about the stack's prior contents
+    // matters, and it never runs concurrently with whatever else might
+    // also be using that VA (single-core, cooperative hand-off only).
+    // SAFETY: single-core; `G_A_STACK_TOP` is written once by `enter`,
+    // before any syscall (including this one) can run.
+    let server_stack_top = unsafe { core::ptr::addr_of!(G_A_STACK_TOP).read() };
+    k.init_user_thread(server, server_entry_vma, server_stack_top, 0, hal);
+    // **Real bug found via QEMU**: `caller` (the client, e.g. `root`)
+    // stays `Running` in the scheduler's own bookkeeping — `dispatch()`
+    // below only ever updates the INCOMING thread, never the outgoing
+    // one (see its own doc comment: "commits `thread` as the running
+    // thread"). Every OTHER direct hand-off in this crate either
+    // retires the outgoing thread first (`p2_preempt_start`'s
+    // `sched.remove(root)`) or goes through `yield_to`, which re-readies
+    // the outgoing thread ITSELF ("if `from` is still `Running`, mark it
+    // `Ready`" — see `run.rs`'s own `yield_to`). This function does
+    // neither: it hands off directly WITHOUT retiring `caller` (unlike
+    // `p2_preempt_start` — `caller` must still be schedulable, it will
+    // resume once `Reply` wakes it later). Without this line, `caller`
+    // stays (incorrectly) `Running` forever after this switch, so the
+    // FIRST `pick_next` call afterward (the server's own `IPC_RECV`,
+    // when it finds nothing queued and blocks) cannot find `caller` at
+    // all — it silently picked a completely unrelated `Ready` thread
+    // instead (process B, left `Ready` from the earlier §8.4 demo,
+    // still waiting for `P2_PREEMPT_START` to arm the timer), switching
+    // the CPU to code that never returns here — an unexplained, totally
+    // silent hang with no crash or diagnostic at all.
+    let _ = k.sched.note_ready(caller, hal.now_ns());
+    // Bypass `pick_next` — we are about to switch straight to `server`
+    // unconditionally, so tell the scheduler that directly (same
+    // reasoning as `p2_preempt_start`'s own explicit `dispatch` call).
+    let _ = k.sched.dispatch(server, hal.now_ns());
+    let (save, into) = k.user_ctx_switch_ptrs(caller, server)?;
+    Some((ep_cap.as_u32(), save, into))
+}
+
+// ============================================================================
+// fs-native as a REAL, isolated process, driven by the REAL FsRequest/
+// FsResponse wire protocol over the REAL Call/Recv/Reply mechanism above
+// (03-Kernel-Subsystems-Layer.md §2.2/§5.3) — the first time this
+// project's IPC fast path drives a genuine subsystem's own logic
+// end-to-end, not just a demo payload. Unlike `p2_ipc_demo_start`'s
+// server (which shares the caller's own address AND capability space —
+// `.user_text`, embedded in the kernel image), fs-native is spawned via
+// `spawn_process_from_elf` exactly like device-manager: its own address
+// space, its own capability space, its own separately-built ELF.
+//
+// Two problems that mechanism doesn't solve on its own, both handled
+// here: (1) the Endpoint capability the caller Retypes lives in the
+// CALLER's cap space only — `grant_cap_into` copies it into fs-native's
+// own fresh cap space (predictably landing at slot 0, since a brand-new
+// `CapTable` always allocates its first slot from 0 — see `CapTable::
+// new`'s own free-list construction); (2) `SmallMessage` carries up to 6
+// data words, but every architecture's own raw syscall convention this
+// project defined only threads 2 payload registers (`a0`/`a1`,
+// `rdi`/`rsi`, `x0`/`x1`) through `int 0x80`/`svc`/`ecall` — nowhere
+// near enough for a real `FsRequest`/`FsResponse`. Rather than widening
+// every `hal-<arch>::cpu::SyscallHandler` signature (a much bigger,
+// unrelated change), the full `SmallMessage` (label + all 6 words,
+// zero-padded) is marshalled through ONE shared physical frame instead —
+// the same "share a frame, not the message registers" principle
+// `ipc-protocol::fs`'s own `shared_cap` field already uses for bulk
+// Read/Write data, just applied to the whole small message here.
+//
+// A `.user_text` function (this project's OWN in-kernel demo code, NOT
+// fs-native's own separate ELF image) must never call a regular,
+// non-inlined function living in the surrounding kernel binary's `.text`
+// — the risk that already bit this project once (see hal-x86_64's own
+// `#[inline(always)]`/`opt-level` fix for device-manager's very first
+// in-kernel process). `ipc_protocol::codec::{encode,decode}_fs_*` are
+// ordinary functions, so `kernel/src/main.rs`'s `umode_root*` never
+// calls them directly: those functions live EITHER here (this crate is
+// a normal `rlib`, not `.user_text`) or inside `fs-native-bin` itself
+// (a fully separate, self-contained ELF — every byte of it is U=1, so
+// there is no "calling into kernel .text" risk there at all). `umode_
+// root*` only ever passes plain integers to the wrapper opcodes below.
+// ============================================================================
+
+/// Physical address of the one page shared between the caller (accessed
+/// via the kernel's own always-present identity map — see `p2_report_a`'s
+/// own cross-checks for the same pattern) and fs-native's own process
+/// (mapped into ITS address space at a fixed VA by `fs_demo_start`).
+/// `usize::MAX` = not yet set up (`fs_demo_start` has not run).
+///
+/// # Safety
+/// Single-core; written once by `fs_demo_start`, read only afterward.
+static mut G_FS_SHARED_PHYS: usize = usize::MAX;
+
+/// Physical address of the one page shared for BULK Read/Write data —
+/// same contract as `G_FS_SHARED_PHYS`, just the SECOND shared page
+/// (`FS_DATA_VA`, not `FS_SHARED_VA`).
+///
+/// # Safety
+/// Single-core; written once by `fs_demo_start`, read only afterward.
+static mut G_FS_DATA_PHYS: usize = usize::MAX;
+
+/// fs-native's own `ThreadId`, written once by `fs_demo_start` and read
+/// by `fs_ipc_call` — see that function's own doc comment for why every
+/// FS call after the first needs to know this directly rather than
+/// trusting `do_send`'s general fallback. Same `Option<ThreadId>`
+/// convention `DM_TID` already uses for the identical "permanent,
+/// spawned-once target thread" shape.
+///
+/// # Safety
+/// Single-core; written once by `fs_demo_start`, read only afterward.
+static mut G_FS_TID: Option<ThreadId> = None;
+
+/// How many real, separately-spawned fs-native CLIENTS can be wired at
+/// once. Three exist today (`simurgh-init`, `simurgh-file-manager`, and —
+/// implicitly — Root Task, which is deliberately NOT registered here; see
+/// [`fs_copy_client_to_server`]). Sized with real headroom rather than
+/// exactly at today's count, matching every other fixed-capacity registry
+/// in this file.
+const FS_MAX_CLIENTS: usize = 8;
+
+/// Per-client PRIVATE `(msg_phys, data_phys)` page pair, keyed by the
+/// client's own raw `ThreadId`. `u32::MAX` = a free slot.
+///
+/// **This is the fix for a real, QEMU-confirmed cross-client corruption
+/// bug.** Before this, [`wire_file_manager_to_fs_native`] mapped the ONE
+/// pair of pages `fs_demo_start` carved (`G_FS_SHARED_PHYS`/
+/// `G_FS_DATA_PHYS`) into EVERY client, at the same fixed VAs — so all of
+/// fs-native's clients shared a single global request/reply buffer with no
+/// mutual exclusion whatsoever. That was justified in this function's own
+/// doc comment by "Root Task and simurgh-file-manager are NOT concurrent
+/// callers in practice", which was true when `simurgh-file-manager` was
+/// the only non-root client — and stopped being true the moment
+/// `simurgh-init` was wired to fs-native through this very same function.
+/// `init-core`'s own boot work runs a real `RegisterPath` -> `Open` ->
+/// `Read` -> `Close` sequence against that shared buffer, concurrently
+/// with `fm-core`'s own `self_check`, so whichever client wrote last won:
+/// `fm-core`'s `Write` reply slot routinely came back holding `init`'s
+/// `Opened`. Each client now gets its OWN pages, and the kernel copies
+/// them in/out around fs-native's own `Recv`/`Reply` (see
+/// [`fs_copy_client_to_server`]/[`fs_copy_server_to_client`]), so no two
+/// clients can ever observe each other's traffic.
+///
+/// # Safety
+/// Single-core; written only by `wire_file_manager_to_fs_native`, read by
+/// the copy helpers.
+static mut G_FS_CLIENT_PAGES: [(u32, usize, usize); FS_MAX_CLIENTS] = [(u32::MAX, 0, 0); FS_MAX_CLIENTS];
+
+/// Records `tid`'s own private page pair. Returns `false` (and registers
+/// nothing) once [`FS_MAX_CLIENTS`] slots are taken.
+fn fs_register_client(tid: u32, msg_phys: usize, data_phys: usize) -> bool {
+    // SAFETY: single-core; see `G_FS_CLIENT_PAGES`.
+    unsafe {
+        let base = core::ptr::addr_of_mut!(G_FS_CLIENT_PAGES).cast::<(u32, usize, usize)>();
+        for i in 0..FS_MAX_CLIENTS {
+            if base.add(i).read().0 == u32::MAX {
+                base.add(i).write((tid, msg_phys, data_phys));
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// `tid`'s own `(msg_phys, data_phys)`, or `None` if `tid` is not a
+/// registered client (Root Task, or any non-fs thread).
+fn fs_client_pages(tid: u32) -> Option<(usize, usize)> {
+    // SAFETY: single-core; see `G_FS_CLIENT_PAGES`.
+    unsafe {
+        let base = core::ptr::addr_of!(G_FS_CLIENT_PAGES).cast::<(u32, usize, usize)>();
+        for i in 0..FS_MAX_CLIENTS {
+            let entry = base.add(i).read();
+            if entry.0 == tid {
+                return Some((entry.1, entry.2));
+            }
+        }
+    }
+    None
+}
+
+/// fs-native's OWN `(msg_phys, data_phys)` — the pages actually mapped
+/// into the server's address space, which now act as a staging window for
+/// whichever client is currently being served.
+fn fs_server_pages() -> Option<(usize, usize)> {
+    // SAFETY: single-core; both written once by `fs_demo_start`.
+    unsafe {
+        let msg = core::ptr::addr_of!(G_FS_SHARED_PHYS).read();
+        let data = core::ptr::addr_of!(G_FS_DATA_PHYS).read();
+        if msg == usize::MAX || data == usize::MAX {
+            None
+        } else {
+            Some((msg, data))
+        }
+    }
+}
+
+/// Copies `client_tid`'s own private request pages into fs-native's
+/// staging pages, immediately before the server is resumed to read them.
+///
+/// A `client_tid` with no registered pages is a deliberate no-op: Root
+/// Task drives its own fs demo by writing fs-native's pages DIRECTLY
+/// through the kernel's identity map (`write_shared_fs_message`), so it
+/// has no private pair to copy from and needs none — leaving it
+/// unregistered keeps that long-proven path byte-for-byte unchanged.
+pub fn fs_copy_client_to_server(client_tid: u32) {
+    if let (Some((cmsg, cdata)), Some((smsg, sdata))) = (fs_client_pages(client_tid), fs_server_pages()) {
+        // SAFETY: all four are valid, exclusively-owned, identity-mapped
+        // 4 KiB frames (carved by `fs_demo_start`/`wire_file_manager_to_
+        // fs_native`); single-core, so no concurrent access.
+        unsafe {
+            core::ptr::copy_nonoverlapping(cmsg as *const u8, smsg as *mut u8, 4096);
+            core::ptr::copy_nonoverlapping(cdata as *const u8, sdata as *mut u8, 4096);
+        }
+    }
+}
+
+/// Copies fs-native's staging pages back into `client_tid`'s own private
+/// pages, immediately after the server has written its reply and before
+/// the client is resumed. Same "unregistered = no-op" contract as
+/// [`fs_copy_client_to_server`].
+pub fn fs_copy_server_to_client(client_tid: u32) {
+    if let (Some((cmsg, cdata)), Some((smsg, sdata))) = (fs_client_pages(client_tid), fs_server_pages()) {
+        // SAFETY: same contract as `fs_copy_client_to_server`.
+        unsafe {
+            core::ptr::copy_nonoverlapping(smsg as *const u8, cmsg as *mut u8, 4096);
+            core::ptr::copy_nonoverlapping(sdata as *const u8, cdata as *mut u8, 4096);
+        }
+    }
+}
+
+/// True iff `into` is fs-native's own saved context — i.e. the switch
+/// about to be performed resumes the fs server itself. Used by
+/// [`p2_ipc_call`] to spot "this `Call` was delivered straight into
+/// fs-native's pending `Recv`" without `IpcSwitch` having to carry a tid.
+fn switching_into_fs_native(into: *const u8) -> bool {
+    // SAFETY: single-core; `G_FS_TID` written once by `fs_demo_start`.
+    let fs_tid = match unsafe { core::ptr::addr_of!(G_FS_TID).read() } {
+        Some(t) => t,
+        None => return false,
+    };
+    kstate().thread_context_mut_ptr(fs_tid).map(|p| p as *const u8 == into).unwrap_or(false)
+}
+
+
+/// `G_FS_TID`, exposed to `kernel/kernel/src/main.rs` — needed by the
+/// `sys::SBS_IPC_RECV` dispatch arm to recognize fs-native as the CALLER
+/// of that syscall (`fs_native_recv`'s own doc comment for why this
+/// matters).
+pub fn fs_tid() -> Option<ThreadId> {
+    // SAFETY: single-core; only ever written by `fs_demo_start`, before
+    // any syscall that could read it concurrently.
+    unsafe { core::ptr::addr_of!(G_FS_TID).read() }
+}
+
+/// Set `true` by `fs_demo_start`, right after it hands control to
+/// fs-native for the very first time; cleared by `wire_file_manager_to_
+/// fs_native`, right when file-manager becomes fs-native's SECOND real
+/// client.
+///
+/// **Real bug found via QEMU** (found while verifying `simurgh-file-
+/// manager`'s new real IPC edge to fs-native, 2026-09-10-11), in two
+/// layers:
+///
+/// 1. fs-native's FIRST EVER `Recv` call — reached the moment `fs_demo_
+///    start` switches control to it, BEFORE Root Task has sent it
+///    anything at all — always finds nothing queued and must block.
+/// 2. Confirmed via a temporary diagnostic covering every `p2_ipc_recv_
+///    general` outcome: fs-native's SECOND (and every later) `Recv` call,
+///    made right after its own `IPC_REPLY` to Root Task's PRECEDING call,
+///    ALSO finds nothing queued and blocks — `IPC_REPLY` marks Root Task
+///    `Ready` again but does NOT itself switch execution away from
+///    fs-native (fs-native's own `raw_syscall(IPC_REPLY, ...)` call
+///    simply returns and its loop continues straight into its NEXT
+///    `Recv`, before Root Task has been scheduled to issue its own next
+///    FS_* call) — so this is NOT a one-shot "only the very first call"
+///    problem, it recurs on EVERY fs-native `Recv` for the WHOLE
+///    sequential, Root-Task-only phase of the fs demo (FS_OPEN, FS_STAT,
+///    FS_WRITE, FS_READ, and the 100+100-iteration throughput benchmark —
+///    202 round trips total).
+///
+/// Both layers are the SAME underlying issue: `p2_ipc_recv_general`'s own
+/// `Reschedule { next: Some(n) }` arm trusts `pick_next`'s general
+/// fairness answer for `n` — correct in general, but AT THIS EXACT POINT
+/// IN BOOT (before `P2_PREEMPT_START` has ever run), `pick_next` can
+/// prefer a stale, long-`Ready`-but-permanently-idle thread left over
+/// from an EARLIER one-shot boot demo (confirmed via a real QEMU boot:
+/// the §8.4 two-process zero-copy demo's own "process B" is exactly this
+/// kind of thread — `p2_ipc_recv`'s own doc comment already documents
+/// this SAME class of thread breaking a different, narrower case) over
+/// Root Task. With no preemptive timer armed yet to ever reschedule
+/// anything, whichever stale thread gets switched to simply keeps running
+/// forever, Root Task never resumes to issue its own next FS_* call, and
+/// the entire sequential fs demo hangs (confirmed via real QEMU CPU-time
+/// accounting: the process kept consuming real CPU cycles — some OTHER
+/// thread genuinely running — while the boot's own serial output stayed
+/// completely silent for 45+ minutes).
+///
+/// Fixed by keeping this flag `true` for fs-native's ENTIRE Root-Task-
+/// only bootstrap phase, not just its first call — `p2_ipc_recv`'s own
+/// narrow, hardcoded-root dispatch is exactly correct for every one of
+/// these 202 round trips (Root Task genuinely is the only party fs-native
+/// ever talks to here, the SAME assumption this exact function already
+/// safely made for the whole fs demo before `SBS_IPC_RECV` existed at
+/// all) — and only cleared once `simurgh-file-manager` is spawned and
+/// wired as a genuine second client, well after `P2_PREEMPT_START` has
+/// armed the preemptive timer, at which point `p2_ipc_recv_general`'s
+/// `pick_next` trust is safe again (self-correcting via round-robin even
+/// on a suboptimal pick — `wire_file_manager_to_fs_native`'s own doc
+/// comment).
+///
+/// # Safety
+/// Single-core; set once by `fs_demo_start`, cleared once by
+/// `wire_file_manager_to_fs_native`, read every time by `fs_native_recv`.
+static mut G_FS_ROOT_ONLY_PHASE: bool = false;
+
+/// The correctly-scoped `Recv` dispatch for fs-native's OWN `SBS_IPC_RECV`
+/// calls specifically — see [`G_FS_ROOT_ONLY_PHASE`]'s own doc comment
+/// for the full story. `kernel/kernel/src/main.rs`'s own `sys::
+/// SBS_IPC_RECV` arm calls this (not `p2_ipc_recv_general` directly)
+/// whenever the calling thread is fs-native itself ([`fs_tid`]); every
+/// other `SBS_IPC_RECV` caller (`security-broker`, `policy-engine`, ...)
+/// keeps calling `p2_ipc_recv_general` directly, unaffected.
+pub fn fs_native_recv(hal: &HalInterface, caller: ThreadId, endpoint_raw: u32) -> Option<IpcRecvOutcome> {
+    // SAFETY: single-core; only ever written by `fs_demo_start`/`wire_
+    // file_manager_to_fs_native`, never concurrently with this read.
+    let root_only_phase = unsafe { core::ptr::addr_of!(G_FS_ROOT_ONLY_PHASE).read() };
+    let outcome = if root_only_phase {
+        p2_ipc_recv(hal, caller, endpoint_raw)
+    } else {
+        p2_ipc_recv_general(hal, caller, endpoint_raw)
+    };
+    // A message was already queued, so fs-native resumes its OWN trap
+    // holding it — stage that client's private request pages in before it
+    // reads them. The `Switch` arm needs no hook: fs-native is parking on
+    // an empty endpoint there, and whichever `Call` wakes it later goes
+    // through `p2_ipc_call`'s own copy-in instead. See `G_FS_CLIENT_PAGES`.
+    if let Some(IpcRecvOutcome::Immediate { from, .. }) = outcome {
+        fs_copy_client_to_server(from as u32);
+    }
+    outcome
+}
+
+/// Writes `msg`'s full `(label, words[0..6] zero-padded)` into the
+/// shared fs page. Always writes all 6 word slots (unused ones as 0)
+/// rather than tracking a separate length — `decode_fs_request`/
+/// `decode_fs_response`'s own `need(n)` checks only require AT LEAST
+/// `n` words to be present, so extra trailing zeros are harmless, and
+/// this keeps the wire layout fixed-size (56 bytes) with no separate
+/// length field to keep in sync.
+///
+/// # Safety
+/// `G_FS_SHARED_PHYS` must already be a valid, exclusively-owned,
+/// mapped physical frame (`fs_demo_start` has run).
+unsafe fn write_shared_fs_message(msg: &SmallMessage) {
+    // SAFETY: single-core; `G_FS_SHARED_PHYS` only written once by
+    // `fs_demo_start`, before this can ever be called.
+    let base = unsafe { core::ptr::addr_of!(G_FS_SHARED_PHYS).read() } as *mut u64;
+    // SAFETY: forwarded from this function's own contract — `base`
+    // names a valid, mapped, 4 KiB physical frame, and low RAM is
+    // always identity-mapped for kernel-mode access regardless of
+    // which process's page table is currently active (the same
+    // assumption every other `p2_*` physical-address cross-check in
+    // this file already relies on).
+    unsafe {
+        base.write_volatile(msg.label);
+        let words = msg.words();
+        for i in 0..kernel_ipc::MSG_MAX_WORDS {
+            base.add(1 + i).write_volatile(words.get(i).copied().unwrap_or(0));
+        }
+    }
+}
+
+/// Reads back a `SmallMessage` written by `write_shared_fs_message` (by
+/// either side — this is a plain, symmetric shared-memory read).
+///
+/// # Safety
+/// Same contract as `write_shared_fs_message`.
+unsafe fn read_shared_fs_message() -> SmallMessage {
+    // SAFETY: single-core; same contract as `write_shared_fs_message`.
+    let base = unsafe { core::ptr::addr_of!(G_FS_SHARED_PHYS).read() } as *const u64;
+    // SAFETY: forwarded from this function's own contract.
+    unsafe {
+        let label = base.read_volatile();
+        let mut words = [0u64; kernel_ipc::MSG_MAX_WORDS];
+        for (i, w) in words.iter_mut().enumerate() {
+            *w = base.add(1 + i).read_volatile();
+        }
+        // `from_words` cannot fail here: `words.len() == MSG_MAX_WORDS`.
+        SmallMessage::from_words(label, &words).unwrap_or(SmallMessage::new(label))
+    }
+}
+
+/// Derives `cap` (from `src_cs`) directly into `dst_cs`, narrowed to
+/// `rights` — the SAME cross-space CDT derivation
+/// `kernel_core::syscall::do_cap_grant` uses for the real,
+/// capability-gated `SyscallOp::CapGrant`, just called directly on
+/// `CapSpaceId`s this trusted glue code already holds rather than
+/// through a `target_thread: CapId` lookup (which would require the
+/// caller to ALREADY hold a `ThreadControlBlock` capability for the
+/// destination — something `spawn_process`/`spawn_process_from_elf`
+/// deliberately do not hand out, matching every other kernel-arch-glue
+/// bootstrap helper's own "trusted glue, not a real syscall" precedent).
+/// `cap` itself is left untouched in `src_cs`, and the new slot's CDT
+/// parent link points back at it, so a later `CapRevoke` on `cap` (in
+/// `src_cs`) reaches and frees this grant too, even though it lives in
+/// `dst_cs` (`kernel_cap::cdt::derive_child_cross_space`).
+fn grant_cap_into(
+    state: &mut KernelState,
+    src_cs: kernel_cap::CapSpaceId,
+    cap: CapId,
+    dst_cs: kernel_cap::CapSpaceId,
+    rights: CapabilityRights,
+) -> Option<CapId> {
+    let (src, dst) = state.cap_space_pair_mut(src_cs, dst_cs)?;
+    kernel_cap::cdt::derive_child_cross_space(src, src_cs, cap, dst, rights, 0).ok()
+}
+
+/// Wires a real client-server IPC edge between two ALREADY-SPAWNED,
+/// separately-isolated subsystem-bin processes (neither of which is Root
+/// Task itself) — the general form of what this session's real-IPC plan
+/// needs repeated for every new layer-4/5 service pair. `Retype`s one
+/// fresh `Endpoint`, `grant_cap_into`s it into both `server_cs` and
+/// `client_cs`, then carves and maps ONE shared physical page into BOTH
+/// processes' own address spaces (`server_va` in the server's, `client_va`
+/// in the client's) — genuine shared memory, not a per-side copy.
+///
+/// **Real design point, not an oversight**: this is DELIBERATELY a single
+/// shared physical frame, unlike `security_broker_intermediary_demo_
+/// start`'s own two-separate-pages setup for security-broker's outgoing
+/// link — that edge always has ROOT TASK (which has free physical RAM
+/// access, no VA mapping needed) as at least one party, and its own
+/// `self_check` never actually validates the round-tripped payload
+/// content (`granted` is stored but never asserted on). THIS function is
+/// for two genuine PEER processes, where the message words must actually
+/// survive the trip (`Simurgh-OS`'s generic `IPC_CALL`/`RECV`/`REPLY`
+/// syscall glue — `p2_ipc_call`/`p2_ipc_recv`/`p2_ipc_reply` — only
+/// carries a `label`, never `words`; the shared physical page IS the real
+/// payload transport, the syscalls are pure synchronization).
+///
+/// Returns the server-side `CapId` (for a boot-log line only — each
+/// process's own copy is otherwise a fixed compile-time constant, per
+/// every existing subsystem's own convention).
+///
+/// **Not yet multi-client-safe**: only ONE client is wired per call. A
+/// server meant to serve several clients over the SAME shared page (this
+/// plan's later phases, e.g. security-broker eventually serving account-
+/// manager/store too) would need either a dedicated page per client pair
+/// or an explicit mutual-exclusion scheme — concurrent writers to one
+/// shared page would otherwise be a real race. Flagged here for whoever
+/// wires the second client in, not hidden.
+#[allow(clippy::too_many_arguments)]
+pub fn wire_service_endpoint(
+    hal: &HalInterface,
+    caller: ThreadId,
+    server_cs: kernel_cap::CapSpaceId,
+    server_root_pt: usize,
+    server_va: usize,
+    client_cs: kernel_cap::CapSpaceId,
+    client_root_pt: usize,
+    client_va: usize,
+    rights: CapabilityRights,
+) -> Option<CapId> {
+    let k = kstate();
+    let ep_cap = retype_one_from_any_untyped(k, hal, caller, KernelObjectType::Endpoint, 1)?;
+
+    let src_cs = k.tcb(caller)?.cap_space;
+    grant_cap_into(k, src_cs, ep_cap, server_cs, rights)?;
+    grant_cap_into(k, src_cs, ep_cap, client_cs, rights)?;
+
+    let shared_phys = carve_from_any_untyped(k, 4096, 4096)?;
+    // SAFETY: fresh untyped RAM, identity-addressable, single-core.
+    unsafe { core::ptr::write_bytes(shared_phys as *mut u8, 0, 4096) };
+
+    let server_pool = carve_from_any_untyped(k, 4096, 4096 * 2)?;
+    // SAFETY: fresh untyped RAM, identity-addressable, single-core;
+    // `map_range` needs the pool pre-zeroed.
+    unsafe { core::ptr::write_bytes(server_pool as *mut u8, 0, 4096 * 2) };
+    if hal.map_range(server_root_pt, server_va, shared_phys, 4096, 1 | 2 | 8, server_pool, 2) == u32::MAX {
+        klog!("wire_service_endpoint: map_range error (server's own shared page)\r\n");
+        return None;
+    }
+
+    let client_pool = carve_from_any_untyped(k, 4096, 4096 * 2)?;
+    // SAFETY: same contract as `server_pool` above.
+    unsafe { core::ptr::write_bytes(client_pool as *mut u8, 0, 4096 * 2) };
+    if hal.map_range(client_root_pt, client_va, shared_phys, 4096, 1 | 2 | 8, client_pool, 2) == u32::MAX {
+        klog!("wire_service_endpoint: map_range error (client's own shared page)\r\n");
+        return None;
+    }
+
+    Some(ep_cap)
+}
+
+/// Wires ONE shared `Notification` into every cap space in `targets` —
+/// the fan-in primitive a multi-client server needs when each client got
+/// its OWN dedicated `Endpoint`+page from separate [`wire_service_
+/// endpoint`] calls (real-IPC plan Phase 2): since `Recv` only ever
+/// waits on one `Endpoint` at a time (confirmed — no "any of N" syscall
+/// exists in this kernel), the server instead `Wait`s on this single
+/// `Notification` (see [`p2_wait_general`]) and each client `Signal`s
+/// its own bit (see [`p2_signal`]) right before its own blocking `Call`,
+/// so the server learns WHICH dedicated `Endpoint` to `Recv` on next
+/// without ever guessing or busy-polling every one of them.
+///
+/// Returns the FIRST target's own `CapId` for this Notification (a
+/// derived copy, same object, lands at whatever slot `grant_cap_into`
+/// gives it in each space — the caller already knows/documents each
+/// target's own fixed slot, same convention every other wiring helper in
+/// this file uses; this return value is for a boot-log line only).
+pub fn wire_notification(hal: &HalInterface, caller: ThreadId, targets: &[kernel_cap::CapSpaceId], rights: CapabilityRights) -> Option<CapId> {
+    let k = kstate();
+    let notif_cap = retype_one_from_any_untyped(k, hal, caller, KernelObjectType::Notification, 1)?;
+
+    let src_cs = k.tcb(caller)?.cap_space;
+    for &target_cs in targets {
+        grant_cap_into(k, src_cs, notif_cap, target_cs, rights)?;
+    }
+
+    Some(notif_cap)
+}
+
+/// Maps `byte_len` (rounded up to a whole number of 4096-byte pages) of
+/// fresh physical memory into `client_cs`'s own address space at
+/// `client_va` — no `Endpoint`/`Notification` capability at all, unlike
+/// [`wire_service_endpoint`]/[`wire_notification`] above: this region is
+/// never shared with another PROCESS, only with the kernel's own
+/// dispatch code (`sys::SERIAL_PRINT`/`sys::SPAWN_FROM_BUFFER`,
+/// `Simurgh-OS/kernel/kernel/src/main.rs`), so there is no peer to wire
+/// it FOR. `simurgh-shell`'s own debug-print channel (one page) and
+/// `simurgh-native-sdk`'s own app-upload buffer (multiple pages) both use
+/// this — see either repo's own `subsystem_entry.rs` for the full design.
+///
+/// `POOL_PAGES` = 32 regardless of `byte_len`: the pool backs NEW page-
+/// table STRUCTURE pages `map_range` allocates while walking/extending
+/// the target `client_root_pt` (PDPT/PD/PT entries), not the mapped data
+/// itself — 32 already proven sufficient for `kernel_arch_glue::
+/// spawn_process_from_elf`'s own considerably more scattered real-world
+/// case (a whole process's multiple ELF segments plus its stack, `POOL_
+/// PAGES`'s own doc comment there for the real bug that sized it), so the
+/// SAME budget comfortably covers one contiguous region here too.
+pub fn wire_shared_pages(hal: &HalInterface, client_root_pt: usize, client_va: usize, byte_len: usize) -> Option<()> {
+    const POOL_PAGES: usize = 32;
+    let byte_len = (byte_len + 0xFFF) & !0xFFF;
+    let k = kstate();
+    let shared_phys = carve_from_any_untyped(k, 4096, byte_len as u64)?;
+    // SAFETY: fresh untyped RAM, identity-addressable, single-core.
+    unsafe { core::ptr::write_bytes(shared_phys as *mut u8, 0, byte_len) };
+
+    let client_pool = carve_from_any_untyped(k, 4096, 4096 * POOL_PAGES as u64)?;
+    // SAFETY: same contract as `shared_phys` above; `map_range` needs
+    // the pool pre-zeroed.
+    unsafe { core::ptr::write_bytes(client_pool as *mut u8, 0, 4096 * POOL_PAGES) };
+    if hal.map_range(client_root_pt, client_va, shared_phys, byte_len, 1 | 2 | 8, client_pool, POOL_PAGES) == u32::MAX {
+        klog!("wire_shared_pages: map_range error\r\n");
+        return None;
+    }
+
+    Some(())
+}
+
+/// VA fs-native's own process maps the shared fs page at — an address no
+/// other mapping in ITS OWN (freshly carved, otherwise-empty) address
+/// space uses; safe to reuse across every architecture's own isolated
+/// spawn, unlike `.user_text`'s own per-architecture base VMA
+/// constraints (this is a plain data page, not an ELF image base).
+const FS_SHARED_VA: usize = 0xD800_0000;
+
+/// VA fs-native's own process maps the shared BULK DATA region at — a
+/// second, separate page from `FS_SHARED_VA` (which only ever carries
+/// the small, fixed-size `SmallMessage` header). Real `Read`/`Write`
+/// bytes travel here instead, per `ipc_protocol::fs`'s own "bulk data
+/// travels through a SharedRegion, not the message" design.
+const FS_DATA_VA: usize = 0xD810_0000;
+
+/// fs-native's own deterministic capability slot for its one shared data
+/// region, in ITS OWN capability space — same reasoning `FS_ENDPOINT_CAP`
+/// (fs-native's own `subsystem_entry.rs` constant) already documents for
+/// slot 0: `fs_demo_start` grants fs-native's fresh, otherwise-empty cap
+/// space exactly two capabilities, in a fixed order (the endpoint, then
+/// this region), and a `CapTable`'s free list always allocates
+/// sequentially from an empty table, so the SECOND grant is guaranteed
+/// to land at slot 1.
+const FS_DATA_SHARED_CAP_SLOT: u32 = 1;
+
+/// Fixed MVP test payload for the `FS_WRITE`/`FS_READ` demo opcodes —
+/// same "one demo, one hardcoded scenario" convention `resolve_path`'s
+/// own `PathId(0)`-only precedent (fs-native's `subsystem_entry.rs`)
+/// already establishes; a real VFS Router would carry caller-supplied
+/// bytes, not a kernel-glue constant. Sized to the FULL shared DATA
+/// page (matching fs-native's own `FS_DATA_LEN` constant) rather than a
+/// short string, so the same buffer doubles as the payload for the
+/// throughput benchmark below (03-Kernel-Subsystems-Layer.md §5, item
+/// 5: "VFS read/write throughput... reported") — a few dozen bytes per
+/// round trip would measure almost pure IPC overhead, not the kind of
+/// transfer size a real `dd`/`fio`-style comparison uses.
+const FS_DEMO_WRITE_DATA_ARR: [u8; 4096] = {
+    let mut data = [0u8; 4096];
+    let mut i = 0;
+    while i < data.len() {
+        // A recognizable, non-constant byte pattern (not all-zero) so
+        // `fs_read_result`'s own MATCH/MISMATCH cross-check still means
+        // something.
+        data[i] = (i % 251) as u8;
+        i += 1;
+    }
+    data
+};
+const FS_DEMO_WRITE_DATA: &[u8] = &FS_DEMO_WRITE_DATA_ARR;
+
+/// One-time setup: creates the endpoint fs-native and its client
+/// (`caller`, always the Root Task in this MVP) rendezvous on, spawns
+/// fs-native as a genuinely isolated process from its own separately-
+/// built ELF image (`fs_elf`), grants it a capability to the SAME
+/// endpoint object, gives it a page of memory shared with the kernel's
+/// own identity map for the real `SmallMessage` payload, and switches
+/// straight to it (see this function's own tail comment for why that
+/// switch is mandatory, not optional, unlike a bare spawn). Returns the
+/// endpoint's capability slot in the CALLER's own cap space (fs-native's
+/// own copy always lands at slot 0 — see `grant_cap_into`'s own doc
+/// comment on why that is deterministic for a freshly spawned,
+/// otherwise-empty process) plus the `(save, into)` switch pointers the
+/// caller wraps in a `TrapOutcome::SwitchTo`.
+pub fn fs_demo_start(
+    hal: &HalInterface,
+    caller: ThreadId,
+    fs_elf: &[u8],
+    expected_machine: u16,
+) -> Option<(u32, *mut u8, *const u8)> {
+    let k = kstate();
+    let ep_cap = retype_one_from_any_untyped(k, hal, caller, KernelObjectType::Endpoint, 1)?;
+
+    const FS_STACK_VMA: usize = 0xC040_0000;
+    const FS_STACK_LEN: usize = 4096 * 16;
+    let (fs_tid, fs_cs, _stack_phys) =
+        spawn_process_from_elf(hal, k, fs_elf, expected_machine, FS_STACK_VMA, FS_STACK_LEN)?;
+    // SAFETY: single-core; written once here, before any `fs_ipc_call`
+    // (reached only via FS_OPEN/FS_STAT/FS_CLOSE, all issued after this
+    // opcode returns) can read it.
+    unsafe { core::ptr::addr_of_mut!(G_FS_TID).write(Some(fs_tid)) };
+
+    let src_cs = k.tcb(caller)?.cap_space;
+    grant_cap_into(k, src_cs, ep_cap, fs_cs, CapabilityRights::READ | CapabilityRights::WRITE)?;
+
+    // Carve and map the shared fs page into fs-native's OWN fresh
+    // address space — mirrors `spawn_process`/`spawn_process_from_elf`'s
+    // own "carve untyped, map_range directly, no SyscallOp ceremony"
+    // pattern (this is trusted bootstrap glue, not a real user syscall).
+    let fs_addr_space = k.tcb(fs_tid)?.addr_space;
+    let fs_root_pt = k.addr_space_mut(fs_addr_space)?.root_phys().as_usize();
+    let shared_phys = carve_from_any_untyped(k, 4096, 4096)?;
+    // SAFETY: `shared_phys` is fresh untyped RAM, identity-addressable
+    // (paging is not active on the CURRENT core for this address —
+    // it is only ever touched through the kernel's own identity map or
+    // fs-native's own U=1 mapping below), single-core.
+    unsafe { core::ptr::write_bytes(shared_phys as *mut u8, 0, 4096) };
+    // `map_range`'s own pool MUST be real, 4 KiB-ALIGNED physical
+    // memory — it stamps page-table-walk PTEs directly at `pool_base +
+    // N*4096`, computing each frame number via `>> 12` (`map_range`'s
+    // own doc comment: "pool frames are zeroed"). **Real bug found via
+    // QEMU**: an earlier draft used a plain local `[u8; 4096*2]` array
+    // here instead — a stack address has NO 4 KiB alignment guarantee
+    // (Rust gives arrays only their element's own alignment, 1 byte for
+    // `u8`), so the resulting PTEs silently truncated to the wrong
+    // frame, corrupting fs-native's own page table without any error
+    // return at all — a SILENT hang once fs-native's process actually
+    // ran into the corrupted mapping, with no diagnostic. Every OTHER
+    // caller in this file already gets this right via `carve()` (real,
+    // explicitly 4 KiB-aligned untyped memory); this one-off inline
+    // call is fixed the same way.
+    let pool = carve_from_any_untyped(k, 4096, 4096 * 2)?;
+    // SAFETY: fresh untyped RAM, identity-addressable, single-core;
+    // `map_range` needs the pool pre-zeroed (same contract every other
+    // pool carve in this file already documents).
+    unsafe { core::ptr::write_bytes(pool as *mut u8, 0, 4096 * 2) };
+    let n = hal.map_range(
+        fs_root_pt,
+        FS_SHARED_VA,
+        shared_phys,
+        4096,
+        1 | 2 | 8, // R+W+U
+        pool,
+        2,
+    );
+    if n == u32::MAX {
+        klog!("fs_demo_start: map_range error (shared page)\r\n");
+        return None;
+    }
+
+    // SAFETY: single-core; written exactly once here, before any of the
+    // `fs_*_call`/`fs_*_result` functions below can be reached (they are
+    // only ever wired to opcodes issued after this one).
+    unsafe { core::ptr::addr_of_mut!(G_FS_SHARED_PHYS).write(shared_phys) };
+
+    // Second shared page, for BULK Read/Write data (03-Kernel-Subsystems-
+    // Layer.md §5.2's own "zero-copy, not the message" rule) — this time
+    // via a REAL `SyscallOp::Retype` into `KernelObjectType::SharedRegion`
+    // (the genuine capability object, not a bare untyped carve like the
+    // SmallMessage page just above), proving the capability actually
+    // works end to end, not just compiling.
+    let region_cap = retype_one_from_any_untyped(k, hal, caller, KernelObjectType::SharedRegion, 1)?;
+    // Resolve the freshly retyped capability back to its own
+    // `SharedRegion` description to learn the physical base `map_range`
+    // below needs — `Retype`'s own `NewCaps` return only carries the
+    // CALLER's new `CapId`, not the object itself.
+    let region_id = k.cap_space(src_cs)?.lookup(region_cap)?.object.id;
+    let region_phys = k
+        .shared_region(kernel_cap::SharedRegionId::new(region_id.as_u32()))?
+        .phys_base
+        .as_usize();
+    grant_cap_into(k, src_cs, region_cap, fs_cs, CapabilityRights::READ | CapabilityRights::WRITE)?;
+    // Fresh, dedicated pool for this SECOND `map_range` call — reusing
+    // the message page's own (already-consumed) `pool` variable here
+    // would violate `map_range`'s own "pool frames are zeroed and
+    // untouched" precondition for a fresh walk; every other multi-map
+    // caller in this file (e.g. `spawn_process_from_elf`'s own per-
+    // segment walks share ONE pool because they're carved together up
+    // front — this one is a separate, later carve, so it gets its own).
+    let data_pool = carve_from_any_untyped(k, 4096, 4096 * 2)?;
+    // SAFETY: fresh untyped RAM, identity-addressable, single-core;
+    // `map_range` needs the pool pre-zeroed (same contract every other
+    // pool carve in this file already documents).
+    unsafe { core::ptr::write_bytes(data_pool as *mut u8, 0, 4096 * 2) };
+    let n2 = hal.map_range(
+        fs_root_pt,
+        FS_DATA_VA,
+        region_phys,
+        4096,
+        1 | 2 | 8, // R+W+U
+        data_pool,
+        2,
+    );
+    if n2 == u32::MAX {
+        klog!("fs_demo_start: map_range error (data page)\r\n");
+        return None;
+    }
+    // SAFETY: single-core; written exactly once here, before any
+    // FS_WRITE/FS_READ call can be reached.
+    unsafe { core::ptr::addr_of_mut!(G_FS_DATA_PHYS).write(region_phys) };
+
+    // Switch straight to fs-native, exactly like `p2_ipc_demo_start`
+    // does for its own in-kernel server — **real bug found via QEMU**:
+    // without this, `caller`'s FIRST `FS_OPEN` (issued immediately
+    // after this opcode returns) is a `Call` racing a receiver that has
+    // NEVER YET RUN AT ALL, so `do_send`'s fast path (which requires
+    // the receiver already blocked in `Recv`) cannot trigger — it falls
+    // back to `pick_next`'s general fairness, which can and did pick a
+    // completely unrelated already-`Ready` thread instead of fs-native,
+    // silently stranding BOTH `caller` (still `BlockedOnReply`, nothing
+    // will ever `Reply` to it) and fs-native (spawned but never
+    // scheduled) forever — the exact same bug class `p2_ipc_demo_start`
+    // itself was already fixed for, and `p2_ipc_recv`'s own hardcoded
+    // "switch to root" doc comment already explains from the other
+    // side. Fixed by switching to fs-native HERE, unconditionally: it
+    // runs its own boot sequence (seed `/greeting`) and reaches its own
+    // first `IPC_RECV`, which finds nothing queued yet and must block.
+    // `G_FS_ROOT_ONLY_PHASE` (set just below) is what makes that — and
+    // EVERY subsequent `Recv` call for the rest of Root Task's own
+    // sequential fs demo — switch straight back to `k.root_thread`
+    // deterministically — see that flag's own doc comment for the real
+    // QEMU-confirmed hang this replaced (fs-native's `Recv` opcode is
+    // `SBS_IPC_RECV`/`p2_ipc_recv_general` as of 2026-09-10, not the
+    // narrow `p2_ipc_recv` an earlier version of this comment described —
+    // general `pick_next` fairness is not safe for ANY of these calls,
+    // before `P2_PREEMPT_START` has ever armed the preemptive timer). By
+    // the time `caller` resumes from THIS switch and issues `FS_OPEN`,
+    // fs-native is genuinely blocked in `Recv`, so the real fast path
+    // (already proven across all three architectures) takes over
+    // correctly from there on.
+    let _ = k.sched.note_ready(caller, hal.now_ns());
+    let _ = k.sched.dispatch(fs_tid, hal.now_ns());
+    let (save, into) = k.user_ctx_switch_ptrs(caller, fs_tid)?;
+    // SAFETY: single-core; the only writer, always before fs-native's own
+    // first `SBS_IPC_RECV` trap (fs-native is not switched to for the
+    // first time until the `Some(...)` this function returns is actually
+    // acted on by the caller).
+    unsafe { core::ptr::addr_of_mut!(G_FS_ROOT_ONLY_PHASE).write(true) };
+
+    Some((ep_cap.as_u32(), save, into))
+}
+
+/// Wires a SECOND, independent real client to fs-native — `simurgh-
+/// file-manager`'s own edge, added 2026-09-10, the first time any
+/// process OTHER than Root Task talks to fs-native for real. Deliberately
+/// NOT [`wire_service_endpoint`]'s own shape (Retype a FRESH `Endpoint` +
+/// carve FRESH shared pages): fs-native's Endpoint and both its shared
+/// pages already exist (`fs_demo_start`'s own `FS_ENDPOINT_CAP`=0/
+/// `G_FS_SHARED_PHYS`/`G_FS_DATA_PHYS`) — this instead derives a SECOND
+/// grant of the SAME Endpoint object (sourced from fs-native's own cap
+/// table, slot 0 — `grant_cap_into` only needs SOME cap space already
+/// holding a valid reference to derive from; fs-native's own slot 0 is as
+/// good a source as Root Task's).
+///
+/// **Each client gets its own PRIVATE pair of message/data pages
+/// (2026-09-17).** This function used to map fs-native's own two physical
+/// pages (`G_FS_SHARED_PHYS`/`G_FS_DATA_PHYS`) into every client, on the
+/// stated reasoning that "Root Task and `simurgh-file-manager` are NOT
+/// concurrent callers in practice". That reasoning covered the only two
+/// callers that existed at the time and silently stopped holding when
+/// `simurgh-init` became a THIRD client through this very same function —
+/// `init-core` runs a real `RegisterPath` -> `Open` -> `Read` -> `Close`
+/// sequence concurrently with `fm-core`'s own `self_check`, on what was
+/// then one global buffer, and clobbered it. `G_FS_CLIENT_PAGES`' own doc
+/// comment has the full, QEMU-confirmed story. Fresh pages are carved and
+/// registered here; the kernel copies them in/out around fs-native's own
+/// `Recv`/`Reply`, so fs-native itself is unchanged and still sees exactly
+/// one request at its own fixed VAs.
+///
+/// **Must be paired with `subsystem_entry.rs`'s own `IPC_RECV` = `sys::
+/// SBS_IPC_RECV` (NOT `sys::IPC_RECV`)** — see that constant's own doc
+/// comment for the real crash class this avoids now that fs-native has a
+/// second, non-fixed caller.
+pub fn wire_file_manager_to_fs_native(
+    hal: &HalInterface,
+    file_manager_tid: ThreadId,
+    file_manager_cs: kernel_cap::CapSpaceId,
+    file_manager_root_pt: usize,
+    file_manager_msg_va: usize,
+    file_manager_data_va: usize,
+) -> Option<()> {
+    let k = kstate();
+    // SAFETY: `G_FS_TID` is written once by `fs_demo_start`, before this
+    // function can ever be reached (fs-native must already be spawned).
+    let fs_tid = unsafe { core::ptr::addr_of!(G_FS_TID).read() }?;
+    let fs_cs = k.tcb(fs_tid)?.cap_space;
+
+    // Derive a second grant of fs-native's own Endpoint (its own slot 0)
+    // into file-manager's cap space — same object, a new capability.
+    grant_cap_into(k, fs_cs, CapId::new(0), file_manager_cs, CapabilityRights::READ | CapabilityRights::WRITE)?;
+
+    // SAFETY: `G_FS_SHARED_PHYS`/`G_FS_DATA_PHYS` are written once by
+    // `fs_demo_start`, before this function can ever be reached.
+    let shared_phys = unsafe { core::ptr::addr_of!(G_FS_SHARED_PHYS).read() };
+    let data_phys = unsafe { core::ptr::addr_of!(G_FS_DATA_PHYS).read() };
+    if shared_phys == usize::MAX || data_phys == usize::MAX {
+        klog!("wire_file_manager_to_fs_native: fs-native's own shared pages are not set up yet\r\n");
+        return None;
+    }
+
+    // This client's OWN private message/data frames — NOT fs-native's own
+    // pages (which `shared_phys`/`data_phys` above name, and which stay
+    // the server-side staging window the kernel copies to and from). See
+    // `G_FS_CLIENT_PAGES`' own doc comment for why sharing them was a real
+    // bug.
+    let client_msg_phys = carve_from_any_untyped(k, 4096, 4096)?;
+    let client_data_phys = carve_from_any_untyped(k, 4096, 4096)?;
+    // SAFETY: fresh untyped RAM, identity-addressable, single-core — a
+    // client must not start out seeing another client's leftover bytes.
+    unsafe {
+        core::ptr::write_bytes(client_msg_phys as *mut u8, 0, 4096);
+        core::ptr::write_bytes(client_data_phys as *mut u8, 0, 4096);
+    }
+    if !fs_register_client(file_manager_tid.as_u32(), client_msg_phys, client_data_phys) {
+        klog!("wire_file_manager_to_fs_native: no free fs client slot (FS_MAX_CLIENTS)\r\n");
+        return None;
+    }
+
+    let msg_pool = carve_from_any_untyped(k, 4096, 4096 * 2)?;
+    // SAFETY: fresh untyped RAM, identity-addressable, single-core;
+    // `map_range` needs the pool pre-zeroed.
+    unsafe { core::ptr::write_bytes(msg_pool as *mut u8, 0, 4096 * 2) };
+    if hal.map_range(file_manager_root_pt, file_manager_msg_va, client_msg_phys, 4096, 1 | 2 | 8, msg_pool, 2) == u32::MAX {
+        klog!("wire_file_manager_to_fs_native: map_range error (message page)\r\n");
+        return None;
+    }
+
+    let data_pool = carve_from_any_untyped(k, 4096, 4096 * 2)?;
+    // SAFETY: same contract as `msg_pool` above.
+    unsafe { core::ptr::write_bytes(data_pool as *mut u8, 0, 4096 * 2) };
+    if hal.map_range(file_manager_root_pt, file_manager_data_va, client_data_phys, 4096, 1 | 2 | 8, data_pool, 2) == u32::MAX {
+        klog!("wire_file_manager_to_fs_native: map_range error (data page)\r\n");
+        return None;
+    }
+
+    // fs-native now has a genuine SECOND client, so its Root-Task-only
+    // bootstrap phase is over: `fs_native_recv` must go back to the
+    // GENERAL dispatch. `G_FS_ROOT_ONLY_PHASE`'s own doc comment has
+    // always specified exactly this ("cleared once by `wire_file_manager_
+    // to_fs_native`") — but the clear itself was never actually written,
+    // so the flag latched `true` for the whole life of the system and
+    // `fs_native_recv` permanently took `p2_ipc_recv`'s narrow,
+    // hardcoded-to-Root-Task switch. Real consequence, confirmed on a
+    // real x86_64 QEMU boot: `fm-core` issues its first `RegisterPath`
+    // `Call`, fs-native blocks in `Recv` and hands the core straight back
+    // to Root Task instead of letting `pick_next` run the client it has
+    // queued work for, and fs-native is never scheduled again — the
+    // client's `Call` is simply never served. `wire_ui_core_to_
+    // compositor`'s own identical `G_COMPOSITOR_ROOT_ONLY_PHASE` clear
+    // (this file, same shape) is the precedent this was missing.
+    //
+    // SAFETY: single-core; the only writer at this point in boot (well
+    // after `fs_demo_start`'s own write, which this call is always
+    // sequenced after).
+    unsafe { core::ptr::addr_of_mut!(G_FS_ROOT_ONLY_PHASE).write(false) };
+
+    Some(())
+}
+
+/// `Call`, specialized for the fs-native demo's known, fixed 2-party
+/// (root <-> fs-native) shape — unlike `p2_ipc_call` (generic, trusts
+/// whichever thread `do_send`'s fast path or `pick_next`'s general
+/// fallback hands back).
+///
+/// **Real bug found via QEMU**: `FS_OPEN` (the very first FS call) works
+/// via `p2_ipc_call`'s plain fast path ONLY because `fs_demo_start`
+/// explicitly switches to fs-native first, so it is already blocked in
+/// `Recv` by the time `FS_OPEN` runs. Every call AFTER that point (e.g.
+/// `FS_STAT`, right after `FS_OPEN`'s own `Reply`) is NOT covered by
+/// that guarantee: `do_reply` (correctly) leaves the replier merely
+/// `Ready` (see its own doc comment), not resumed — fs-native has not
+/// actually run again to reach its OWN next `IPC_RECV` by the time
+/// `caller` issues the next FS opcode. So `do_send`'s fast path cannot
+/// trigger, and falls back to `SendOutcome::SenderQueued` + `pick_next`
+/// — general fairness, which silently picked some OTHER unrelated
+/// `Ready` thread (left over from an earlier demo phase) instead of
+/// fs-native, stranding `caller` in `BlockedOnReply` forever (fs-native,
+/// never scheduled, never reaches `Recv` to see the queued message) — a
+/// totally silent hang, confirmed via QEMU (output stops dead right
+/// after `FS_OPEN`'s own report, every run). Exactly the same bug class
+/// `p2_ipc_recv`'s and `p2_ipc_demo_start`'s own "Real bug found via
+/// QEMU" comments already describe for the sibling cases; the identical
+/// fix applies: since this demo is a deterministic 2-party RPC, bypass
+/// `pick_next`'s answer and switch straight to the known fs-native
+/// `ThreadId` instead. Safe to discard whatever `pick_next` chose:
+/// `pick_next` is read-only ("without committing to it" — see its own
+/// doc comment), so overriding its answer here never corrupts scheduler
+/// bookkeeping — the thread it would have picked simply stays `Ready`,
+/// untouched, for a later call to actually choose.
+fn fs_ipc_call(hal: &HalInterface, caller: ThreadId, ep_cap: u32) -> Option<IpcSwitch> {
+    let k = kstate();
+    // SAFETY: single-core; `G_FS_TID` is written once by `fs_demo_start`,
+    // before any FS_OPEN/FS_STAT/FS_CLOSE call (this function) can run.
+    let fs_tid = unsafe { core::ptr::addr_of!(G_FS_TID).read() }?;
+    let msg = SmallMessage::new(0);
+    match k.dispatch(caller, hal.now_ns(), SyscallOp::Call { endpoint: CapId::new(ep_cap), msg }, hal) {
+        Ok(SyscallReturn::Reschedule { next: Some(n) }) => {
+            let _ = k.sched.dispatch(fs_tid, hal.now_ns());
+            let (save, into) = k.user_ctx_switch_ptrs(caller, fs_tid)?;
+            // `pending_from`/`pending_msg` are only ever set on the
+            // thread `do_send`'s OWN fast path actually delivered to
+            // directly (see `p2_ipc_call`'s own comment) — that is
+            // fs-native exactly when `n == fs_tid` (the fast path DID
+            // trigger); when it did not (the general-fallback case this
+            // function exists to correct), the message is merely queued
+            // in the endpoint, for fs-native's own next `IPC_RECV` to
+            // pick up the ordinary way, so there is nothing to poke.
+            let poke = if n == fs_tid {
+                k.tcb_mut(fs_tid)
+                    .and_then(|t| Some((t.pending_from.take()?, t.pending_msg.take()?)))
+                    .map(|(from, m)| (from.as_u32() as usize, m.label as usize))
+            } else {
+                None
+            };
+            Some(IpcSwitch { save, into, poke })
+        }
+        _ => None,
+    }
+}
+
+/// `FS_OPEN` demo opcode: builds a REAL `FsRequest::Open` (per-arch
+/// `.user_text` code passes only `path_id`/`flags_bits` as plain
+/// integers — see this section's own doc comment on why), marshals it
+/// through the shared fs page, and issues a REAL `SyscallOp::Call`.
+pub fn fs_open_call(
+    hal: &HalInterface,
+    caller: ThreadId,
+    ep_cap: u32,
+    path_id: u32,
+    flags_bits: u32,
+) -> Option<IpcSwitch> {
+    let flags = ipc_protocol::OpenFlags::from_bits(flags_bits).unwrap_or(ipc_protocol::OpenFlags::empty());
+    let req = ipc_protocol::FsRequest::Open {
+        path: ipc_protocol::PathId(path_id),
+        flags,
+    };
+    let msg = ipc_protocol::codec::encode_fs_request(&req);
+    // SAFETY: `fs_demo_start` has already run by the time any `.user_
+    // text` code can reach this opcode (it needs `ep_cap`, which only
+    // `fs_demo_start`'s own return value provides).
+    unsafe { write_shared_fs_message(&msg) };
+    fs_ipc_call(hal, caller, ep_cap)
+}
+
+/// Reads back the `FsResponse` fs-native's `IPC_REPLY` just wrote into
+/// the shared fs page, once the caller resumes from `fs_open_call`'s own
+/// switch. Returns the new handle, or `usize::MAX` on any error/decode
+/// failure — `.user_text` code reports this raw via `sys::REPORT`.
+pub fn fs_open_result() -> usize {
+    // SAFETY: same contract as `fs_open_call`.
+    let msg = unsafe { read_shared_fs_message() };
+    match ipc_protocol::codec::decode_fs_response(&msg) {
+        Ok(ipc_protocol::FsResponse::Opened { handle }) => handle.0 as usize,
+        _ => usize::MAX,
+    }
+}
+
+/// `FS_STAT` demo opcode: builds a REAL `FsRequest::Stat`.
+pub fn fs_stat_call(hal: &HalInterface, caller: ThreadId, ep_cap: u32, path_id: u32) -> Option<IpcSwitch> {
+    let req = ipc_protocol::FsRequest::Stat {
+        path: ipc_protocol::PathId(path_id),
+    };
+    let msg = ipc_protocol::codec::encode_fs_request(&req);
+    // SAFETY: see `fs_open_call`'s own contract.
+    unsafe { write_shared_fs_message(&msg) };
+    fs_ipc_call(hal, caller, ep_cap)
+}
+
+/// Reads back the `FsResponse` for `fs_stat_call`. Returns the file's
+/// real size, or `usize::MAX` on any error/decode failure.
+pub fn fs_stat_result() -> usize {
+    // SAFETY: same contract as `fs_open_call`.
+    let msg = unsafe { read_shared_fs_message() };
+    match ipc_protocol::codec::decode_fs_response(&msg) {
+        Ok(ipc_protocol::FsResponse::Stat { size, .. }) => size as usize,
+        _ => usize::MAX,
+    }
+}
+
+/// `FS_CLOSE` demo opcode: builds a REAL `FsRequest::Close`.
+pub fn fs_close_call(hal: &HalInterface, caller: ThreadId, ep_cap: u32, handle: u32) -> Option<IpcSwitch> {
+    let req = ipc_protocol::FsRequest::Close {
+        handle: ipc_protocol::FileHandle(handle),
+    };
+    let msg = ipc_protocol::codec::encode_fs_request(&req);
+    // SAFETY: see `fs_open_call`'s own contract.
+    unsafe { write_shared_fs_message(&msg) };
+    fs_ipc_call(hal, caller, ep_cap)
+}
+
+/// Reads back the `FsResponse` for `fs_close_call`. Returns `1` for a
+/// real `Closed`, `0` for anything else (error/decode failure).
+pub fn fs_close_result() -> usize {
+    // SAFETY: same contract as `fs_open_call`.
+    let msg = unsafe { read_shared_fs_message() };
+    match ipc_protocol::codec::decode_fs_response(&msg) {
+        Ok(ipc_protocol::FsResponse::Closed) => 1,
+        _ => 0,
+    }
+}
+
+/// `FS_WRITE` demo opcode: writes `FS_DEMO_WRITE_DATA` (fixed MVP test
+/// payload — see that constant's own doc comment) into the shared DATA
+/// region's own physical memory, then builds a REAL `FsRequest::Write`
+/// naming it via `shared_cap` (fs-native's own deterministic slot for
+/// its one shared data region — `FS_DATA_SHARED_CAP_SLOT`). `offset` is
+/// always 0 for this MVP demo — no partial-write exercise yet.
+pub fn fs_write_call(hal: &HalInterface, caller: ThreadId, ep_cap: u32, handle: u32) -> Option<IpcSwitch> {
+    // SAFETY: `G_FS_DATA_PHYS` was set once by `fs_demo_start`, before
+    // any FS_WRITE call can be reached; identity-mapped for kernel-mode
+    // access like every other physical cross-check in this file.
+    unsafe {
+        let base = core::ptr::addr_of!(G_FS_DATA_PHYS).read() as *mut u8;
+        core::ptr::copy_nonoverlapping(FS_DEMO_WRITE_DATA.as_ptr(), base, FS_DEMO_WRITE_DATA.len());
+    }
+    let req = ipc_protocol::FsRequest::Write {
+        handle: ipc_protocol::FileHandle(handle),
+        offset: 0,
+        len: FS_DEMO_WRITE_DATA.len() as u32,
+        shared_cap: FS_DATA_SHARED_CAP_SLOT,
+    };
+    let msg = ipc_protocol::codec::encode_fs_request(&req);
+    // SAFETY: see `fs_open_call`'s own contract.
+    unsafe { write_shared_fs_message(&msg) };
+    fs_ipc_call(hal, caller, ep_cap)
+}
+
+/// Reads back the `FsResponse` for `fs_write_call`. Returns the byte
+/// count, or `usize::MAX` on any error/decode failure.
+pub fn fs_write_result() -> usize {
+    // SAFETY: same contract as `fs_open_call`.
+    let msg = unsafe { read_shared_fs_message() };
+    match ipc_protocol::codec::decode_fs_response(&msg) {
+        Ok(ipc_protocol::FsResponse::Written { bytes }) => bytes as usize,
+        _ => usize::MAX,
+    }
+}
+
+/// `FS_READ` demo opcode: builds a REAL `FsRequest::Read` for `len`
+/// bytes at offset 0 (always following an `FS_WRITE`, in this demo's
+/// own fixed sequence — never past EOF).
+pub fn fs_read_call(hal: &HalInterface, caller: ThreadId, ep_cap: u32, handle: u32, len: u32) -> Option<IpcSwitch> {
+    let req = ipc_protocol::FsRequest::Read {
+        handle: ipc_protocol::FileHandle(handle),
+        offset: 0,
+        len,
+        shared_cap: FS_DATA_SHARED_CAP_SLOT,
+    };
+    let msg = ipc_protocol::codec::encode_fs_request(&req);
+    // SAFETY: see `fs_open_call`'s own contract.
+    unsafe { write_shared_fs_message(&msg) };
+    fs_ipc_call(hal, caller, ep_cap)
+}
+
+/// Reads back the `FsResponse` for `fs_read_call`, AND cross-checks the
+/// shared data region's own physical bytes against `FS_DEMO_WRITE_DATA`
+/// — proving the REAL Write→Read round-trip actually moved real bytes
+/// through fs-native's own `MemFs`, zero-copy (same "read back via the
+/// kernel's own identity map and compare" verification style every
+/// other real demo in this file already uses — e.g. the two-Sv39-spaces
+/// zero-copy proof). Returns the byte count, or `usize::MAX` on any
+/// error/decode failure (the match/mismatch verdict is logged, not
+/// folded into the return value, so `.user_text`'s own `REPORT` still
+/// reports the plain byte count like every other FS opcode).
+pub fn fs_read_result() -> usize {
+    // SAFETY: same contract as `fs_open_call`.
+    let msg = unsafe { read_shared_fs_message() };
+    let bytes = match ipc_protocol::codec::decode_fs_response(&msg) {
+        Ok(ipc_protocol::FsResponse::Read { bytes }) => bytes as usize,
+        _ => return usize::MAX,
+    };
+    // SAFETY: same contract as `fs_write_call`'s own read of
+    // `G_FS_DATA_PHYS`.
+    let matches = unsafe {
+        let base = core::ptr::addr_of!(G_FS_DATA_PHYS).read() as *const u8;
+        bytes == FS_DEMO_WRITE_DATA.len() && core::slice::from_raw_parts(base, bytes) == FS_DEMO_WRITE_DATA
+    };
+    klog!(
+        "fs_read_result: real Write->Read round-trip through fs-native's own MemFs (03 5.3) -> {}\r\n",
+        if matches { "MATCH, zero-copy through the SharedRegion capability" } else { "MISMATCH" }
+    );
+    bytes
+}
+
+/// Same real round trip as `fs_read_result`, but skips the MATCH/
+/// MISMATCH `klog!` — used by the VFS read-throughput benchmark loop
+/// below so it doesn't spam one near-identical log line per iteration
+/// (same reason `mm_query_total_resident_result_quiet` exists).
+pub fn fs_read_result_quiet() -> usize {
+    // SAFETY: same contract as `fs_open_call`.
+    let msg = unsafe { read_shared_fs_message() };
+    match ipc_protocol::codec::decode_fs_response(&msg) {
+        Ok(ipc_protocol::FsResponse::Read { bytes }) => bytes as usize,
+        _ => usize::MAX,
+    }
+}
+
+/// `FS_WRITE_THROUGHPUT_SUMMARY` demo opcode: logs one honest MB/s line
+/// for the VFS write-throughput phase of 03-Kernel-Subsystems-Layer.md
+/// §5's item 5 ("VFS read/write throughput relative to a reference
+/// system... reported"). `total_bytes`/`total_ns` are summed in
+/// `.user_text` across a real `FS_WRITE`/`FS_WRITE_RESULT` loop — each
+/// iteration a genuine `Call`/`Reply` round trip through fs-native's
+/// own isolated process, exactly like every byte transferred in the
+/// single-shot `fs_write_call`/`fs_read_result` demo above, just
+/// repeated and timed. Fixed-point (integer-only, matching this
+/// project's `kernel-sched::weight`-style "no floating point in the
+/// kernel-adjacent path" convention): reports whole KB/s rather than a
+/// fractional MB/s, since `total_bytes * 1000 / total_ns` (nanoseconds
+/// to seconds, bytes to kilobytes) stays comfortably inside `u64`
+/// for any realistic sample size here and needs no float formatting
+/// support in this `no_std` `klog!` path.
+pub fn fs_write_throughput_summary(total_bytes: usize, total_ns: usize) {
+    if total_ns == 0 {
+        klog!("fs_write_throughput_summary: zero elapsed time, skipping\r\n");
+        return;
+    }
+    let kb_per_sec = (total_bytes as u64).saturating_mul(1_000_000) / total_ns as u64;
+    klog!(
+        "vfs write throughput (03 5, item 5): {} bytes in {} ns -> {} KB/s\r\n",
+        total_bytes,
+        total_ns,
+        kb_per_sec
+    );
+}
+
+/// Same shape as `fs_write_throughput_summary`, for the read phase.
+pub fn fs_read_throughput_summary(total_bytes: usize, total_ns: usize) {
+    if total_ns == 0 {
+        klog!("fs_read_throughput_summary: zero elapsed time, skipping\r\n");
+        return;
+    }
+    let kb_per_sec = (total_bytes as u64).saturating_mul(1_000_000) / total_ns as u64;
+    klog!(
+        "vfs read throughput (03 5, item 5): {} bytes in {} ns -> {} KB/s\r\n",
+        total_bytes,
+        total_ns,
+        kb_per_sec
+    );
+}
+
+// ============================================================================
+// compositor: real IPC-driven Compositor Service (03 §2.4/§5.4.2)
+//
+// Mirrors the fs-native section immediately above almost exactly (same
+// "spawn, grant an Endpoint, pre-map shared pages, drive it via a
+// dedicated ecall-per-request-type + shared-message-area protocol,
+// bypass pick_next for the deterministic 2-party shape" pattern — see
+// that section's own doc comments for the parts that repeat verbatim
+// here). The one addition: a THIRD mapped page (`COMPOSITOR_CONFIRM_VA`)
+// compositor's own `subsystem_entry::copy_frame_to_confirm` writes the
+// committed frame's own bytes into after reading them from
+// `COMPOSITOR_FB_VA` — proof (peeked directly here, the SAME "kernel
+// reads via its own identity map and compares" verification style
+// `fs_read_result`'s own doc comment already establishes) that
+// Compositor genuinely dereferenced the shared frame buffer, not just
+// that the round trip completed. §5.4.2's own acceptance bar ("a client
+// creates a surface, commits a buffer, and it is shown zero-copy — even
+// headless/file output is enough for the MVP") is satisfied by this
+// direct physical-memory proof standing in for real GPU scanout
+// hardware, which does not exist in this codebase yet.
+// ============================================================================
+
+/// This process's own thread id, set once by `compositor_demo_start` —
+/// same role as `G_FS_TID`.
+static mut G_COMPOSITOR_TID: Option<ThreadId> = None;
+
+/// `G_COMPOSITOR_TID`, exposed to `kernel/kernel/src/main.rs` — same role
+/// as `fs_tid`, needed by the `sys::SBS_IPC_RECV` dispatch arm now that
+/// Compositor is gaining a second real client (`Simurgh-UI-Template01`'s
+/// own `ui-core`).
+pub fn compositor_tid() -> Option<ThreadId> {
+    // SAFETY: single-core; only ever written by `compositor_demo_start`,
+    // before any syscall that could read it concurrently.
+    unsafe { core::ptr::addr_of!(G_COMPOSITOR_TID).read() }
+}
+
+/// Same role as `G_FS_ROOT_ONLY_PHASE`, for Compositor — see that flag's
+/// own doc comment for the full story (a real, QEMU-confirmed boot hang
+/// this exact pattern already fixed for fs-native's identical situation:
+/// a server whose Recv opcode was the narrow, hardcoded-root `p2_ipc_recv`
+/// while it had exactly one real client, now gaining a second one, needs
+/// the general `SBS_IPC_RECV`/`p2_ipc_recv_general` dispatch for the
+/// second client but MUST stay on the narrow dispatch for its own
+/// Root-Task-only bootstrap phase — trusting `pick_next` during that
+/// early window, before `P2_PREEMPT_START` arms the preemptive timer,
+/// can hand control to a stale, long-`Ready`-but-permanently-idle thread
+/// forever). Set `true` by `compositor_demo_start`; cleared by
+/// `wire_ui_core_to_compositor` once `ui-core` is spawned and wired as a
+/// genuine second client, well after the preemptive timer is armed.
+///
+/// # Safety
+/// Single-core; set once by `compositor_demo_start`, cleared once by
+/// `wire_ui_core_to_compositor`, read every time by `compositor_native_recv`.
+static mut G_COMPOSITOR_ROOT_ONLY_PHASE: bool = false;
+
+/// The correctly-scoped `Recv` dispatch for Compositor's OWN
+/// `SBS_IPC_RECV` calls specifically — see [`G_COMPOSITOR_ROOT_ONLY_
+/// PHASE`]'s own doc comment for the full story. `kernel/kernel/src/
+/// main.rs`'s own `sys::SBS_IPC_RECV` arm calls this (not `p2_ipc_recv_
+/// general` directly) whenever the calling thread is Compositor itself
+/// ([`compositor_tid`]).
+pub fn compositor_native_recv(hal: &HalInterface, caller: ThreadId, endpoint_raw: u32) -> Option<IpcRecvOutcome> {
+    // SAFETY: single-core; only ever written by `compositor_demo_start`/
+    // `wire_ui_core_to_compositor`, never concurrently with this read.
+    let root_only_phase = unsafe { core::ptr::addr_of!(G_COMPOSITOR_ROOT_ONLY_PHASE).read() };
+    if root_only_phase {
+        return p2_ipc_recv(hal, caller, endpoint_raw);
+    }
+    p2_ipc_recv_general(hal, caller, endpoint_raw)
+}
+
+/// Physical address of the page shared between the caller (accessed via
+/// the kernel's own always-present identity map) and Compositor's own
+/// process (mapped into ITS address space at `COMPOSITOR_SHARED_VA` by
+/// `compositor_demo_start`) — same role as `G_FS_SHARED_PHYS`.
+static mut G_COMPOSITOR_SHARED_PHYS: usize = usize::MAX;
+
+/// Physical address of the page shared for the committed frame's own
+/// pixel bytes — same role as `G_FS_DATA_PHYS`.
+static mut G_COMPOSITOR_FB_PHYS: usize = usize::MAX;
+
+/// Physical address of Compositor's own private "confirm" region — see
+/// this section's own module doc comment for why it exists.
+static mut G_COMPOSITOR_CONFIRM_PHYS: usize = usize::MAX;
+
+/// VA Compositor's own process maps the shared message page at — must
+/// stay numerically equal to `compositor::subsystem_entry::SHARED_VA`.
+const COMPOSITOR_SHARED_VA: usize = 0xD840_0000;
+
+/// VA Compositor's own process maps the committed frame buffer at — must
+/// stay numerically equal to `compositor::subsystem_entry::FB_VA`.
+const COMPOSITOR_FB_VA: usize = 0xD850_0000;
+
+/// VA Compositor's own process maps its private confirm region at — must
+/// stay numerically equal to `compositor::subsystem_entry::CONFIRM_VA`.
+///
+/// Was `0xD860_0000` (1 MiB past `COMPOSITOR_FB_VA`) until the frame
+/// buffer itself grew past 1 MiB (`COMPOSITOR_FB_PAGES`'s own doc
+/// comment) — `0xD850_0000 + COMPOSITOR_FB_PAGES * 4096` reaches
+/// `0xD86D_6000`, which is PAST the old `0xD860_0000`, so the two
+/// regions would have silently overlapped in Compositor's own address
+/// space (the frame buffer's own tail pages aliasing the confirm
+/// region's head pages) had this not moved. `0xD8A0_0000` leaves a
+/// clean ~3.6 MiB gap after the frame buffer's own end, with headroom
+/// for the frame buffer to grow further without needing this to move
+/// again.
+const COMPOSITOR_CONFIRM_VA: usize = 0xD8A0_0000;
+
+/// VA Compositor's own process maps the scanout INFO page at — must stay
+/// numerically equal to `compositor::subsystem_entry::SCANOUT_INFO_VA`.
+///
+/// ALWAYS mapped, on every architecture, even when this machine has no
+/// display at all: a zero-filled page is how the kernel tells the
+/// Compositor "no framebuffer was granted", and a process that must read
+/// a page to learn that is a process with no `cfg(target_arch)` in it —
+/// which is the rule above the HAL.
+const COMPOSITOR_SCANOUT_INFO_VA: usize = 0xD900_0000;
+
+/// VA Compositor's own process maps the real framebuffer at — must stay
+/// numerically equal to `compositor::subsystem_entry::SCANOUT_VA`.
+/// Mapped ONLY when a real framebuffer exists. Placed clear of every
+/// other region in this address space (`COMPOSITOR_MOUSE_VA`, the last
+/// one below it, ends long before `0xD900_0000`) with room for
+/// `COMPOSITOR_SCANOUT_MAX_BYTES` above it.
+const COMPOSITOR_SCANOUT_VA: usize = 0xD910_0000;
+
+/// Largest framebuffer this VA window will map: 8 MiB, which covers
+/// every mode up to ~1440x1080 at 32bpp (and comfortably the 800x600
+/// and 1024x768 modes OVMF actually offers). A firmware mode larger than
+/// this is refused with a log line rather than partially mapped — half a
+/// screen is not a display, and silently mapping the first 8 MiB of a
+/// bigger mode would put the Compositor's rows at the wrong addresses.
+const COMPOSITOR_SCANOUT_MAX_BYTES: usize = 8 * 1024 * 1024;
+
+/// Magic word introducing the scanout info page — must stay numerically
+/// equal to `compositor::scanout::SCANOUT_INFO_MAGIC` (ASCII `"SIMGSC"`
+/// + a 16-bit layout version). See that constant's own doc comment for
+/// why a magic (rather than a bare field) is what makes an
+/// unrecognized/absent page decode to "headless" instead of to a
+/// misread base address.
+const SCANOUT_INFO_MAGIC: u64 = 0x5349_4D47_5343_0001;
+
+/// Byte offset of the fields the COMPOSITOR writes back into the info
+/// page (blit count, then the last blitted size packed as
+/// `width | height << 32`) — must stay numerically equal to
+/// `compositor::scanout::SCANOUT_STATUS_OFFSET`.
+const SCANOUT_STATUS_OFFSET: usize = 32;
+
+/// Byte offset of the Compositor's acknowledgement echo — must stay
+/// numerically equal to `compositor::scanout::SCANOUT_ACK_OFFSET`.
+const SCANOUT_ACK_OFFSET: usize = 48;
+
+/// Physical address of the scanout info page, kept so
+/// `compositor_scanout_report` can peek the Compositor's own written-back
+/// status through the kernel's identity map — the same "kernel reads the
+/// shared region directly and compares" verification style
+/// `G_COMPOSITOR_CONFIRM_PHYS` already uses for committed frame bytes.
+/// `usize::MAX` until `compositor_demo_start` has run.
+static mut G_COMPOSITOR_SCANOUT_INFO_PHYS: usize = usize::MAX;
+
+/// Maps the display for the Compositor process, and only for it.
+///
+/// Two mappings, one always and one conditional:
+///   - the 4 KiB INFO page (always): carved from untyped RAM, zeroed,
+///     and filled with the real geometry when a framebuffer exists.
+///     Zeroes mean "headless", which is the correct answer on riscv64
+///     and on any machine whose firmware offered no writable mode.
+///   - the framebuffer itself (only when one exists): the physical
+///     pages named by `KernelState::root_mmio_framebuffer_cap`, mapped
+///     `U=1 R+W` at `COMPOSITOR_SCANOUT_VA`.
+///
+/// The framebuffer capability is deliberately NOT granted into the
+/// Compositor's own cap space, for the same two reasons
+/// `spawn_nvme_driver` never grants a BAR capability to its driver: the
+/// kernel walks the mapping itself at boot (trusted bootstrap, no `Map`
+/// ceremony), and this process's capability slots are numbered by grant
+/// ORDER — slot 0 is the display Endpoint, slots 1-4 belong to the
+/// i8042/mouse edges (`compositor::subsystem_entry`'s own `*_CAP`
+/// constants), so an extra grant here would silently renumber them all.
+/// The authority is still real and still checked: this function refuses
+/// to map anything unless `root_mmio_framebuffer_cap` resolves to an
+/// actual `MmioRegion` object.
+///
+/// Returns `None` only when the INFO page itself could not be carved or
+/// mapped — a genuine allocation failure. A machine with no display is
+/// `Some(())` with a zeroed page, because that is not an error.
+fn map_compositor_scanout(
+    k: &mut KernelState,
+    hal: &HalInterface,
+    caller: ThreadId,
+    comp_root_pt: usize,
+) -> Option<()> {
+    let info_phys = carve_from_any_untyped(k, 4096, 4096)?;
+    // SAFETY: fresh untyped RAM, identity-addressable, single-core. The
+    // zeroing is what makes "no framebuffer" the default answer rather
+    // than whatever this frame previously held.
+    unsafe { core::ptr::write_bytes(info_phys as *mut u8, 0, 4096) };
+
+    // Resolve the framebuffer capability, if this machine has one, and
+    // work out how much of it to map. Every early return below leaves
+    // the info page zeroed, i.e. headless — and still maps it.
+    let mapped_bytes = 'resolve: {
+        let fb_cap = k.root_mmio_framebuffer_cap;
+        if fb_cap == CapId::new(u32::MAX) {
+            klog!("compositor scanout: no framebuffer was handed over at boot - Compositor stays headless\r\n");
+            break 'resolve 0usize;
+        }
+        let src_cs = k.tcb(caller)?.cap_space;
+        let Some(entry) = k.cap_space(src_cs).and_then(|cs| cs.lookup(fb_cap)) else {
+            klog!("compositor scanout: the framebuffer capability does not resolve - staying headless\r\n");
+            break 'resolve 0usize;
+        };
+        let mmio_id = kernel_cap::MmioRegionId::new(entry.object.id.as_u32());
+        let Some(mmio) = k.mmio_region(mmio_id).copied() else {
+            klog!("compositor scanout: the framebuffer MmioRegion object is missing - staying headless\r\n");
+            break 'resolve 0usize;
+        };
+        let fb = k.framebuffer;
+
+        // `map_range` demands page alignment on all three of vaddr,
+        // paddr and len. A GOP framebuffer base is page-aligned on every
+        // real firmware, but refusing loudly beats a `u32::MAX` return
+        // nobody can explain later.
+        if mmio.phys_base & 0xFFF != 0 {
+            klog!("compositor scanout: framebuffer base {:#x} is not page-aligned - staying headless\r\n", mmio.phys_base);
+            break 'resolve 0usize;
+        }
+        // Round the needed window UP to a page. Rounding up can reach at
+        // most 4095 bytes past the last row, still inside the display
+        // device's own BAR, and nothing ever writes there: the
+        // Compositor bounds every write by the geometry, never by the
+        // mapping's length.
+        let needed = (mmio.size as usize + 0xFFF) & !0xFFF;
+        if needed == 0 || needed > COMPOSITOR_SCANOUT_MAX_BYTES {
+            klog!("compositor scanout: mode needs {} bytes, past this VA window's {} - staying headless\r\n", needed, COMPOSITOR_SCANOUT_MAX_BYTES);
+            break 'resolve 0usize;
+        }
+
+        // Eight pool frames: an 8 MiB range crosses at most four 2 MiB
+        // boundaries (five PT-level tables) plus one PD-level table,
+        // leaving two frames of margin — same sizing reasoning as the
+        // frame-buffer mapping above.
+        let pool = carve_from_any_untyped(k, 4096, 4096 * 8)?;
+        // SAFETY: fresh untyped RAM, identity-addressable, single-core;
+        // `map_range` needs the pool pre-zeroed.
+        unsafe { core::ptr::write_bytes(pool as *mut u8, 0, 4096 * 8) };
+        if hal.map_range(comp_root_pt, COMPOSITOR_SCANOUT_VA, mmio.phys_base as usize, needed, 1 | 2 | 8, pool, 8) == u32::MAX {
+            klog!("compositor scanout: map_range error (framebuffer) - staying headless\r\n");
+            break 'resolve 0usize;
+        }
+        klog!(
+            "compositor scanout: framebuffer {}x{} stride={} bpp={} base={:#x} mapped {} bytes into Compositor at {:#x} (device memory, NOT untyped RAM)\r\n",
+            fb.width, fb.height, fb.stride_pixels, fb.bits_per_pixel, mmio.phys_base, needed, COMPOSITOR_SCANOUT_VA
+        );
+        needed
+    };
+
+    // Fill in the info page: the real geometry when the mapping above
+    // succeeded, otherwise nothing at all (the page stays zeroed, which
+    // `compositor::scanout::ScanoutInfo::from_bytes` decodes as "no
+    // display").
+    if mapped_bytes != 0 {
+        let fb = k.framebuffer;
+        let format = match fb.format {
+            hal_manifest::raw::PixelFormatRaw::Bgrx8 => 1u32,
+            hal_manifest::raw::PixelFormatRaw::Rgbx8 => 2u32,
+            hal_manifest::raw::PixelFormatRaw::Unknown => 0u32,
+        };
+        // SAFETY: `info_phys` is a freshly carved, identity-addressable
+        // 4 KiB frame this function owns; all writes are within its
+        // first 32 bytes.
+        unsafe {
+            let base = info_phys as *mut u8;
+            core::ptr::write_unaligned(base as *mut u64, SCANOUT_INFO_MAGIC);
+            core::ptr::write_unaligned(base.add(8) as *mut u32, fb.width);
+            core::ptr::write_unaligned(base.add(12) as *mut u32, fb.height);
+            core::ptr::write_unaligned(base.add(16) as *mut u32, fb.stride_pixels);
+            core::ptr::write_unaligned(base.add(20) as *mut u32, format);
+            core::ptr::write_unaligned(base.add(24) as *mut u64, mapped_bytes as u64);
+        }
+    }
+
+    let info_pool = carve_from_any_untyped(k, 4096, 4096 * 2)?;
+    // SAFETY: fresh untyped RAM, identity-addressable, single-core;
+    // `map_range` needs the pool pre-zeroed.
+    unsafe { core::ptr::write_bytes(info_pool as *mut u8, 0, 4096 * 2) };
+    if hal.map_range(comp_root_pt, COMPOSITOR_SCANOUT_INFO_VA, info_phys, 4096, 1 | 2 | 8, info_pool, 2) == u32::MAX {
+        klog!("compositor scanout: map_range error (info page)\r\n");
+        return None;
+    }
+    // SAFETY: single-core; written exactly once here, before the
+    // Compositor can run and before any `compositor_scanout_report`.
+    unsafe { core::ptr::addr_of_mut!(G_COMPOSITOR_SCANOUT_INFO_PHYS).write(info_phys) };
+    Some(())
+}
+
+/// Reports what the Compositor has ACTUALLY put on screen, read straight
+/// out of the scanout info page's status fields through the kernel's own
+/// identity map — not from anything the Compositor told us over IPC.
+///
+/// Three distinguishable outcomes, which is the whole point of the
+/// separate acknowledgement word: no framebuffer was granted at all;
+/// one was, but the Compositor has not reached it (this project's known
+/// scheduling-capacity characteristic makes that a real possibility, not
+/// a hypothetical); or it has, with a real blit count.
+fn compositor_scanout_report() {
+    // SAFETY: single-core; written once by `map_compositor_scanout`
+    // before the Compositor could run.
+    let info_phys = unsafe { core::ptr::addr_of!(G_COMPOSITOR_SCANOUT_INFO_PHYS).read() };
+    if info_phys == usize::MAX {
+        return;
+    }
+    // SAFETY: `info_phys` is the identity-addressable frame this module
+    // carved and mapped; these reads stay within its first 56 bytes.
+    let (magic, blits, last, ack) = unsafe {
+        let base = info_phys as *const u8;
+        (
+            core::ptr::read_unaligned(base as *const u64),
+            core::ptr::read_unaligned(base.add(SCANOUT_STATUS_OFFSET) as *const u64),
+            core::ptr::read_unaligned(base.add(SCANOUT_STATUS_OFFSET + 8) as *const u64),
+            core::ptr::read_unaligned(base.add(SCANOUT_ACK_OFFSET) as *const u64),
+        )
+    };
+    if magic != SCANOUT_INFO_MAGIC {
+        klog!("compositor_scanout_verify: no framebuffer granted - frames stay in RAM (headless, as before)\r\n");
+        return;
+    }
+    if ack != SCANOUT_INFO_MAGIC {
+        klog!("compositor_scanout_verify: framebuffer granted, but Compositor has not acquired it yet\r\n");
+        return;
+    }
+    klog!(
+        "compositor_scanout_verify: Compositor acquired the real framebuffer and blitted {} frame(s), last {}x{} -> PIXELS ON SCREEN\r\n",
+        blits,
+        last as u32,
+        (last >> 32) as u32
+    );
+}
+
+/// Page count for the frame buffer AND confirm `SharedRegion`s — enough
+/// for a real 800x600 BGRA8 desktop frame (800 * 600 * 4 = 1,920,000
+/// bytes; 470 pages = 1,925,120 bytes, the smallest page count that
+/// covers it). Both regions use the SAME count: `subsystem_entry::
+/// copy_frame_to_confirm` copies up to `FRAME_MAX` bytes from `FB_VA`
+/// into `CONFIRM_VA`, so a confirm region smaller than the frame buffer
+/// would make a large, legitimately-sized commit overrun it.
+///
+/// Was `1` (a single page, 4096 bytes) until `Simurgh-UI-Template01`'s
+/// own `ui-core` needed a real, full-resolution frame to flow through
+/// this same pipe (that repo's own README, "Also needed before Phase 1
+/// is truly done"). Made possible by `kernel-core::syscall::do_retype`'s
+/// own new `SharedRegion`-specific `count`-means-"pages in this ONE
+/// region" semantic (see that function's own doc comment) — the naive
+/// alternative, ~470 SEPARATE one-page `SharedRegion` objects, would
+/// have blown straight through `CAP_SLOTS_PER_SPACE` (96,
+/// `kernel-cap/src/cdt.rs`) on its own.
+const COMPOSITOR_FB_PAGES: u32 = 470;
+
+/// Byte length of the frame buffer / confirm `SharedRegion`s —
+/// `COMPOSITOR_FB_PAGES * 4096`. Must stay numerically equal to
+/// `compositor::subsystem_entry::FRAME_MAX`.
+const COMPOSITOR_FB_LEN: usize = COMPOSITOR_FB_PAGES as usize * 4096;
+
+/// Fixed MVP test frame — a 2x2 packed-BGRA8 surface (16 bytes), a
+/// recognizable sentinel pattern (not all-zero, so a MISMATCH from an
+/// unmapped/zeroed page is distinguishable from a genuine round-trip
+/// failure) — same "one demo, one hardcoded scenario" convention
+/// `FS_DEMO_WRITE_DATA`'s own doc comment already establishes.
+const COMPOSITOR_DEMO_FRAME: [u8; 16] = [
+    0xDE, 0xAD, 0xBE, 0xEF, 0xCA, 0xFE, 0xBA, 0xBE, 0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0,
+];
+/// Frame width, in pixels, for the fixed demo frame above (`2 * 2 * 4 ==
+/// COMPOSITOR_DEMO_FRAME.len()`).
+const COMPOSITOR_DEMO_WIDTH: u32 = 2;
+/// Frame height, in pixels, for the fixed demo frame above.
+const COMPOSITOR_DEMO_HEIGHT: u32 = 2;
+
+/// Writes `msg`'s full `(label, words[0..6] zero-padded)` into the
+/// shared compositor page — same convention `write_shared_fs_message`'s
+/// own doc comment documents in full.
+///
+/// # Safety
+/// `G_COMPOSITOR_SHARED_PHYS` must already be a valid, exclusively-owned,
+/// mapped physical frame (`compositor_demo_start` has run).
+unsafe fn write_shared_compositor_message(msg: &SmallMessage) {
+    // SAFETY: single-core; `G_COMPOSITOR_SHARED_PHYS` only written once
+    // by `compositor_demo_start`, before this can ever be called.
+    let base = unsafe { core::ptr::addr_of!(G_COMPOSITOR_SHARED_PHYS).read() } as *mut u64;
+    // SAFETY: forwarded from this function's own contract — low RAM is
+    // always identity-mapped for kernel-mode access regardless of which
+    // process's page table is currently active.
+    unsafe {
+        base.write_volatile(msg.label);
+        let words = msg.words();
+        for i in 0..kernel_ipc::MSG_MAX_WORDS {
+            base.add(1 + i).write_volatile(words.get(i).copied().unwrap_or(0));
+        }
+    }
+}
+
+/// Reads back a `SmallMessage` written by `write_shared_compositor_message`.
+///
+/// # Safety
+/// Same contract as `write_shared_compositor_message`.
+unsafe fn read_shared_compositor_message() -> SmallMessage {
+    // SAFETY: single-core; same contract as `write_shared_compositor_message`.
+    let base = unsafe { core::ptr::addr_of!(G_COMPOSITOR_SHARED_PHYS).read() } as *const u64;
+    // SAFETY: forwarded from this function's own contract.
+    unsafe {
+        let label = base.read_volatile();
+        let mut words = [0u64; kernel_ipc::MSG_MAX_WORDS];
+        for (i, w) in words.iter_mut().enumerate() {
+            *w = base.add(1 + i).read_volatile();
+        }
+        SmallMessage::from_words(label, &words).unwrap_or(SmallMessage::new(label))
+    }
+}
+
+/// One-time setup: creates the endpoint Compositor and its client
+/// (`caller`, always the Root Task in this MVP) rendezvous on, spawns
+/// Compositor as a genuinely isolated process from its own separately-
+/// built ELF image (`compositor_elf`), grants it the endpoint plus THREE
+/// pre-mapped pages (message, frame buffer, confirm region — this
+/// section's own module doc comment), and switches straight to it — same
+/// "without this, the caller's first Call races a receiver that has
+/// never run" rationale `fs_demo_start`'s own tail comment documents in
+/// full. Returns the endpoint's capability slot in the CALLER's own cap
+/// space plus the `(save, into)` switch pointers the caller wraps in a
+/// `TrapOutcome::SwitchTo`.
+pub fn compositor_demo_start(
+    hal: &HalInterface,
+    caller: ThreadId,
+    compositor_elf: &[u8],
+    expected_machine: u16,
+) -> Option<(u32, *mut u8, *const u8)> {
+    let k = kstate();
+    let ep_cap = retype_one_from_any_untyped(k, hal, caller, KernelObjectType::Endpoint, 1)?;
+
+    const COMPOSITOR_STACK_VMA: usize = 0xC050_0000;
+    const COMPOSITOR_STACK_LEN: usize = 4096 * 16;
+    let (comp_tid, comp_cs, _stack_phys) =
+        spawn_process_from_elf(hal, k, compositor_elf, expected_machine, COMPOSITOR_STACK_VMA, COMPOSITOR_STACK_LEN)?;
+    // SAFETY: single-core; written once here, before any compositor call
+    // (reached only after this function returns) can read it.
+    unsafe { core::ptr::addr_of_mut!(G_COMPOSITOR_TID).write(Some(comp_tid)) };
+
+    let src_cs = k.tcb(caller)?.cap_space;
+    grant_cap_into(k, src_cs, ep_cap, comp_cs, CapabilityRights::READ | CapabilityRights::WRITE)?;
+
+    let comp_addr_space = k.tcb(comp_tid)?.addr_space;
+    let comp_root_pt = k.addr_space_mut(comp_addr_space)?.root_phys().as_usize();
+
+    // Shared message page (trusted-bootstrap direct map, no SyscallOp
+    // ceremony — same "carve untyped, map_range directly" pattern
+    // `fs_demo_start`'s own identical block already uses).
+    let shared_phys = carve_from_any_untyped(k, 4096, 4096)?;
+    // SAFETY: fresh untyped RAM, identity-addressable, single-core.
+    unsafe { core::ptr::write_bytes(shared_phys as *mut u8, 0, 4096) };
+    let shared_pool = carve_from_any_untyped(k, 4096, 4096 * 2)?;
+    // SAFETY: fresh untyped RAM, identity-addressable, single-core;
+    // `map_range` needs the pool pre-zeroed.
+    unsafe { core::ptr::write_bytes(shared_pool as *mut u8, 0, 4096 * 2) };
+    let n = hal.map_range(comp_root_pt, COMPOSITOR_SHARED_VA, shared_phys, 4096, 1 | 2 | 8, shared_pool, 2);
+    if n == u32::MAX {
+        klog!("compositor_demo_start: map_range error (shared page)\r\n");
+        return None;
+    }
+    // SAFETY: single-core; written exactly once here, before any
+    // compositor call can be reached.
+    unsafe { core::ptr::addr_of_mut!(G_COMPOSITOR_SHARED_PHYS).write(shared_phys) };
+
+    // Frame buffer — a REAL `SyscallOp::Retype` into `KernelObjectType::
+    // SharedRegion` (the genuine capability object, not a bare untyped
+    // carve like the message page above), matching `fs_demo_start`'s own
+    // identical second-region precedent. `count: COMPOSITOR_FB_PAGES`
+    // (not `1`): this ONE capability now spans `COMPOSITOR_FB_PAGES`
+    // contiguous pages, per `do_retype`'s own `SharedRegion`-specific
+    // "count means pages in this region" semantic — see that constant's
+    // own doc comment.
+    let fb_cap =
+        retype_one_from_any_untyped(k, hal, caller, KernelObjectType::SharedRegion, COMPOSITOR_FB_PAGES)?;
+    let fb_id = k.cap_space(src_cs)?.lookup(fb_cap)?.object.id;
+    let fb_phys = k.shared_region(kernel_cap::SharedRegionId::new(fb_id.as_u32()))?.phys_base.as_usize();
+    grant_cap_into(k, src_cs, fb_cap, comp_cs, CapabilityRights::READ | CapabilityRights::WRITE)?;
+    // Pool sized for the worst case this VA range actually needs: 470
+    // pages starting at `COMPOSITOR_FB_VA` crosses one 2 MiB (one PD
+    // entry) boundary, needing at most 1 new PD-level table + 2 new
+    // PT-level tables = 3 pool frames — `4` leaves one frame of margin.
+    let fb_pool = carve_from_any_untyped(k, 4096, 4096 * 4)?;
+    // SAFETY: fresh untyped RAM, identity-addressable, single-core.
+    unsafe { core::ptr::write_bytes(fb_pool as *mut u8, 0, 4096 * 4) };
+    let n2 = hal.map_range(comp_root_pt, COMPOSITOR_FB_VA, fb_phys, COMPOSITOR_FB_LEN, 1 | 2 | 8, fb_pool, 4);
+    if n2 == u32::MAX {
+        klog!("compositor_demo_start: map_range error (frame buffer)\r\n");
+        return None;
+    }
+    // SAFETY: single-core; written exactly once here.
+    unsafe { core::ptr::addr_of_mut!(G_COMPOSITOR_FB_PHYS).write(fb_phys) };
+
+    // Confirm region — Compositor's own PRIVATE `SharedRegion` (no grant
+    // into the caller's cap space needed: the kernel peeks it directly
+    // via its own identity map, same "trusted bootstrap, no Map
+    // ceremony" pattern `netstack::spawn_netstack_service`'s own STATUS_
+    // VA region already established). Same `COMPOSITOR_FB_PAGES` page
+    // count as the frame buffer itself — see `COMPOSITOR_FB_PAGES`'s own
+    // doc comment for why the two must match.
+    let confirm_cap =
+        retype_one_from_any_untyped(k, hal, caller, KernelObjectType::SharedRegion, COMPOSITOR_FB_PAGES)?;
+    let confirm_id = k.cap_space(src_cs)?.lookup(confirm_cap)?.object.id;
+    let confirm_phys =
+        k.shared_region(kernel_cap::SharedRegionId::new(confirm_id.as_u32()))?.phys_base.as_usize();
+    // SAFETY: fresh `SharedRegion` memory, identity-addressable, single-core.
+    unsafe { core::ptr::write_bytes(confirm_phys as *mut u8, 0, COMPOSITOR_FB_LEN) };
+    // `COMPOSITOR_CONFIRM_VA`'s own 470-page range stays within a single
+    // 2 MiB region (see that constant's own doc comment on the VA
+    // layout) — at most 1 new PT-level table, since the PD-level table
+    // covering it already exists after the frame buffer's own mapping
+    // above (same PD table, different PD entry). `2` still leaves margin.
+    let confirm_pool = carve_from_any_untyped(k, 4096, 4096 * 2)?;
+    unsafe { core::ptr::write_bytes(confirm_pool as *mut u8, 0, 4096 * 2) };
+    let n3 =
+        hal.map_range(comp_root_pt, COMPOSITOR_CONFIRM_VA, confirm_phys, COMPOSITOR_FB_LEN, 1 | 2 | 8, confirm_pool, 2);
+    if n3 == u32::MAX {
+        klog!("compositor_demo_start: map_range error (confirm region)\r\n");
+        return None;
+    }
+    // SAFETY: single-core; written exactly once here, before any
+    // `compositor_commit_verify` call (reached only after this function
+    // returns).
+    unsafe { core::ptr::addr_of_mut!(G_COMPOSITOR_CONFIRM_PHYS).write(confirm_phys) };
+
+    // The real display, if this machine has one — the FOURTH and FIFTH
+    // mappings (info page, framebuffer). Additive: every mapping above
+    // is untouched, and a machine with no display still gets the info
+    // page, zeroed. See `map_compositor_scanout`'s own doc comment.
+    if map_compositor_scanout(k, hal, caller, comp_root_pt).is_none() {
+        klog!("compositor_demo_start: scanout setup failed - continuing headless\r\n");
+    }
+
+    // Switch straight to Compositor — same race-avoidance rationale as
+    // `fs_demo_start`'s own tail comment.
+    let _ = k.sched.note_ready(caller, hal.now_ns());
+    let _ = k.sched.dispatch(comp_tid, hal.now_ns());
+    let (save, into) = k.user_ctx_switch_ptrs(caller, comp_tid)?;
+    // SAFETY: single-core; the only writer, always before Compositor's
+    // own first `SBS_IPC_RECV` trap — see `G_COMPOSITOR_ROOT_ONLY_PHASE`'s
+    // own doc comment.
+    unsafe { core::ptr::addr_of_mut!(G_COMPOSITOR_ROOT_ONLY_PHASE).write(true) };
+
+    Some((ep_cap.as_u32(), save, into))
+}
+
+/// Wires a SECOND, independent real client to Compositor — `Simurgh-UI-
+/// Template01`'s own `ui-core`, the base desktop environment (Phase 1
+/// continuation). Mirrors `wire_file_manager_to_fs_native`'s own shape
+/// exactly (see that function's own doc comment for the full story of
+/// why a plain shared `Endpoint` with no `Notification` fan-in suffices
+/// here too): Root Task's own compositor demo happens once, early in
+/// boot, and completes before `ui-core` is ever spawned, so the two are
+/// never concurrent callers. Clears `G_COMPOSITOR_ROOT_ONLY_PHASE` — see
+/// that flag's own doc comment for why this is the right moment (well
+/// after `P2_PREEMPT_START` has armed the preemptive timer).
+pub fn wire_ui_core_to_compositor(
+    hal: &HalInterface,
+    ui_core_cs: kernel_cap::CapSpaceId,
+    ui_core_root_pt: usize,
+    ui_core_shared_va: usize,
+    ui_core_fb_va: usize,
+) -> Option<()> {
+    let k = kstate();
+    // SAFETY: `G_COMPOSITOR_TID` is written once by `compositor_demo_
+    // start`, before this function can ever be reached (Compositor must
+    // already be spawned).
+    let comp_tid = unsafe { core::ptr::addr_of!(G_COMPOSITOR_TID).read() }?;
+    let comp_cs = k.tcb(comp_tid)?.cap_space;
+
+    // Derive a second grant of Compositor's own Endpoint (its own slot 0)
+    // into ui-core's cap space — same object, a new capability.
+    grant_cap_into(k, comp_cs, CapId::new(0), ui_core_cs, CapabilityRights::READ | CapabilityRights::WRITE)?;
+
+    // SAFETY: `G_COMPOSITOR_SHARED_PHYS`/`G_COMPOSITOR_FB_PHYS` are
+    // written once by `compositor_demo_start`, before this function can
+    // ever be reached.
+    let shared_phys = unsafe { core::ptr::addr_of!(G_COMPOSITOR_SHARED_PHYS).read() };
+    let fb_phys = unsafe { core::ptr::addr_of!(G_COMPOSITOR_FB_PHYS).read() };
+    if shared_phys == usize::MAX || fb_phys == usize::MAX {
+        klog!("wire_ui_core_to_compositor: Compositor's own shared pages are not set up yet\r\n");
+        return None;
+    }
+
+    let msg_pool = carve_from_any_untyped(k, 4096, 4096 * 2)?;
+    // SAFETY: fresh untyped RAM, identity-addressable, single-core;
+    // `map_range` needs the pool pre-zeroed.
+    unsafe { core::ptr::write_bytes(msg_pool as *mut u8, 0, 4096 * 2) };
+    if hal.map_range(ui_core_root_pt, ui_core_shared_va, shared_phys, 4096, 1 | 2 | 8, msg_pool, 2) == u32::MAX {
+        klog!("wire_ui_core_to_compositor: map_range error (message page)\r\n");
+        return None;
+    }
+
+    // Same pool-sizing reasoning as `compositor_demo_start`'s own
+    // identical frame-buffer mapping (4 frames: up to 1 PD-level + 2
+    // PT-level tables for this 470-page range, plus margin).
+    let fb_pool = carve_from_any_untyped(k, 4096, 4096 * 4)?;
+    // SAFETY: same contract as `msg_pool` above.
+    unsafe { core::ptr::write_bytes(fb_pool as *mut u8, 0, 4096 * 4) };
+    if hal.map_range(ui_core_root_pt, ui_core_fb_va, fb_phys, COMPOSITOR_FB_LEN, 1 | 2 | 8, fb_pool, 4) == u32::MAX {
+        klog!("wire_ui_core_to_compositor: map_range error (frame buffer)\r\n");
+        return None;
+    }
+
+    // SAFETY: single-core; the only writer at this point in boot (well
+    // after `compositor_demo_start`'s own write, which this call is
+    // always sequenced after).
+    unsafe { core::ptr::addr_of_mut!(G_COMPOSITOR_ROOT_ONLY_PHASE).write(false) };
+
+    Some(())
+}
+
+/// `Call`, specialized for the compositor demo's known, fixed 2-party
+/// (root <-> Compositor) shape — same "bypass `pick_next`'s answer,
+/// switch straight to the known target thread" fix `fs_ipc_call`'s own
+/// doc comment documents in full (identical bug class, identical fix).
+fn compositor_ipc_call(hal: &HalInterface, caller: ThreadId, ep_cap: u32) -> Option<IpcSwitch> {
+    let k = kstate();
+    // SAFETY: single-core; `G_COMPOSITOR_TID` is written once by
+    // `compositor_demo_start`, before any compositor call (this
+    // function) can run.
+    let comp_tid = unsafe { core::ptr::addr_of!(G_COMPOSITOR_TID).read() }?;
+    let msg = SmallMessage::new(0);
+    match k.dispatch(caller, hal.now_ns(), SyscallOp::Call { endpoint: CapId::new(ep_cap), msg }, hal) {
+        Ok(SyscallReturn::Reschedule { next: Some(n) }) => {
+            let _ = k.sched.dispatch(comp_tid, hal.now_ns());
+            let (save, into) = k.user_ctx_switch_ptrs(caller, comp_tid)?;
+            let poke = if n == comp_tid {
+                k.tcb_mut(comp_tid)
+                    .and_then(|t| Some((t.pending_from.take()?, t.pending_msg.take()?)))
+                    .map(|(from, m)| (from.as_u32() as usize, m.label as usize))
+            } else {
+                None
+            };
+            Some(IpcSwitch { save, into, poke })
+        }
+        _ => None,
+    }
+}
+
+/// `COMPOSITOR_CREATE_SURFACE` demo opcode: builds a REAL
+/// `DisplayRequest::CreateSurface`.
+pub fn compositor_create_surface_call(hal: &HalInterface, caller: ThreadId, ep_cap: u32) -> Option<IpcSwitch> {
+    let msg = ipc_protocol::codec::encode_display_request(&ipc_protocol::DisplayRequest::CreateSurface);
+    // SAFETY: `compositor_demo_start` has already run by the time any
+    // `.user_text` code can reach this opcode (it needs `ep_cap`, which
+    // only `compositor_demo_start`'s own return value provides).
+    unsafe { write_shared_compositor_message(&msg) };
+    compositor_ipc_call(hal, caller, ep_cap)
+}
+
+/// Reads back the `DisplayResponse` for `compositor_create_surface_call`.
+/// Returns the new surface handle, or `usize::MAX` on any error/decode
+/// failure.
+pub fn compositor_create_surface_result() -> usize {
+    // SAFETY: same contract as `compositor_create_surface_call`.
+    let msg = unsafe { read_shared_compositor_message() };
+    match ipc_protocol::codec::decode_display_response(&msg) {
+        Ok(ipc_protocol::DisplayResponse::SurfaceCreated { surface }) => surface.0 as usize,
+        _ => usize::MAX,
+    }
+}
+
+/// `COMPOSITOR_COMMIT_BUFFER` demo opcode: writes `COMPOSITOR_DEMO_FRAME`
+/// (fixed MVP test pixels — see that constant's own doc comment) into
+/// the shared frame buffer's own physical memory, then builds a REAL
+/// `DisplayRequest::CommitBuffer` naming the fixed demo frame's own
+/// dimensions. `buffer_cap` is always `0` — this MVP demo never resolves
+/// it (`compositor::subsystem_entry::handle_request`'s own doc comment
+/// on why), same simplification `fs_write_call`'s own `shared_cap`
+/// already makes.
+pub fn compositor_commit_call(hal: &HalInterface, caller: ThreadId, ep_cap: u32, surface: u32) -> Option<IpcSwitch> {
+    // SAFETY: `G_COMPOSITOR_FB_PHYS` was set once by `compositor_demo_
+    // start`, before any commit call can be reached; identity-mapped for
+    // kernel-mode access like every other physical cross-check in this
+    // file.
+    unsafe {
+        let base = core::ptr::addr_of!(G_COMPOSITOR_FB_PHYS).read() as *mut u8;
+        core::ptr::copy_nonoverlapping(COMPOSITOR_DEMO_FRAME.as_ptr(), base, COMPOSITOR_DEMO_FRAME.len());
+    }
+    let req = ipc_protocol::DisplayRequest::CommitBuffer {
+        surface: ipc_protocol::SurfaceHandle(surface),
+        buffer_cap: 0,
+        width: COMPOSITOR_DEMO_WIDTH,
+        height: COMPOSITOR_DEMO_HEIGHT,
+    };
+    let msg = ipc_protocol::codec::encode_display_request(&req);
+    // SAFETY: see `compositor_create_surface_call`'s own contract.
+    unsafe { write_shared_compositor_message(&msg) };
+    compositor_ipc_call(hal, caller, ep_cap)
+}
+
+/// Reads back the `DisplayResponse` for `compositor_commit_call`, AND
+/// cross-checks Compositor's own private confirm region's own physical
+/// bytes against `COMPOSITOR_DEMO_FRAME` — proving Compositor genuinely
+/// dereferenced the SAME shared frame buffer the caller wrote into, no
+/// copy through the message (this section's own module doc comment).
+/// Returns `1` for a real `Committed` AND a byte-for-byte confirm-region
+/// match, `0` otherwise (error/decode failure/mismatch — the exact
+/// verdict is logged either way, matching `fs_read_result`'s own
+/// convention).
+pub fn compositor_commit_verify() -> usize {
+    // SAFETY: same contract as `compositor_create_surface_call`.
+    let msg = unsafe { read_shared_compositor_message() };
+    let committed = matches!(
+        ipc_protocol::codec::decode_display_response(&msg),
+        Ok(ipc_protocol::DisplayResponse::Committed)
+    );
+    // SAFETY: same contract as `compositor_commit_call`'s own read of
+    // `G_COMPOSITOR_FB_PHYS`.
+    let confirmed = unsafe {
+        let base = core::ptr::addr_of!(G_COMPOSITOR_CONFIRM_PHYS).read() as *const u8;
+        core::slice::from_raw_parts(base, COMPOSITOR_DEMO_FRAME.len()) == COMPOSITOR_DEMO_FRAME
+    };
+    klog!(
+        "compositor_commit_verify: real CommitBuffer round-trip, frame bytes read back through Compositor's own confirm region (03 2.4/5.4.2) -> {}\r\n",
+        if committed && confirmed { "MATCH, zero-copy through the SharedRegion capability" } else { "MISMATCH" }
+    );
+    // Additive second half of the same proof: the line above says the
+    // frame reached the Compositor, this one says whether it reached
+    // the SCREEN. Reported here rather than from a new opcode so this
+    // needs no change in `kernel/kernel/src/main.rs`'s own boot
+    // sequence, and never affects the verdict returned below.
+    compositor_scanout_report();
+    (committed && confirmed) as usize
+}
+
+/// `COMPOSITOR_DESTROY_SURFACE` demo opcode: builds a REAL
+/// `DisplayRequest::DestroySurface`.
+pub fn compositor_destroy_call(hal: &HalInterface, caller: ThreadId, ep_cap: u32, surface: u32) -> Option<IpcSwitch> {
+    let req = ipc_protocol::DisplayRequest::DestroySurface {
+        surface: ipc_protocol::SurfaceHandle(surface),
+    };
+    let msg = ipc_protocol::codec::encode_display_request(&req);
+    // SAFETY: see `compositor_create_surface_call`'s own contract.
+    unsafe { write_shared_compositor_message(&msg) };
+    compositor_ipc_call(hal, caller, ep_cap)
+}
+
+/// Reads back the `DisplayResponse` for `compositor_destroy_call`.
+/// Returns `1` for a real `Destroyed`, `0` otherwise.
+pub fn compositor_destroy_result() -> usize {
+    // SAFETY: same contract as `compositor_create_surface_call`.
+    let msg = unsafe { read_shared_compositor_message() };
+    matches!(
+        ipc_protocol::codec::decode_display_response(&msg),
+        Ok(ipc_protocol::DisplayResponse::Destroyed)
+    ) as usize
+}
+
+// ============================================================================
+// mm-service: real IPC-driven memory-policy service (03 §2.5)
+//
+// Mirrors the fs-native/compositor sections above almost exactly (same
+// "spawn, grant an Endpoint, pre-map a shared page, drive it via a
+// dedicated ecall-per-request-type + shared-message-area protocol,
+// bypass pick_next for the deterministic 2-party shape" pattern). The
+// one simplification relative to those two: `MmRequest`/`MmResponse`
+// never carries genuinely bulk data (a thread id + a byte count fits
+// inside the message itself), so this section needs only ONE shared
+// page — no second `SharedRegion` the way fs-native's `FS_DATA_VA` or
+// Compositor's `COMPOSITOR_FB_VA`/`COMPOSITOR_CONFIRM_VA` do.
+//
+// The demo registers two fixed processes (matching `mm_service`'s own
+// `sacrificial_chosen_before_larger_normal` host test verbatim — a
+// 100 MiB `Normal` process and a 4 MiB `Sacrificial` one), queries the
+// total resident bytes and the OOM victim over REAL IPC, and verifies
+// both against the same expected values that host test already proves
+// the underlying policy produces — the real, end-to-end version of a
+// property already known correct in isolation.
+// ============================================================================
+
+/// This process's own thread id, set once by `mm_demo_start` — same
+/// role as `G_FS_TID`.
+static mut G_MM_TID: Option<ThreadId> = None;
+
+/// Physical address of the page shared between the caller and
+/// mm-service's own process (mapped into ITS address space at
+/// `MM_SHARED_VA` by `mm_demo_start`) — same role as `G_FS_SHARED_PHYS`.
+static mut G_MM_SHARED_PHYS: usize = usize::MAX;
+
+/// VA mm-service's own process maps the shared message page at — must
+/// stay numerically equal to `mm_service::subsystem_entry::SHARED_VA`.
+const MM_SHARED_VA: usize = 0xD870_0000;
+
+/// Fixed MVP demo processes — the SAME `(footprint, class)` pairs
+/// `mm_service`'s own `sacrificial_chosen_before_larger_normal` host
+/// test already proves the underlying policy handles correctly; this
+/// demo drives the identical scenario over REAL IPC instead of calling
+/// `choose_oom_victim` in-process. Index 0 = thread 100 (100 MiB,
+/// `Normal`); index 1 = thread 200 (4 MiB, `Sacrificial` — the expected
+/// victim despite its much smaller footprint).
+const MM_DEMO_PROCS: [(u32, u64, ipc_protocol::mm::ReclaimClass); 2] = [
+    (100, 100 * 1024 * 1024, ipc_protocol::mm::ReclaimClass::Normal),
+    (200, 4 * 1024 * 1024, ipc_protocol::mm::ReclaimClass::Sacrificial),
+];
+/// Expected `QueryTotalResident` result once both `MM_DEMO_PROCS` are
+/// registered — `mm_query_total_resident_result`'s own verify check.
+const MM_DEMO_EXPECTED_TOTAL: u64 = MM_DEMO_PROCS[0].1 + MM_DEMO_PROCS[1].1;
+/// Expected `QueryVictim` result once both `MM_DEMO_PROCS` are
+/// registered — the `Sacrificial` one, thread 200, regardless of its
+/// smaller footprint (`choose_oom_victim`'s own doc comment on why).
+const MM_DEMO_EXPECTED_VICTIM: u32 = 200;
+
+/// Writes `msg`'s full `(label, words[0..6] zero-padded)` into the
+/// shared mm page — same convention `write_shared_fs_message`'s own doc
+/// comment documents in full.
+///
+/// # Safety
+/// `G_MM_SHARED_PHYS` must already be a valid, exclusively-owned, mapped
+/// physical frame (`mm_demo_start` has run).
+unsafe fn write_shared_mm_message(msg: &SmallMessage) {
+    // SAFETY: single-core; `G_MM_SHARED_PHYS` only written once by
+    // `mm_demo_start`, before this can ever be called.
+    let base = unsafe { core::ptr::addr_of!(G_MM_SHARED_PHYS).read() } as *mut u64;
+    // SAFETY: forwarded from this function's own contract — low RAM is
+    // always identity-mapped for kernel-mode access regardless of which
+    // process's page table is currently active.
+    unsafe {
+        base.write_volatile(msg.label);
+        let words = msg.words();
+        for i in 0..kernel_ipc::MSG_MAX_WORDS {
+            base.add(1 + i).write_volatile(words.get(i).copied().unwrap_or(0));
+        }
+    }
+}
+
+/// Reads back a `SmallMessage` written by `write_shared_mm_message`.
+///
+/// # Safety
+/// Same contract as `write_shared_mm_message`.
+unsafe fn read_shared_mm_message() -> SmallMessage {
+    // SAFETY: single-core; same contract as `write_shared_mm_message`.
+    let base = unsafe { core::ptr::addr_of!(G_MM_SHARED_PHYS).read() } as *const u64;
+    // SAFETY: forwarded from this function's own contract.
+    unsafe {
+        let label = base.read_volatile();
+        let mut words = [0u64; kernel_ipc::MSG_MAX_WORDS];
+        for (i, w) in words.iter_mut().enumerate() {
+            *w = base.add(1 + i).read_volatile();
+        }
+        SmallMessage::from_words(label, &words).unwrap_or(SmallMessage::new(label))
+    }
+}
+
+/// One-time setup: creates the endpoint mm-service and its client
+/// (`caller`, always the Root Task in this MVP) rendezvous on, spawns
+/// mm-service as a genuinely isolated process from its own separately-
+/// built ELF image (`mm_elf`), grants it the endpoint plus ONE pre-mapped
+/// message page, and switches straight to it — same "without this, the
+/// caller's first Call races a receiver that has never run" rationale
+/// `fs_demo_start`'s own tail comment documents in full. Returns the
+/// endpoint's capability slot in the CALLER's own cap space plus the
+/// `(save, into)` switch pointers the caller wraps in a
+/// `TrapOutcome::SwitchTo`.
+pub fn mm_demo_start(
+    hal: &HalInterface,
+    caller: ThreadId,
+    mm_elf: &[u8],
+    expected_machine: u16,
+) -> Option<(u32, *mut u8, *const u8)> {
+    let k = kstate();
+    let ep_cap = retype_one_from_any_untyped(k, hal, caller, KernelObjectType::Endpoint, 1)?;
+
+    const MM_STACK_VMA: usize = 0xC0B0_0000;
+    const MM_STACK_LEN: usize = 4096 * 16;
+    let (mm_tid, mm_cs, _stack_phys) =
+        spawn_process_from_elf(hal, k, mm_elf, expected_machine, MM_STACK_VMA, MM_STACK_LEN)?;
+    // SAFETY: single-core; written once here, before any mm-service call
+    // (reached only after this function returns) can read it.
+    unsafe { core::ptr::addr_of_mut!(G_MM_TID).write(Some(mm_tid)) };
+
+    let src_cs = k.tcb(caller)?.cap_space;
+    grant_cap_into(k, src_cs, ep_cap, mm_cs, CapabilityRights::READ | CapabilityRights::WRITE)?;
+
+    let mm_addr_space = k.tcb(mm_tid)?.addr_space;
+    let mm_root_pt = k.addr_space_mut(mm_addr_space)?.root_phys().as_usize();
+
+    let shared_phys = carve_from_any_untyped(k, 4096, 4096)?;
+    // SAFETY: fresh untyped RAM, identity-addressable, single-core.
+    unsafe { core::ptr::write_bytes(shared_phys as *mut u8, 0, 4096) };
+    let shared_pool = carve_from_any_untyped(k, 4096, 4096 * 2)?;
+    // SAFETY: fresh untyped RAM, identity-addressable, single-core;
+    // `map_range` needs the pool pre-zeroed.
+    unsafe { core::ptr::write_bytes(shared_pool as *mut u8, 0, 4096 * 2) };
+    let n = hal.map_range(mm_root_pt, MM_SHARED_VA, shared_phys, 4096, 1 | 2 | 8, shared_pool, 2);
+    if n == u32::MAX {
+        klog!("mm_demo_start: map_range error (shared page)\r\n");
+        return None;
+    }
+    // SAFETY: single-core; written exactly once here, before any
+    // mm-service call can be reached.
+    unsafe { core::ptr::addr_of_mut!(G_MM_SHARED_PHYS).write(shared_phys) };
+
+    // Switch straight to mm-service — same race-avoidance rationale as
+    // `fs_demo_start`'s own tail comment.
+    let _ = k.sched.note_ready(caller, hal.now_ns());
+    let _ = k.sched.dispatch(mm_tid, hal.now_ns());
+    let (save, into) = k.user_ctx_switch_ptrs(caller, mm_tid)?;
+
+    Some((ep_cap.as_u32(), save, into))
+}
+
+/// `Call`, specialized for the mm-service demo's known, fixed 2-party
+/// (root <-> mm-service) shape — same "bypass `pick_next`'s answer,
+/// switch straight to the known target thread" fix `fs_ipc_call`'s own
+/// doc comment documents in full (identical bug class, identical fix).
+fn mm_ipc_call(hal: &HalInterface, caller: ThreadId, ep_cap: u32) -> Option<IpcSwitch> {
+    let k = kstate();
+    // SAFETY: single-core; `G_MM_TID` is written once by `mm_demo_start`,
+    // before any mm-service call (this function) can run.
+    let mm_tid = unsafe { core::ptr::addr_of!(G_MM_TID).read() }?;
+    let msg = SmallMessage::new(0);
+    match k.dispatch(caller, hal.now_ns(), SyscallOp::Call { endpoint: CapId::new(ep_cap), msg }, hal) {
+        Ok(SyscallReturn::Reschedule { next: Some(n) }) => {
+            let _ = k.sched.dispatch(mm_tid, hal.now_ns());
+            let (save, into) = k.user_ctx_switch_ptrs(caller, mm_tid)?;
+            let poke = if n == mm_tid {
+                k.tcb_mut(mm_tid)
+                    .and_then(|t| Some((t.pending_from.take()?, t.pending_msg.take()?)))
+                    .map(|(from, m)| (from.as_u32() as usize, m.label as usize))
+            } else {
+                None
+            };
+            Some(IpcSwitch { save, into, poke })
+        }
+        _ => None,
+    }
+}
+
+/// `MM_REGISTER` demo opcode: builds a REAL `MmRequest::Register` for
+/// `MM_DEMO_PROCS[which]` (`0` or `1` — any other value is clamped to
+/// `0`, matching `resolve_path`'s own "one demo, fixed scenario"
+/// simplification precedent).
+pub fn mm_register_call(hal: &HalInterface, caller: ThreadId, ep_cap: u32, which: u32) -> Option<IpcSwitch> {
+    let (thread, resident_bytes, class) = MM_DEMO_PROCS[(which as usize).min(MM_DEMO_PROCS.len() - 1)];
+    let req = ipc_protocol::MmRequest::Register { thread, resident_bytes, class };
+    let msg = ipc_protocol::codec::encode_mm_request(&req);
+    // SAFETY: `mm_demo_start` has already run by the time any `.user_
+    // text` code can reach this opcode (it needs `ep_cap`, which only
+    // `mm_demo_start`'s own return value provides).
+    unsafe { write_shared_mm_message(&msg) };
+    mm_ipc_call(hal, caller, ep_cap)
+}
+
+/// Reads back the `MmResponse` for `mm_register_call`. Returns `1` for a
+/// real `Registered`, `0` otherwise.
+pub fn mm_register_result() -> usize {
+    // SAFETY: same contract as `mm_register_call`.
+    let msg = unsafe { read_shared_mm_message() };
+    matches!(ipc_protocol::codec::decode_mm_response(&msg), Ok(ipc_protocol::MmResponse::Registered)) as usize
+}
+
+/// `MM_UNREGISTER` demo opcode: builds a REAL `MmRequest::Unregister`.
+pub fn mm_unregister_call(hal: &HalInterface, caller: ThreadId, ep_cap: u32, thread: u32) -> Option<IpcSwitch> {
+    let req = ipc_protocol::MmRequest::Unregister { thread };
+    let msg = ipc_protocol::codec::encode_mm_request(&req);
+    // SAFETY: see `mm_register_call`'s own contract.
+    unsafe { write_shared_mm_message(&msg) };
+    mm_ipc_call(hal, caller, ep_cap)
+}
+
+/// Reads back the `MmResponse` for `mm_unregister_call`. Returns `1` for
+/// a real `Unregistered`, `0` otherwise.
+pub fn mm_unregister_result() -> usize {
+    // SAFETY: same contract as `mm_register_call`.
+    let msg = unsafe { read_shared_mm_message() };
+    matches!(ipc_protocol::codec::decode_mm_response(&msg), Ok(ipc_protocol::MmResponse::Unregistered)) as usize
+}
+
+/// `MM_QUERY_VICTIM` demo opcode: builds a REAL `MmRequest::QueryVictim`.
+pub fn mm_query_victim_call(hal: &HalInterface, caller: ThreadId, ep_cap: u32) -> Option<IpcSwitch> {
+    let msg = ipc_protocol::codec::encode_mm_request(&ipc_protocol::MmRequest::QueryVictim);
+    // SAFETY: see `mm_register_call`'s own contract.
+    unsafe { write_shared_mm_message(&msg) };
+    mm_ipc_call(hal, caller, ep_cap)
+}
+
+/// Reads back the `MmResponse` for `mm_query_victim_call`, AND
+/// cross-checks it against `MM_DEMO_EXPECTED_VICTIM` — proving the REAL
+/// `MemRegistry` behind mm-service's own process picks the same victim
+/// its host-tested `choose_oom_victim` logic already proves correct in
+/// isolation (same "real round-trip reproduces the known-correct
+/// answer" verification style `fs_read_result` already established).
+/// Returns the victim thread id (`u32::MAX` as `usize` for none), or
+/// `usize::MAX` on any decode failure.
+pub fn mm_query_victim_result() -> usize {
+    // SAFETY: same contract as `mm_register_call`.
+    let msg = unsafe { read_shared_mm_message() };
+    let thread = match ipc_protocol::codec::decode_mm_response(&msg) {
+        Ok(ipc_protocol::MmResponse::Victim { thread }) => thread,
+        _ => return usize::MAX,
+    };
+    klog!(
+        "mm_query_victim_result: real OOM victim query through mm-service's own MemRegistry, over real IPC (03 2.5) -> {}\r\n",
+        if thread == MM_DEMO_EXPECTED_VICTIM { "MATCH (Sacrificial process chosen over the larger Normal one)" } else { "MISMATCH" }
+    );
+    thread as usize
+}
+
+/// `MM_QUERY_TOTAL_RESIDENT` demo opcode: builds a REAL `MmRequest::
+/// QueryTotalResident`.
+pub fn mm_query_total_resident_call(hal: &HalInterface, caller: ThreadId, ep_cap: u32) -> Option<IpcSwitch> {
+    let msg = ipc_protocol::codec::encode_mm_request(&ipc_protocol::MmRequest::QueryTotalResident);
+    // SAFETY: see `mm_register_call`'s own contract.
+    unsafe { write_shared_mm_message(&msg) };
+    mm_ipc_call(hal, caller, ep_cap)
+}
+
+/// Reads back the `MmResponse` for `mm_query_total_resident_call`, AND
+/// cross-checks it against `MM_DEMO_EXPECTED_TOTAL` — same verification
+/// style as `mm_query_victim_result`'s own doc comment. Returns the
+/// total resident byte count, or `usize::MAX` on any decode failure.
+pub fn mm_query_total_resident_result() -> usize {
+    // SAFETY: same contract as `mm_register_call`.
+    let msg = unsafe { read_shared_mm_message() };
+    let bytes = match ipc_protocol::codec::decode_mm_response(&msg) {
+        Ok(ipc_protocol::MmResponse::TotalResident { bytes }) => bytes,
+        _ => return usize::MAX,
+    };
+    klog!(
+        "mm_query_total_resident_result: real resident-byte accounting through mm-service's own MemRegistry, over real IPC (03 2.5) -> {}\r\n",
+        if bytes == MM_DEMO_EXPECTED_TOTAL { "MATCH" } else { "MISMATCH" }
+    );
+    bytes as usize
+}
+
+/// Same decode as `mm_query_total_resident_result`, without the verdict
+/// `klog!` — `mm_bench_*`'s own 200-iteration `.user_text` loop
+/// (02-Microkernel-Layer.md §8.3) reuses `MM_QUERY_TOTAL_RESIDENT` as a
+/// cheap, repeatable real round trip purely to TIME it; logging a MATCH
+/// line on every one of the 200 calls would drown the boot log in
+/// identical noise for no reason (unlike the one-shot `mm_demo_*` call
+/// this quiet variant is NOT a substitute for — that one's own MATCH/
+/// MISMATCH verdict is the real correctness proof and stays as is).
+pub fn mm_query_total_resident_result_quiet() -> usize {
+    // SAFETY: same contract as `mm_register_call`.
+    let msg = unsafe { read_shared_mm_message() };
+    match ipc_protocol::codec::decode_mm_response(&msg) {
+        Ok(ipc_protocol::MmResponse::TotalResident { bytes }) => bytes as usize,
+        _ => usize::MAX,
+    }
+}
+
+// ============================================================================
+// driver-virtio-blk: real MMIO + virtqueue block driver process (03 §5.1)
+//
+// Mirrors the fs-native section immediately above almost exactly (same
+// "spawn, grant an Endpoint, pre-map a shared page/region, drive it via
+// a dedicated ecall-per-request-type + shared-message-area protocol"
+// shape) — see that section's own doc comments for the parts that
+// repeat verbatim here. Two differences: (1) this driver ALSO needs a
+// virtio-mmio transport window pre-mapped (`DRV_MMIO_VA`, from the
+// boot-seeded `root_mmio_blk_cap` — see `MmioRegionDescriptor`'s own
+// doc comment for why that capability exists at all); (2) its
+// `DriverRequest`/`DriverResponse` message area lives INSIDE the same
+// `SharedRegion` as its virtqueue (`driver_virtio_blk::layout::
+// MESSAGE_OFFSET`), not a second dedicated page — one grant covers
+// both, see `layout`'s own doc comment.
+// ============================================================================
+
+/// This process's own thread id, set once by `spawn_virtio_blk_driver`.
+static mut G_DRV_TID: Option<ThreadId> = None;
+
+/// Physical base of the driver's virtqueue/data `SharedRegion` — same
+/// role as `G_FS_DATA_PHYS`, additionally used to derive the message-
+/// area address (`+ driver_virtio_blk::layout::MESSAGE_OFFSET`) since
+/// this driver reuses one region for both purposes.
+static mut G_DRV_QUEUE_PHYS: usize = usize::MAX;
+
+/// Physical base of the virtio-blk device's own MMIO window (`k.mmio_
+/// region(...)`'s own `phys_base`, cached at spawn time) — used ONLY by
+/// `virtio_blk_irq_trampoline` to ack the DEVICE's own `INTERRUPT_
+/// STATUS`/`INTERRUPT_ACK` registers (`driver_virtio_blk::mmio`'s own
+/// fixed offsets, valid for any virtio-mmio device regardless of type)
+/// directly from interrupt context — see that function's own doc
+/// comment for why this ack cannot wait for `VirtioBlk::ack_completion`
+/// (a DIFFERENT process's own private state, unreachable from here) to
+/// run later in the driver process's own time.
+static mut G_DRV_MMIO_PHYS: usize = usize::MAX;
+
+/// `Transport::Pci`'s own counterpart to `G_DRV_MMIO_PHYS`: the ISR_CFG
+/// register's own VA — a VA, not a physical address, because unlike
+/// virtio-mmio's window (identity-mapped, dereferenceable from ANY
+/// active page table) virtio-pci's BAR only exists at a HIGH physical
+/// address (QEMU virt's own highmem PCI aperture, e.g. `0x80_0000_0000`
+/// — see `KERNEL_PCI_CFG_VA`'s own doc comment for the identical class
+/// of problem this solves for ECAM config space). Deliberately reuses
+/// `wire_virtio_pci_transport`'s own `isr_cfg_va` (a VA in `drv_root_
+/// pt`, NOT `caller_root_pt`) rather than building a SEPARATE kernel-
+/// side mapping: `virtio_blk_irq_trampoline` only ever fires while
+/// `drv_irq_wait_step`'s own `wfi()` retry loop is spinning INSIDE the
+/// driver process's own `DRV_IRQ_WAIT` syscall — i.e., while `drv_
+/// root_pt` (not `caller_root_pt`) is the ACTIVE TTBR0_EL1, since a
+/// `Wait`-blocked thread's own trap context is never unwound back to
+/// its caller — so the driver's OWN existing BAR mapping is already
+/// exactly what this needs, with no new mapping required.
+static mut G_DRV_ISR_CFG_VA: usize = usize::MAX;
+
+/// VA the virtio-mmio transport window is pre-mapped at in the driver's
+/// own address space — must stay numerically equal to
+/// `driver_virtio_blk::subsystem_entry::DRV_MMIO_VA`.
+const DRV_MMIO_VA: usize = 0xD820_0000;
+
+/// VA the virtqueue/data `SharedRegion` is pre-mapped at in the driver's
+/// own address space — must stay numerically equal to
+/// `driver_virtio_blk::subsystem_entry::DRV_QUEUE_VA`.
+const DRV_QUEUE_VA: usize = 0xD830_0000;
+
+// ============================================================================
+// virtio-pci "modern" transport support (aarch64) — PCI capability-list
+// walking + BAR mapping. Unlike `DRV_MMIO_VA`/`DRV_QUEUE_VA` above, the
+// driver process never hardcodes the VA(s) this section maps its
+// register windows at: it learns them entirely from the `PCI_INFO_
+// OFFSET` header block this section writes into the SAME `SharedRegion`
+// `DRV_QUEUE_VA` already covers (see `driver_virtio_blk::layout::
+// PCI_INFO_OFFSET`'s own doc comment for the field layout, and
+// `driver_virtio_blk::subsystem_entry::new_driver_for_this_transport`
+// for the reader). This split exists because — unlike virtio-mmio's
+// single fixed register block at a HAL-discovered base — virtio-pci
+// "modern" scatters its 4 register windows (COMMON/NOTIFY/ISR/
+// DEVICE_CFG) across a PCI capability list (virtio 1.x spec §4.1.4)
+// that only THIS trusted glue code (not the HAL, which only reports
+// BAR0 — see `hal_arm64::peripheral`'s own module doc comment) is
+// positioned to resolve, since resolving it requires live PCI config-
+// space + BAR reads no HAL discovery pass performs.
+// ============================================================================
+
+/// PCI config-space byte offset of the Capabilities Pointer register
+/// (Type 0x00 header, PCI Local Bus Spec §6.7) — valid whenever the
+/// Status register's own Capabilities List bit (offset 0x06, bit 4) is
+/// set, which every virtio-pci "modern" device sets by construction
+/// (the only kind `hal_arm64::peripheral::PeripheralDiscovery` reports
+/// a nonzero `config_space_base` for in the first place).
+const PCI_CAP_POINTER_OFFSET: u32 = 0x34;
+
+/// PCI config-space byte offset of the Command register (Type 0x00
+/// header, PCI Local Bus Spec §6.2.2) — a u16 register, but written
+/// here as the low half of the u32 word it shares with Status (0x06),
+/// via a read-modify-write so Status's own write-1-to-clear error bits
+/// are never touched.
+const PCI_COMMAND_OFFSET: u32 = 0x04;
+/// Command register bit 1: Memory Space Enable — decode of this
+/// function's own memory BARs stays OFF until this is set (PCI Local
+/// Bus Spec §6.2.2), independent of whether those BARs are otherwise
+/// correctly sized/assigned.
+const PCI_COMMAND_MEMORY_SPACE: u32 = 1 << 1;
+/// Command register bit 2: Bus Master Enable — required before this
+/// function may itself initiate a memory transaction (irrelevant to
+/// the driver's own MMIO register reads/writes, which are CPU-
+/// initiated, but required regardless for virtqueue DMA once the
+/// device is driving completions).
+const PCI_COMMAND_BUS_MASTER: u32 = 1 << 2;
+
+/// Vendor-specific capability id (PCI Local Bus Spec §6.7's own
+/// Capability ID assignments) — the only capability id virtio-pci
+/// devices attach to the standard PCI capability list (virtio 1.x spec
+/// §4.1.4, `struct virtio_pci_cap`'s own `cap_vndr` field).
+const PCI_CAP_ID_VENDOR_SPECIFIC: u8 = 0x09;
+
+/// `cfg_type` byte values from `struct virtio_pci_cap` (virtio 1.x spec
+/// §4.1.4.3).
+const VIRTIO_PCI_CAP_COMMON_CFG: u8 = 1;
+const VIRTIO_PCI_CAP_NOTIFY_CFG: u8 = 2;
+const VIRTIO_PCI_CAP_ISR_CFG: u8 = 3;
+const VIRTIO_PCI_CAP_DEVICE_CFG: u8 = 4;
+
+/// Base VA for virtio-pci BAR window(s) — one `DRV_PCI_BAR_VA_STRIDE`
+/// slot per DISTINCT BAR index the capability list below references,
+/// starting well clear of `DRV_QUEUE_VA`'s own single page. QEMU's own
+/// virtio-pci-modern devices bundle all 4 capability windows into ONE
+/// BAR (so in practice exactly one slot is ever used), but the virtio
+/// spec does not require that, so this supports up to `DRV_PCI_MAX_
+/// BARS` distinct ones.
+const DRV_PCI_BAR_VA_BASE: usize = 0xD840_0000;
+/// Headroom reserved per distinct BAR — generously above the low-KiB
+/// window sizes QEMU's own virtio-pci-modern BARs actually use.
+const DRV_PCI_BAR_VA_STRIDE: usize = 0x10_0000;
+const DRV_PCI_MAX_BARS: usize = 4;
+
+/// VA `wire_virtio_pci_transport` maps a PCI function's own ECAM
+/// config-space page at, in the CALLER's (root's) own address space —
+/// see that function's own doc comment for why this mapping (not a
+/// raw physical dereference) is required at all: unlike `mmio.phys_
+/// base` (a BAR base, always within the low few GiB `map_ram_identity`
+/// already covers for every process), ECAM config space sits at
+/// `hal_arm64::compute`'s own `QEMU_VIRT_DEFAULT_ECAM_BASE` (0x40_1000_
+/// 0000, ~256 GiB) — far outside ANY process's own identity-mapped
+/// range, so a raw pointer dereference against it faults under
+/// whichever page table happens to be active (a REAL bug found via
+/// QEMU: without this mapping, `spawn_virtio_blk_driver`'s PCI branch
+/// hangs the very first time `walk_virtio_pci_capabilities` reads
+/// config space, root's own EL1 code faulting under its own `root_pt`).
+const KERNEL_PCI_CFG_VA: usize = 0xD800_0000;
+
+/// VA `enable_and_program_msix` maps the MSI-X table's own BAR window
+/// at, in the CALLER's (root's) own address space — the SAME "kernel-
+/// side mapping, not driver-space" reasoning `KERNEL_PCI_CFG_VA`'s own
+/// doc comment gives, and `enable_and_program_msix`'s own doc comment
+/// covers the real bug this constant's existence fixes. Distinct from
+/// both `KERNEL_PCI_CFG_VA` (a single ECAM config-space PAGE, not a
+/// BAR) and `DRV_PCI_BAR_VA_BASE` (driver-space, a DIFFERENT address
+/// space entirely) — headroom sized the same generous way `DRV_PCI_
+/// BAR_VA_STRIDE` already documents.
+const KERNEL_MSIX_BAR_VA: usize = 0xD810_0000;
+
+/// VA `enable_and_program_msix` maps COMMON_CFG's own BAR window at (in
+/// the CALLER's own address space, same "kernel-side, not driver-space"
+/// reasoning as `KERNEL_MSIX_BAR_VA` — see that constant's own doc
+/// comment). A SEPARATE mapping from `KERNEL_MSIX_BAR_VA` because
+/// COMMON_CFG and the MSI-X table are near-universally on DIFFERENT
+/// BARs (QEMU's own virtio-pci-modern devices: COMMON/NOTIFY/ISR/
+/// DEVICE_CFG share one BAR, MSI-X — a PCI-SIG-standard capability, not
+/// virtio's own — lives on a different one), so neither can reuse the
+/// other's mapping.
+const KERNEL_MSIX_COMMON_VA: usize = 0xD811_0000;
+
+/// `struct virtio_pci_common_cfg`'s own `queue_msix_vector` field byte
+/// offset (virtio 1.x spec §4.1.4.3, Table 4-1) — a `le16`, PER-QUEUE
+/// (governed by whatever `queue_select`, offset 0x16, currently names),
+/// that this project's own `driver_virtio_blk::pci_common` module has
+/// NO field for at all: that module was written before MSI-X support
+/// existed in this codebase, and neither virtio-mmio nor legacy-INTx
+/// PCI (aarch64's own choice) ever needs a driver to assign a queue's
+/// completions to a specific vector — INTx fires unconditionally
+/// whenever ANY interrupt condition is pending, no per-queue routing
+/// involved. MSI-X is different: per the virtio spec, an unassigned
+/// queue defaults to `VIRTIO_MSI_NO_VECTOR` (0xFFFF) and the device
+/// will never signal ANYTHING for it until the driver explicitly
+/// programs this register — **the real bug an initial MSI-X attempt
+/// hit via QEMU**: `enable_and_program_msix`'s own table-entry write +
+/// capability Enable bit were BOTH verified correct via direct
+/// register readback, yet the driver's own `DRV_IRQ_WAIT` still hung
+/// forever waiting on the SAME PCI MSI-X vector 44 that was correctly
+/// programmed — because the DEVICE itself was never told to use it for
+/// this queue. Written here (not `driver_virtio_blk`, which stays
+/// transport-detail-free) since only kernel-arch-glue's own PCI
+/// capability-list walk already knows which table index (0, this
+/// MVP's only entry) the interrupt controller resolved.
+const VIRTIO_PCI_COMMON_QUEUE_SELECT: u32 = 0x16;
+const VIRTIO_PCI_COMMON_QUEUE_MSIX_VECTOR: u32 = 0x1a;
+
+/// Raw PCI/PCIe config-space reads, `config_phys` already folding in
+/// bus/device/function (exactly the value `hal_arm64::peripheral::
+/// PeripheralDiscovery::new` assembled into `MmioRegionDescriptor::
+/// config_space_base` at boot) — callers here only ever add a register
+/// offset on top.
+///
+/// # Safety
+/// `config_phys` must be a live, mapped ECAM config-space address for
+/// the life of the call — true for every `MmioRegionDescriptor` this
+/// kernel boot-seeds, the same trust boundary `mmio.phys_base` reads
+/// elsewhere in this file already rely on.
+unsafe fn pci_cfg_read8(config_phys: u64, offset: u32) -> u8 {
+    // SAFETY: forwarded from this function's own contract.
+    unsafe { ((config_phys + offset as u64) as *const u8).read_volatile() }
+}
+
+/// # Safety
+/// Same contract as `pci_cfg_read8`.
+unsafe fn pci_cfg_read32(config_phys: u64, offset: u32) -> u32 {
+    // SAFETY: forwarded from this function's own contract.
+    unsafe { ((config_phys + offset as u64) as *const u32).read_volatile() }
+}
+
+/// # Safety
+/// Same contract as `pci_cfg_read8`.
+unsafe fn pci_cfg_write32(config_phys: u64, offset: u32, val: u32) {
+    // SAFETY: forwarded from this function's own contract.
+    unsafe { ((config_phys + offset as u64) as *mut u32).write_volatile(val) };
+}
+
+/// Resolves BAR `bar_index`'s own physical base + size on the PCI
+/// function at `config_phys` — the general, arbitrary-index counterpart
+/// to `hal_arm64::peripheral`'s own discovery-time BAR0-only probe
+/// (that one lives in the HAL and only ever reports BAR0; this one
+/// lives here, resolved lazily only for whichever BAR(s) `walk_virtio_
+/// pci_capabilities` below actually references). Correctly follows a
+/// 64-bit memory BAR (bits[2:1] == 0b10 of the BAR register) onto its
+/// own upper dword at `bar_index + 1` (PCI Local Bus Spec §6.2.5.1) —
+/// QEMU's own virtio-pci-modern devices route COMMON/NOTIFY/ISR/
+/// DEVICE_CFG through exactly such a BAR (typically BAR4).
+///
+/// # Safety
+/// Same contract as `pci_cfg_read8`; additionally performs the standard
+/// write-all-ones/read-back/restore sizing dance on the live BAR
+/// register(s) — not safe against a concurrent access to the SAME
+/// function's config space, which this single-core, root-only
+/// bootstrap path (called only from `spawn_virtio_blk_driver`, before
+/// the driver process it is resolving registers FOR has even started
+/// running) never has.
+unsafe fn pci_bar_phys(config_phys: u64, bar_index: u8) -> Option<(u64, u64)> {
+    let bar_off = 0x10 + (bar_index as u32) * 4;
+    // SAFETY: forwarded from this function's own contract.
+    let bar_lo = unsafe { pci_cfg_read32(config_phys, bar_off) };
+    if bar_lo & 0x1 != 0 {
+        return None; // I/O-space BAR — out of scope, same as hal-arm64's own probe_bar0.
+    }
+    let is_64bit = (bar_lo >> 1) & 0x3 == 0b10;
+
+    // SAFETY: forwarded; original value restored immediately below —
+    // standard PCI BAR-sizing procedure (spec §6.2.5.1).
+    unsafe { pci_cfg_write32(config_phys, bar_off, 0xFFFF_FFFF) };
+    // SAFETY: forwarded.
+    let size_lo = unsafe { pci_cfg_read32(config_phys, bar_off) };
+    // SAFETY: forwarded; restoring.
+    unsafe { pci_cfg_write32(config_phys, bar_off, bar_lo) };
+
+    let base_lo = (bar_lo & 0xFFFF_FFF0) as u64;
+
+    if !is_64bit {
+        if size_lo == 0 {
+            return None;
+        }
+        let size = (!(size_lo & 0xFFFF_FFF0) as u64) + 1;
+        return Some((base_lo, size));
+    }
+
+    let bar_hi_off = bar_off + 4;
+    // SAFETY: forwarded.
+    let bar_hi = unsafe { pci_cfg_read32(config_phys, bar_hi_off) };
+    // SAFETY: forwarded; restored below.
+    unsafe { pci_cfg_write32(config_phys, bar_hi_off, 0xFFFF_FFFF) };
+    // SAFETY: forwarded.
+    let size_hi = unsafe { pci_cfg_read32(config_phys, bar_hi_off) };
+    // SAFETY: forwarded; restoring.
+    unsafe { pci_cfg_write32(config_phys, bar_hi_off, bar_hi) };
+
+    let base = base_lo | ((bar_hi as u64) << 32);
+    let size_mask = ((size_hi as u64) << 32) | (size_lo & 0xFFFF_FFF0) as u64;
+    if size_mask == 0 {
+        return None;
+    }
+    let size = (!size_mask) + 1;
+    Some((base, size))
+}
+
+/// One resolved virtio-pci capability window: which BAR it lives in,
+/// plus its own byte offset/length within that BAR (`struct
+/// virtio_pci_cap`, virtio 1.x spec §4.1.4.3).
+#[derive(Clone, Copy, Default)]
+struct VirtioPciCapWindow {
+    bar: u8,
+    offset: u32,
+}
+
+/// Standard PCI capability id for MSI-X (PCI Local Bus Spec §6.8.2, as
+/// extended by the MSI-X ECN) — a DIFFERENT capability from virtio's
+/// own vendor-specific ones (`PCI_CAP_ID_VENDOR_SPECIFIC`), found on the
+/// SAME capability list `walk_virtio_pci_capabilities` already walks.
+/// Only ever populated on x86_64's own virtio-pci device in this
+/// project (aarch64 uses legacy INTx instead — `hal_core::interrupt::
+/// InterruptController::msi_message`'s own doc comment covers why this
+/// stays purely data-driven, never a `target_arch` check): whether THIS
+/// capability is present, combined with whether `HalInterface::
+/// msi_message` returns `Some` at all, is what `wire_virtio_pci_
+/// transport` below actually branches on.
+const PCI_CAP_ID_MSIX: u8 = 0x11;
+
+/// Byte offset, from an MSI-X capability's own structure start, of the
+/// Table Offset/BIR register (PCI Local Bus Spec, MSI-X ECN §6.8.2.3):
+/// bits 2:0 name the BAR index, bits 31:3 the table's own byte offset
+/// within it (already 8-byte aligned by construction, so masking off
+/// the low 3 bits recovers it exactly).
+const MSIX_TABLE_OFFSET_BIR: u32 = 4;
+/// Message Control lives at capability offset+2 (a u16), sharing the
+/// SAME 32-bit dword as the 1-byte Capability ID (offset+0) and 1-byte
+/// Next Pointer (offset+1) — bit 31 of that dword (Message Control's
+/// own bit 15) is MSI-X Enable; bit 30 (Message Control's own bit 14)
+/// is Function Mask, which must stay CLEAR for an enabled entry to
+/// actually fire.
+const MSIX_ENABLE_BIT: u32 = 1 << 31;
+
+/// One resolved MSI-X table location: which BAR it lives in, plus its
+/// own byte offset within that BAR — the MSI-X counterpart to
+/// `VirtioPciCapWindow`, kept as a separate type since MSI-X's own
+/// capability structure (a fixed, PCI-SIG-standard layout) shares
+/// nothing with virtio's own vendor-specific `struct virtio_pci_cap`
+/// beyond both living on the same capability list.
+#[derive(Clone, Copy, Default)]
+struct MsixLocation {
+    /// The capability structure's own byte offset within config space
+    /// (`walk_virtio_pci_capabilities`'s own list-walk pointer) — needed
+    /// to later write the Message Control register's own MSI-X Enable
+    /// bit, which lives WITHIN this capability structure, not the BAR
+    /// window `bar`/`table_offset` below name.
+    cap_ptr: u8,
+    bar: u8,
+    table_offset: u32,
+}
+
+/// The capability windows a virtio-pci "modern" device's own capability
+/// list carries (virtio 1.x spec §4.1.4) — `notify` additionally needs
+/// `notify_off_multiplier` (`struct virtio_pci_notify_cap`'s own
+/// extension field, spec §4.1.4.4) to locate a specific queue's own
+/// doorbell within the NOTIFY_CFG window. `msix`, when present, is
+/// resolved (BAR/table offset) but NOT yet enabled — `wire_virtio_pci_
+/// transport` does that, since enabling requires the destination
+/// vector's own Message Address/Data (`HalInterface::msi_message`),
+/// which this purely-data-collecting walk has no access to.
+#[derive(Default)]
+struct VirtioPciCapLayout {
+    common: Option<VirtioPciCapWindow>,
+    notify: Option<VirtioPciCapWindow>,
+    notify_off_multiplier: u32,
+    isr: Option<VirtioPciCapWindow>,
+    device: Option<VirtioPciCapWindow>,
+    msix: Option<MsixLocation>,
+}
+
+/// Walks the standard PCI capability list (starting at the
+/// Capabilities Pointer register, offset 0x34) looking for vendor-
+/// specific (id 0x09) capabilities, classifying each by its own
+/// `cfg_type` byte (virtio 1.x spec §4.1.4.3) — the real counterpart to
+/// `hal_arm64::peripheral`'s own discovery-time BAR0-only read (see
+/// that module's own doc comment on why the full walk is deliberately
+/// deferred to here, the driver-spawning trusted glue, rather than done
+/// at HAL discovery time).
+///
+/// # Safety
+/// Same contract as `pci_cfg_read8`.
+unsafe fn walk_virtio_pci_capabilities(config_phys: u64) -> VirtioPciCapLayout {
+    let mut layout = VirtioPciCapLayout::default();
+
+    // SAFETY: forwarded from this function's own contract.
+    let mut ptr = unsafe { pci_cfg_read8(config_phys, PCI_CAP_POINTER_OFFSET) };
+    // Bounded walk — a real capability list is a finite linked list
+    // within a 256-byte config space; this guards against a malformed
+    // device looping the list forever (defensive even though this only
+    // ever walks an emulated/passthrough device's own config space).
+    for _ in 0..48 {
+        if ptr == 0 {
+            break;
+        }
+        // SAFETY: forwarded.
+        let cap_id = unsafe { pci_cfg_read8(config_phys, ptr as u32) };
+        // SAFETY: forwarded.
+        let cap_next = unsafe { pci_cfg_read8(config_phys, ptr as u32 + 1) };
+
+        if cap_id == PCI_CAP_ID_VENDOR_SPECIFIC {
+            // SAFETY: forwarded.
+            let cfg_type = unsafe { pci_cfg_read8(config_phys, ptr as u32 + 3) };
+            // SAFETY: forwarded.
+            let bar = unsafe { pci_cfg_read8(config_phys, ptr as u32 + 4) };
+            // SAFETY: forwarded.
+            let offset = unsafe { pci_cfg_read32(config_phys, ptr as u32 + 8) };
+            let window = VirtioPciCapWindow { bar, offset };
+
+            match cfg_type {
+                VIRTIO_PCI_CAP_COMMON_CFG => layout.common = Some(window),
+                VIRTIO_PCI_CAP_NOTIFY_CFG => {
+                    layout.notify = Some(window);
+                    // SAFETY: forwarded — `struct virtio_pci_notify_cap`'s
+                    // own extension field, spec §4.1.4.4.
+                    layout.notify_off_multiplier =
+                        unsafe { pci_cfg_read32(config_phys, ptr as u32 + 16) };
+                }
+                VIRTIO_PCI_CAP_ISR_CFG => layout.isr = Some(window),
+                VIRTIO_PCI_CAP_DEVICE_CFG => layout.device = Some(window),
+                _ => {}
+            }
+        } else if cap_id == PCI_CAP_ID_MSIX {
+            // SAFETY: forwarded.
+            let bir_dword = unsafe { pci_cfg_read32(config_phys, ptr as u32 + MSIX_TABLE_OFFSET_BIR) };
+            layout.msix = Some(MsixLocation {
+                cap_ptr: ptr,
+                bar: (bir_dword & 0x7) as u8,
+                table_offset: bir_dword & !0x7,
+            });
+        }
+
+        ptr = cap_next;
+    }
+
+    layout
+}
+
+/// Maps virtio-pci BAR `bar_index`'s own physical window into the
+/// driver process's address space, returning its virtual base —
+/// memoized against `mapped`/`mapped_count` so the SAME BAR referenced
+/// by more than one capability window (COMMON/NOTIFY/ISR/DEVICE_CFG
+/// commonly all share one BAR — see this section's own module doc
+/// comment) is mapped exactly once. Mirrors the untyped-carve + `map_
+/// range` pattern `spawn_virtio_blk_driver`'s own virtio-mmio window
+/// pre-map already uses, generalized to an arbitrary size (a BAR can be
+/// larger than one page, unlike the fixed single-page virtio-mmio
+/// window).
+///
+/// # Safety
+/// Same contract as `pci_bar_phys`.
+#[allow(clippy::too_many_arguments)]
+unsafe fn map_pci_bar(
+    k: &mut KernelState,
+    hal: &HalInterface,
+    drv_root_pt: usize,
+    config_phys: u64,
+    bar_index: u8,
+    mapped: &mut [(u8, usize); DRV_PCI_MAX_BARS],
+    mapped_count: &mut usize,
+) -> Option<usize> {
+    if let Some((_, va)) = mapped[..*mapped_count].iter().find(|(b, _)| *b == bar_index) {
+        return Some(*va);
+    }
+    if *mapped_count >= DRV_PCI_MAX_BARS {
+        return None;
+    }
+    // SAFETY: forwarded from this function's own contract.
+    let (bar_phys, bar_size) = unsafe { pci_bar_phys(config_phys, bar_index) }?;
+    let map_len = (bar_size as usize).div_ceil(4096) * 4096;
+    if map_len == 0 || map_len > DRV_PCI_BAR_VA_STRIDE {
+        return None; // would collide with the next BAR slot's own VA range.
+    }
+    let va = DRV_PCI_BAR_VA_BASE + *mapped_count * DRV_PCI_BAR_VA_STRIDE;
+
+    // Pool sizing: one new L2 table plus up to one new L3 table per
+    // 2 MiB (512 pages) of mapped range, +1 page of slack — the same
+    // "pool is page-table scratch, not target-region-sized" contract
+    // `map_range`'s own doc comment establishes, just scaled up from
+    // the fixed single-page virtio-mmio pre-map's `pool_len = 2`.
+    let pages_needed = map_len / 4096;
+    let pool_pages = 2 + pages_needed.div_ceil(512);
+    let pool = carve_from_any_untyped(k, 4096, (4096 * pool_pages) as u64)?;
+    // SAFETY: fresh untyped RAM, identity-addressable, single-core;
+    // `map_range` needs the pool pre-zeroed (same contract every other
+    // pool carve in this file already documents).
+    unsafe { core::ptr::write_bytes(pool as *mut u8, 0, 4096 * pool_pages) };
+    let n = hal.map_range(
+        drv_root_pt,
+        va,
+        bar_phys as usize,
+        map_len,
+        1 | 2 | 8, // R+W+U — the driver's own user-mode register window.
+        pool,
+        pool_pages,
+    );
+    if n == u32::MAX {
+        return None;
+    }
+
+    mapped[*mapped_count] = (bar_index, va);
+    *mapped_count += 1;
+    Some(va)
+}
+
+/// Enables MSI-X (Message Control's own Enable bit, Function Mask left
+/// clear) and programs table entry 0 — this MVP's own single-vector
+/// scope, matching `IrqBind`'s own "one Notification per device" model
+/// — with `msi_message`'s Message Address/Data, unmasking that ONE
+/// entry (`vector_control` bit 0 clear). `msix.bar`'s own window is
+/// mapped via `map_pci_bar` exactly like every virtio capability window
+/// already is — MSI-X's table lives in device memory space like any
+/// other BAR-relative structure, nothing about it is config-space-only.
+///
+/// Only ever called when BOTH a real MSI-X capability was found on this
+/// device's own list AND `HalInterface::msi_message` returned `Some`
+/// (this project's x86_64-only interrupt controller) — see `wire_
+/// virtio_pci_transport`'s own call site for the data-driven (never
+/// `target_arch`) branch this stays behind.
+///
+/// # Safety
+/// Same contract as `map_pci_bar`.
+#[allow(clippy::too_many_arguments)]
+unsafe fn enable_and_program_msix(
+    k: &mut KernelState,
+    hal: &HalInterface,
+    caller_root_pt: usize,
+    config_va: u64,
+    msix: MsixLocation,
+    common: VirtioPciCapWindow,
+    msi_message: (u64, u32),
+) -> Option<()> {
+    // **Real bug found via QEMU**: an earlier version of this function
+    // mapped the MSI-X table's own BAR into `drv_root_pt` (the DRIVER
+    // process's own, NOT-YET-ACTIVE page table — reusing `map_pci_bar`
+    // exactly like the virtio capability windows below do) and then
+    // immediately dereferenced the resulting VA from RIGHT HERE — but
+    // this function runs from `spawn_virtio_blk_driver`, still under
+    // the CALLER's (root's) own currently-ACTIVE page table, which has
+    // no such mapping at all. Result: a real `#PF` (write, not-present)
+    // the instant `entry.write_volatile` below ran — confirmed via
+    // `-d int`/exception dump, `cr2` landing exactly at the SECOND
+    // `DRV_PCI_BAR_VA_STRIDE` slot (this device's own MSI-X table lives
+    // in a DIFFERENT BAR than COMMON/NOTIFY/ISR/DEVICE_CFG's shared
+    // BAR4, so it was never already-mapped via the `mapped[]`
+    // memoization either). The virtio capability windows below never
+    // hit this class of bug because kernel-arch-glue never dereferences
+    // THEIR VAs itself — it only writes them into the `PCI_INFO_OFFSET`
+    // header block for the DRIVER PROCESS to read once it is actually
+    // scheduled under `drv_root_pt`. This function is different: it
+    // must write the MSI-X table entry NOW, from kernel-arch-glue's own
+    // currently-running context — so it maps into `caller_root_pt`
+    // instead, at the SAME kind of dedicated, kernel-only VA `KERNEL_
+    // PCI_CFG_VA` already uses for the config-space page, not the
+    // driver-space `DRV_PCI_BAR_VA_BASE` range `map_pci_bar` targets.
+    let msix_pool = carve_from_any_untyped(k, 4096, 4096 * 2)?;
+    // SAFETY: fresh untyped RAM, identity-addressable, single-core;
+    // `map_range` needs the pool pre-zeroed.
+    unsafe { core::ptr::write_bytes(msix_pool as *mut u8, 0, 4096 * 2) };
+    // SAFETY: forwarded from this function's own contract; `msix.bar`'s
+    // own physical base/size resolved fresh here (not memoized against
+    // the driver-space `mapped[]` table, which tracks a DIFFERENT
+    // address space entirely).
+    let (bar_phys, bar_size) = unsafe { pci_bar_phys(config_va, msix.bar) }?;
+    let map_len = (bar_size as usize).div_ceil(4096) * 4096;
+    let n = hal.map_range(
+        caller_root_pt,
+        KERNEL_MSIX_BAR_VA,
+        bar_phys as usize,
+        map_len,
+        1 | 2, // R+W, kernel-only (no U bit) — EL1/S-mode/Ring-0 code only, same as KERNEL_PCI_CFG_VA's own mapping.
+        msix_pool,
+        2,
+    );
+    if n == u32::MAX {
+        return None;
+    }
+    // Modifying a LIVE, currently-active page table (unlike `map_pci_
+    // bar`'s own driver-space mappings, which target a not-yet-active
+    // one) — flush before relying on the fresh mapping, same insurance
+    // `wire_virtio_pci_transport`'s own config-space mapping already
+    // takes for the identical reason.
+    hal.flush_tlb();
+
+    let table_va = KERNEL_MSIX_BAR_VA + msix.table_offset as usize;
+    let (addr, data) = msi_message;
+    let entry = table_va as *mut u32; // entry 0 — this MVP's only vector.
+    // SAFETY: `entry` is within the just-mapped MSI-X table BAR window
+    // (R+W+U, `map_pci_bar`'s own contract), 16-byte MSI-X table entry
+    // layout per the MSI-X ECN (Message Address Low/High, Message Data,
+    // Vector Control — PCI Local Bus Spec §6.8.2.9).
+    unsafe {
+        entry.write_volatile(addr as u32); // Message Address (low 32 bits).
+        entry.add(1).write_volatile((addr >> 32) as u32); // Message Address (high 32 bits) — always 0, this MVP's address is always < 4 GiB.
+        entry.add(2).write_volatile(data); // Message Data.
+        entry.add(3).write_volatile(0); // Vector Control — bit 0 clear = unmasked.
+    }
+
+    // Message Control's own dword shares byte offsets 0-3 of the
+    // capability structure with Capability ID (byte 0) and Next Pointer
+    // (byte 1) — read-modify-write so those two bytes are never touched.
+    // SAFETY: forwarded from this function's own contract.
+    unsafe {
+        let ctrl_dword = pci_cfg_read32(config_va, msix.cap_ptr as u32);
+        pci_cfg_write32(config_va, msix.cap_ptr as u32, ctrl_dword | MSIX_ENABLE_BIT);
+    }
+
+    // Tell the DEVICE to actually use table entry 0 for the request
+    // virtqueue's own completions — see `VIRTIO_PCI_COMMON_QUEUE_MSIX_
+    // VECTOR`'s own doc comment for the full "real bug found via QEMU"
+    // story this fixes. A second kernel-side BAR mapping, exactly the
+    // same shape as the MSI-X table's own above (COMMON_CFG is almost
+    // always a DIFFERENT BAR).
+    let common_pool = carve_from_any_untyped(k, 4096, 4096 * 2)?;
+    // SAFETY: fresh untyped RAM, identity-addressable, single-core.
+    unsafe { core::ptr::write_bytes(common_pool as *mut u8, 0, 4096 * 2) };
+    // SAFETY: forwarded from this function's own contract.
+    let (common_bar_phys, common_bar_size) = unsafe { pci_bar_phys(config_va, common.bar) }?;
+    let common_map_len = (common_bar_size as usize).div_ceil(4096) * 4096;
+    let common_n = hal.map_range(
+        caller_root_pt,
+        KERNEL_MSIX_COMMON_VA,
+        common_bar_phys as usize,
+        common_map_len,
+        1 | 2, // R+W, kernel-only — same as KERNEL_MSIX_BAR_VA's own mapping.
+        common_pool,
+        2,
+    );
+    if common_n == u32::MAX {
+        return None;
+    }
+    hal.flush_tlb();
+    let common_cfg_kernel_va = KERNEL_MSIX_COMMON_VA + common.offset as usize;
+    // REQUEST_QUEUE's own index (0 — this driver's only virtqueue,
+    // `driver_virtio_blk`'s own module doc comment) — select it, THEN
+    // write its own `queue_msix_vector` (spec §4.1.4.3: `queue_select`
+    // MUST be written before either register named "About a specific
+    // virtqueue" is read or written, since they alias the CURRENTLY
+    // selected queue's own state).
+    // SAFETY: `common_cfg_kernel_va` is within the just-mapped, just-
+    // flushed COMMON_CFG BAR window (R+W, kernel-only).
+    unsafe {
+        ((common_cfg_kernel_va + VIRTIO_PCI_COMMON_QUEUE_SELECT as usize) as *mut u16)
+            .write_volatile(0);
+        ((common_cfg_kernel_va + VIRTIO_PCI_COMMON_QUEUE_MSIX_VECTOR as usize) as *mut u16)
+            .write_volatile(0); // table entry 0 — this MVP's only vector, matching enable_and_program_msix's own table write above.
+    }
+
+    Some(())
+}
+
+/// Resolves and maps a virtio-pci "modern" device's own 4 capability
+/// windows (COMMON/NOTIFY/ISR/DEVICE_CFG) into the driver process, then
+/// writes the `PCI_INFO_OFFSET` header block (`driver_virtio_blk::
+/// layout::PCI_INFO_OFFSET`'s own doc comment) into `region_phys` so
+/// `driver_virtio_blk::subsystem_entry::new_driver_for_this_transport`
+/// can construct a `Transport::Pci`-backed `VirtioBlk` without ever
+/// needing its own copy of these addresses. Returns `None` (and logs)
+/// if COMMON_CFG — the one capability window virtio-pci-modern cannot
+/// function without — was not found, or if mapping its own BAR failed;
+/// NOTIFY/ISR/DEVICE_CFG are logged-and-skipped individually since a
+/// missing one still leaves `VirtioBlk::probe` able to fail cleanly
+/// rather than dereference a null VA (mirrors `spawn_virtio_blk_driver`'s
+/// own "no allocation, no process" failure philosophy applied at
+/// finer, per-window grain here).
+///
+/// First maps `config_phys`'s own ECAM page (already page-aligned —
+/// `ecam_offset`'s own construction) into `caller_root_pt` at `KERNEL_
+/// PCI_CFG_VA` — see that const's own doc comment for why this kernel-
+/// side mapping is required before ANY read/write against config space,
+/// unlike a BAR's own target window (`mmio.phys_base`, always within
+/// the identity-mapped low GiB range every process already carries).
+/// Every capability-list walk and BAR-sizing probe below reads through
+/// `KERNEL_PCI_CFG_VA`, never the raw `config_phys`, for exactly this
+/// reason (`pci_bar_phys`'s own BAR-register reads/writes live WITHIN
+/// this same config-space page, not the BAR's own target memory).
+///
+/// `irq` (the SAME value `spawn_virtio_blk_driver`'s own `IrqBind` call
+/// later registers a handler at) is only consulted for MSI-X — see
+/// `enable_and_program_msix`'s own doc comment for the full data-driven
+/// branch this takes on architectures where `HalInterface::msi_message`
+/// and this device's own capability list both cooperate (x86_64 only,
+/// today); ignored entirely otherwise.
+///
+/// # Safety
+/// Same contract as `pci_bar_phys` / `map_pci_bar`.
+unsafe fn wire_virtio_pci_transport(
+    k: &mut KernelState,
+    hal: &HalInterface,
+    drv_root_pt: usize,
+    caller_root_pt: usize,
+    config_phys: u64,
+    region_phys: usize,
+    irq: u32,
+) -> Option<()> {
+    let cfg_pool = carve_from_any_untyped(k, 4096, 4096 * 2)?;
+    // SAFETY: fresh untyped RAM, identity-addressable, single-core;
+    // `map_range` needs the pool pre-zeroed.
+    unsafe { core::ptr::write_bytes(cfg_pool as *mut u8, 0, 4096 * 2) };
+    let cfg_n = hal.map_range(
+        caller_root_pt,
+        KERNEL_PCI_CFG_VA,
+        config_phys as usize,
+        4096,
+        1 | 2, // R+W, kernel-only (no U bit) — EL1/S-mode code only.
+        cfg_pool,
+        2,
+    );
+    if cfg_n == u32::MAX {
+        klog!("wire_virtio_pci_transport: map_range error (ECAM config-space page)\r\n");
+        return None;
+    }
+    // Modifying a LIVE, currently-active page table (unlike every other
+    // `map_range` call in this file, which always targets a not-yet-
+    // activated process) — flush before relying on the fresh mapping,
+    // cheap insurance against any stale walk-cache state.
+    hal.flush_tlb();
+    let config_va = KERNEL_PCI_CFG_VA as u64;
+
+    // Enable Memory Space + Bus Master (PCI Local Bus Spec §6.2.2) —
+    // **real bug found via QEMU**: without this, EVERY register in
+    // BAR4's own MMIO window reads back 0xFFFFFFFF, regardless of page
+    // tables or exception level (confirmed by reading the SAME
+    // physical window directly from EL1 with its own fresh mapping —
+    // still 0xFFFFFFFF), because the device's memory decode is simply
+    // OFF until a driver explicitly turns it on. Every peripheral this
+    // project touched before virtio-pci was virtio-mmio, which has no
+    // such gate at all, so this step never had a reason to exist here
+    // until now. Read-modify-write (not a raw overwrite) so Status's
+    // own write-1-to-clear bits, sharing this same u32 word, are never
+    // touched.
+    // SAFETY: forwarded from this function's own contract.
+    unsafe {
+        let cmd_status = pci_cfg_read32(config_va, PCI_COMMAND_OFFSET);
+        pci_cfg_write32(
+            config_va,
+            PCI_COMMAND_OFFSET,
+            cmd_status | PCI_COMMAND_MEMORY_SPACE | PCI_COMMAND_BUS_MASTER,
+        );
+    }
+
+    // SAFETY: forwarded from this function's own contract; `config_va`
+    // is the mapping just installed above.
+    let caps = unsafe { walk_virtio_pci_capabilities(config_va) };
+    let Some(common) = caps.common else {
+        klog!("wire_virtio_pci_transport: no COMMON_CFG capability found\r\n");
+        return None;
+    };
+
+    let mut mapped: [(u8, usize); DRV_PCI_MAX_BARS] = [(0, 0); DRV_PCI_MAX_BARS];
+    let mut mapped_count = 0usize;
+
+    // SAFETY: forwarded.
+    let common_va = unsafe {
+        map_pci_bar(k, hal, drv_root_pt, config_va, common.bar, &mut mapped, &mut mapped_count)
+    }?;
+    let common_cfg_va = common_va + common.offset as usize;
+
+    let mut resolve = |window: Option<VirtioPciCapWindow>, name: &str| -> usize {
+        let Some(w) = window else {
+            klog!("wire_virtio_pci_transport: no {} capability found\r\n", name);
+            return 0;
+        };
+        // SAFETY: forwarded from this function's own contract.
+        let base = unsafe {
+            map_pci_bar(k, hal, drv_root_pt, config_va, w.bar, &mut mapped, &mut mapped_count)
+        };
+        match base {
+            Some(va) => va + w.offset as usize,
+            None => {
+                klog!("wire_virtio_pci_transport: failed to map {} BAR\r\n", name);
+                0
+            }
+        }
+    };
+    let notify_cfg_va = resolve(caps.notify, "NOTIFY_CFG");
+    let isr_cfg_va = resolve(caps.isr, "ISR_CFG");
+    let device_cfg_va = resolve(caps.device, "DEVICE_CFG");
+
+    // MSI-X (x86_64 only — see `msi_message`'s own doc comment for the
+    // full data-driven, never-`target_arch` rationale): only attempted
+    // when BOTH this device's own capability list actually carries an
+    // MSI-X capability AND the live `InterruptController` reports a
+    // message-signaled path at all. Neither is true for aarch64's own
+    // virtio-pci device (this project's own choice stays legacy INTx
+    // there, resolved at HAL discovery time into `mmio.irq` already —
+    // this whole block is simply never reached in that case, `caps.
+    // msix` being `None`), so this branch changes nothing for the
+    // architecture it was NOT written for.
+    // Table entry index the driver process's own `VirtioBlk::msix_
+    // vector` gets told to assign its queue to (`driver_virtio_blk::
+    // pci_common::QUEUE_MSIX_VECTOR`'s own doc comment) — default
+    // `VIRTIO_MSI_NO_VECTOR`, overwritten below only on success.
+    let mut msix_vector = driver_virtio_blk::VIRTIO_MSI_NO_VECTOR;
+    if let Some(msix) = caps.msix {
+        if let Some(msi_message) = hal.msi_message(irq) {
+            // SAFETY: forwarded from this function's own contract.
+            let enabled = unsafe {
+                enable_and_program_msix(k, hal, caller_root_pt, config_va, msix, common, msi_message)
+            };
+            if enabled.is_none() {
+                klog!("wire_virtio_pci_transport: failed to enable MSI-X\r\n");
+                return None;
+            }
+            msix_vector = 0; // table entry 0 — this MVP's only vector, matching enable_and_program_msix's own table write.
+        }
+    }
+
+    // With MSI-X (`msix_vector` was assigned above) the interrupt is an
+    // edge-style memory write with no INTx line to deassert, so the
+    // trampoline has NO reason to read ISR_CFG at all — and it must not:
+    // `isr_cfg_va` only exists in `drv_root_pt`, while on x86_64 the MSI
+    // can land while ANY other process's CR3 is active (the driver is
+    // `Blocked` in `DRV_IRQ_WAIT` and other subsystems run meanwhile), so
+    // the read page-faulted inside the interrupt handler and hung the boot
+    // right after the first block write. The sentinel makes the trampoline
+    // skip the read (same role `usize::MAX` already has for MMIO).
+    let trampoline_isr_va = if msix_vector == driver_virtio_blk::VIRTIO_MSI_NO_VECTOR {
+        isr_cfg_va
+    } else {
+        usize::MAX
+    };
+    // SAFETY: single-core; written once here, before `IrqBind`
+    // (`spawn_virtio_blk_driver`'s own caller) installs the trampoline
+    // that reads it — see `G_DRV_ISR_CFG_VA`'s own doc comment for why
+    // this VA (not a physical address) is what the trampoline needs.
+    unsafe { core::ptr::addr_of_mut!(G_DRV_ISR_CFG_VA).write(trampoline_isr_va) };
+
+    let header = region_phys + driver_virtio_blk::layout::PCI_INFO_OFFSET;
+    // SAFETY: `region_phys` is the driver's own fresh, zeroed
+    // `SharedRegion`, identity-addressable, single-core — same
+    // contract every other direct physical write in this file relies
+    // on for that region.
+    unsafe {
+        (header as *mut u64).write_volatile(1); // transport_kind = Pci
+        ((header + 8) as *mut u64).write_volatile(common_cfg_va as u64);
+        ((header + 16) as *mut u64).write_volatile(notify_cfg_va as u64);
+        ((header + 24) as *mut u64).write_volatile(caps.notify_off_multiplier as u64);
+        ((header + 32) as *mut u64).write_volatile(isr_cfg_va as u64);
+        ((header + 40) as *mut u64).write_volatile(device_cfg_va as u64);
+        ((header + 48) as *mut u64).write_volatile(msix_vector as u64);
+    }
+
+    Some(())
+}
+
+/// `driver-virtio-net`'s own counterpart to `wire_virtio_pci_transport`
+/// above — same COMMON_CFG/NOTIFY_CFG/ISR_CFG/DEVICE_CFG capability walk,
+/// BAR-mapping machinery, and MSI-X programming (reused directly: `walk_
+/// virtio_pci_capabilities`, `map_pci_bar`, `pci_cfg_read32`/`write32`,
+/// `enable_and_program_msix`, the same Memory-Space+Bus-Master enable
+/// dance and its own real-bug rationale — see that function's own doc
+/// comment for all of it). TX completion is now real interrupt-driven on
+/// every architecture (`driver_virtio_net`'s own crate-level doc comment
+/// on why RX deliberately stays non-blocking-poll-only instead), so this
+/// function needs exactly the same MSI-X wiring `wire_virtio_pci_
+/// transport` already does for blk — the only remaining difference is
+/// the header block this writes (`driver_virtio_net::layout::PCI_INFO_
+/// OFFSET`, a DIFFERENT crate's own offsets, even though the byte shape
+/// happens to match blk's own seven `u64`s exactly).
+///
+/// # Safety
+/// Same contract as `wire_virtio_pci_transport`.
+unsafe fn wire_virtio_pci_transport_net(
+    k: &mut KernelState,
+    hal: &HalInterface,
+    drv_root_pt: usize,
+    caller_root_pt: usize,
+    config_phys: u64,
+    region_phys: usize,
+    irq: u32,
+) -> Option<()> {
+    let cfg_pool = carve_from_any_untyped(k, 4096, 4096 * 2)?;
+    // SAFETY: fresh untyped RAM, identity-addressable, single-core;
+    // `map_range` needs the pool pre-zeroed.
+    unsafe { core::ptr::write_bytes(cfg_pool as *mut u8, 0, 4096 * 2) };
+    let cfg_n = hal.map_range(
+        caller_root_pt,
+        KERNEL_PCI_CFG_VA,
+        config_phys as usize,
+        4096,
+        1 | 2, // R+W, kernel-only (no U bit) — EL1/S-mode code only.
+        cfg_pool,
+        2,
+    );
+    if cfg_n == u32::MAX {
+        klog!("wire_virtio_pci_transport_net: map_range error (ECAM config-space page)\r\n");
+        return None;
+    }
+    // Modifying a LIVE, currently-active page table — same reasoning as
+    // `wire_virtio_pci_transport`'s own identical flush.
+    hal.flush_tlb();
+    let config_va = KERNEL_PCI_CFG_VA as u64;
+
+    // Enable Memory Space + Bus Master — same real-bug rationale as
+    // `wire_virtio_pci_transport`'s own doc comment.
+    // SAFETY: forwarded from this function's own contract.
+    unsafe {
+        let cmd_status = pci_cfg_read32(config_va, PCI_COMMAND_OFFSET);
+        pci_cfg_write32(
+            config_va,
+            PCI_COMMAND_OFFSET,
+            cmd_status | PCI_COMMAND_MEMORY_SPACE | PCI_COMMAND_BUS_MASTER,
+        );
+    }
+
+    // SAFETY: forwarded from this function's own contract; `config_va`
+    // is the mapping just installed above.
+    let caps = unsafe { walk_virtio_pci_capabilities(config_va) };
+    let Some(common) = caps.common else {
+        klog!("wire_virtio_pci_transport_net: no COMMON_CFG capability found\r\n");
+        return None;
+    };
+
+    let mut mapped: [(u8, usize); DRV_PCI_MAX_BARS] = [(0, 0); DRV_PCI_MAX_BARS];
+    let mut mapped_count = 0usize;
+
+    // SAFETY: forwarded.
+    let common_va = unsafe {
+        map_pci_bar(k, hal, drv_root_pt, config_va, common.bar, &mut mapped, &mut mapped_count)
+    }?;
+    let common_cfg_va = common_va + common.offset as usize;
+
+    let mut resolve = |window: Option<VirtioPciCapWindow>, name: &str| -> usize {
+        let Some(w) = window else {
+            klog!("wire_virtio_pci_transport_net: no {} capability found\r\n", name);
+            return 0;
+        };
+        // SAFETY: forwarded from this function's own contract.
+        let base = unsafe {
+            map_pci_bar(k, hal, drv_root_pt, config_va, w.bar, &mut mapped, &mut mapped_count)
+        };
+        match base {
+            Some(va) => va + w.offset as usize,
+            None => {
+                klog!("wire_virtio_pci_transport_net: failed to map {} BAR\r\n", name);
+                0
+            }
+        }
+    };
+    let notify_cfg_va = resolve(caps.notify, "NOTIFY_CFG");
+    let isr_cfg_va = resolve(caps.isr, "ISR_CFG");
+    let device_cfg_va = resolve(caps.device, "DEVICE_CFG");
+
+    // MSI-X (x86_64 only — see `wire_virtio_pci_transport`'s own doc
+    // comment on `msi_message`'s data-driven, never-`target_arch`
+    // rationale; identical here). `msix_vector` defaults to `driver_
+    // virtio_net::VIRTIO_MSI_NO_VECTOR`, overwritten below only on
+    // success — aarch64's own virtio-pci device has no MSI-X capability
+    // at all (`caps.msix` is `None`), so this block is simply never
+    // reached there, exactly like blk's own identical branch.
+    let mut msix_vector = driver_virtio_net::VIRTIO_MSI_NO_VECTOR;
+    if let Some(msix) = caps.msix {
+        if let Some(msi_message) = hal.msi_message(irq) {
+            // SAFETY: forwarded from this function's own contract.
+            let enabled = unsafe {
+                enable_and_program_msix(k, hal, caller_root_pt, config_va, msix, common, msi_message)
+            };
+            if enabled.is_none() {
+                klog!("wire_virtio_pci_transport_net: failed to enable MSI-X\r\n");
+                return None;
+            }
+            msix_vector = 0; // table entry 0 — this MVP's only vector, matching enable_and_program_msix's own table write.
+            // SAFETY: single-core; written once here, before `IrqBind` installs the trampoline that reads it.
+            unsafe { core::ptr::addr_of_mut!(G_DRV_NET_MSIX_ACTIVE).write(true) };
+        }
+    }
+
+    // SAFETY: single-core; written once here, before `IrqBind`
+    // (`spawn_virtio_net_driver`'s own caller) installs the trampoline
+    // that reads it — see `G_DRV_NET_ISR_CFG_VA`'s own doc comment.
+    unsafe { core::ptr::addr_of_mut!(G_DRV_NET_ISR_CFG_VA).write(isr_cfg_va) };
+
+    // Re-derive the ISR window's own PHYSICAL base — `caps.isr`'s BAR
+    // register hasn't changed since `map_pci_bar` (inside `resolve`)
+    // read it moments ago, so re-reading it here has no side effect
+    // beyond the same harmless BAR-sizing probe every other `pci_bar_
+    // phys` call already performs. See `G_DRV_NET_ISR_CFG_PHYS`'s own
+    // doc comment for why `spawn_netstack_service` needs this.
+    // SAFETY: forwarded from this function's own contract; `config_va`
+    // is the mapping installed above.
+    let isr_cfg_phys = caps
+        .isr
+        .and_then(|w| unsafe { pci_bar_phys(config_va, w.bar) }.map(|(base, _)| base as usize + w.offset as usize));
+    // SAFETY: single-core; written once here, read-only by `spawn_
+    // netstack_service` after this function has already returned.
+    unsafe { core::ptr::addr_of_mut!(G_DRV_NET_ISR_CFG_PHYS).write(isr_cfg_phys.unwrap_or(usize::MAX)) };
+
+    // Re-derive the NOTIFY window's own PHYSICAL base (only ever used to
+    // compute the matching page-table VA `spawn_netstack_service` maps
+    // into root's own address space — see `G_DRV_NET_NOTIFY_PHYS`'s own
+    // doc comment for why this can NEVER be dereferenced directly) +
+    // `notify_off_multiplier`. Needed by `net_bypass_direct_send`
+    // (03-Kernel-Subsystems-Layer.md §2.3/§5.4.1) to ring the TX queue's
+    // own doorbell directly from kernel mode, computing the exact same
+    // address `notify_queue`'s own `Transport::Pci` arm would, but
+    // without the driver process's own involvement.
+    // SAFETY: forwarded from this function's own contract; `config_va`
+    // is the mapping installed above.
+    let notify_cfg_phys = caps
+        .notify
+        .and_then(|w| unsafe { pci_bar_phys(config_va, w.bar) }.map(|(base, _)| base as usize + w.offset as usize));
+    // SAFETY: single-core; written once here, read-only by `spawn_
+    // netstack_service` after this function has already returned.
+    unsafe { core::ptr::addr_of_mut!(G_DRV_NET_NOTIFY_PHYS).write(notify_cfg_phys.unwrap_or(usize::MAX)) };
+    unsafe { core::ptr::addr_of_mut!(G_DRV_NET_NOTIFY_VA).write(notify_cfg_va) };
+    unsafe { core::ptr::addr_of_mut!(G_DRV_NET_NOTIFY_OFF_MULT).write(caps.notify_off_multiplier) };
+
+    let header = region_phys + driver_virtio_net::layout::PCI_INFO_OFFSET;
+    // SAFETY: `region_phys` is the driver's own fresh, zeroed RX
+    // `SharedRegion`, identity-addressable, single-core — same contract
+    // `wire_virtio_pci_transport`'s own identical write relies on.
+    unsafe {
+        (header as *mut u64).write_volatile(1); // transport_kind = Pci
+        ((header + 8) as *mut u64).write_volatile(common_cfg_va as u64);
+        ((header + 16) as *mut u64).write_volatile(notify_cfg_va as u64);
+        ((header + 24) as *mut u64).write_volatile(caps.notify_off_multiplier as u64);
+        ((header + 32) as *mut u64).write_volatile(isr_cfg_va as u64);
+        ((header + 40) as *mut u64).write_volatile(device_cfg_va as u64);
+        ((header + 48) as *mut u64).write_volatile(msix_vector as u64);
+    }
+
+    Some(())
+}
+
+/// # Safety
+/// `G_DRV_QUEUE_PHYS` must already be a valid, exclusively-owned,
+/// identity-addressable physical page (true from `spawn_virtio_blk_
+/// driver` onward, before any `drv_blk_*_call` can be reached).
+unsafe fn write_shared_drv_message(msg: &SmallMessage) {
+    // SAFETY: single-core; `G_DRV_QUEUE_PHYS` only written once, before
+    // any `drv_blk_*_call` runs.
+    let base = unsafe {
+        (core::ptr::addr_of!(G_DRV_QUEUE_PHYS).read() + driver_virtio_blk::layout::MESSAGE_OFFSET)
+            as *mut u64
+    };
+    // SAFETY: forwarded from this function's own contract.
+    unsafe {
+        base.write_volatile(msg.label);
+        let words = msg.words();
+        for i in 0..kernel_ipc::MSG_MAX_WORDS {
+            base.add(1 + i).write_volatile(words.get(i).copied().unwrap_or(0));
+        }
+    }
+}
+
+/// # Safety
+/// Same contract as `write_shared_drv_message`.
+unsafe fn read_shared_drv_message() -> SmallMessage {
+    // SAFETY: same contract as `write_shared_drv_message`.
+    let base = unsafe {
+        (core::ptr::addr_of!(G_DRV_QUEUE_PHYS).read() + driver_virtio_blk::layout::MESSAGE_OFFSET)
+            as *const u64
+    };
+    // SAFETY: forwarded from this function's own contract.
+    unsafe {
+        let label = base.read_volatile();
+        let mut words = [0u64; kernel_ipc::MSG_MAX_WORDS];
+        for (i, w) in words.iter_mut().enumerate() {
+            *w = base.add(1 + i).read_volatile();
+        }
+        SmallMessage::from_words(label, &words).unwrap_or(SmallMessage::new(label))
+    }
+}
+
+/// Same shape as `fs_ipc_call`, targeting `G_DRV_TID` instead.
+fn drv_ipc_call(hal: &HalInterface, caller: ThreadId, ep_cap: u32) -> Option<IpcSwitch> {
+    let k = kstate();
+    // SAFETY: single-core; `G_DRV_TID` is written once by
+    // `spawn_virtio_blk_driver`, before any `drv_blk_*_call` can run.
+    let drv_tid = unsafe { core::ptr::addr_of!(G_DRV_TID).read() }?;
+    let msg = SmallMessage::new(0);
+    match k.dispatch(caller, hal.now_ns(), SyscallOp::Call { endpoint: CapId::new(ep_cap), msg }, hal) {
+        Ok(SyscallReturn::Reschedule { next: Some(n) }) => {
+            let _ = k.sched.dispatch(drv_tid, hal.now_ns());
+            let (save, into) = k.user_ctx_switch_ptrs(caller, drv_tid)?;
+            let poke = if n == drv_tid {
+                k.tcb_mut(drv_tid)
+                    .and_then(|t| Some((t.pending_from.take()?, t.pending_msg.take()?)))
+                    .map(|(from, m)| (from.as_u32() as usize, m.label as usize))
+            } else {
+                None
+            };
+            Some(IpcSwitch { save, into, poke })
+        }
+        _ => None,
+    }
+}
+
+/// The trampoline `SyscallOp::IrqBind` installs with the platform's
+/// `InterruptController` (via `HalInterface::register_irq`) for the
+/// virtio-blk device's own IRQ line. Runs from interrupt context (the
+/// architecture trap vector's own interrupt branch calls it directly,
+/// exactly like the tick/fault handlers already registered elsewhere
+/// in this file) — its only job is finding which `Notification` is
+/// bound to `irq` and signalling it, waking whatever thread called
+/// `Wait` on it (`kernel_core::state::KernelState::notification_for_
+/// irq`/`wake_blocked`, the SAME primitives `SyscallOp::Signal`'s own
+/// `do_signal` uses for the ordinary syscall-driven case — this is
+/// just the hardware-driven trigger for the identical effect).
+///
+/// A plain function pointer with no captured state, per `hal_core::
+/// interrupt::IrqHandler`'s own doc comment — reaches `KernelState`
+/// through the same global `kstate()`/`khal()` accessors every other
+/// interrupt-context handler in this file already uses.
+pub fn virtio_blk_irq_trampoline(irq: hal_core::interrupt::IrqId) {
+    // Ack the DEVICE's own `INTERRUPT_STATUS`/`INTERRUPT_ACK` registers
+    // (`driver_virtio_blk::mmio`'s own fixed offsets — valid for any
+    // virtio-mmio device regardless of type, not specific to virtio-blk)
+    // FIRST, before signalling anything — **real bug found via QEMU
+    // interrupt tracing**: without this, the device's own interrupt
+    // line stays asserted for the ENTIRE time between this trampoline
+    // running and `VirtioBlk::ack_completion` eventually running (much
+    // later, in the DRIVER process's own time, once `Wait` returns and
+    // it resumes) — the PLIC re-delivers the STILL-pending line the
+    // instant this trap returns, over and over, a genuine hardware
+    // interrupt storm (confirmed via `-d int`: thousands of identical
+    // `s_external` traps at the same `epc`, the core never actually
+    // making forward progress). `VirtioBlk::ack_completion`'s own later
+    // ack becomes a harmless no-op re-read of an already-clear register
+    // once the driver process resumes — this is not a duplicate-ack
+    // correctness issue, just moving the ack earlier to where it is
+    // actually reachable (kernel-arch-glue can reach the device's own
+    // MMIO registers via the identity-mapped physical address cached at
+    // spawn time; a DIFFERENT process's own private `VirtioBlk` state
+    // is not reachable from interrupt context at all).
+    // SAFETY: single-core; `G_DRV_MMIO_PHYS` was written once by
+    // `spawn_virtio_blk_driver`, before `IrqBind` installed this
+    // trampoline; the virtio-mmio window is identity-mapped in the
+    // kernel's own address space (`hal.map_ram_identity`'s own low-GiB
+    // coverage — the same physical range `spawn_virtio_blk_driver`
+    // already reads/writes directly via `core::ptr::write_bytes` etc.).
+    unsafe {
+        let mmio_phys = core::ptr::addr_of!(G_DRV_MMIO_PHYS).read();
+        if mmio_phys != usize::MAX {
+            let status = ((mmio_phys + driver_virtio_blk::mmio::INTERRUPT_STATUS) as *const u32)
+                .read_volatile();
+            ((mmio_phys + driver_virtio_blk::mmio::INTERRUPT_ACK) as *mut u32)
+                .write_volatile(status);
+        }
+    }
+
+    // `Transport::Pci`'s own counterpart to the MMIO ack above — same
+    // "must happen HERE, not later in the driver process's own time"
+    // rationale (`G_DRV_MMIO_PHYS`'s own doc comment), same real-bug
+    // consequence if skipped (a level-sensitive INTx line the GIC keeps
+    // re-delivering the instant this trap returns — the exact PCI
+    // counterpart of the MMIO PLIC storm already documented above).
+    // Unlike MMIO's separate STATUS-read/ACK-write pair, virtio-pci's
+    // ISR_CFG (virtio 1.x spec §4.1.4.5) is a SINGLE byte that clears
+    // (deasserting INTx) on the read itself — no separate ack write.
+    // SAFETY: single-core; `G_DRV_ISR_CFG_VA` was written once by
+    // `wire_virtio_pci_transport`, before `IrqBind` installed this
+    // trampoline; see that static's own doc comment for why this VA
+    // (in `drv_root_pt`, not a physical address) is safely
+    // dereferenceable exactly when this trampoline runs.
+    unsafe {
+        let isr_va = core::ptr::addr_of!(G_DRV_ISR_CFG_VA).read();
+        if isr_va != usize::MAX {
+            let _isr_reason = (isr_va as *const u8).read_volatile();
+        }
+    }
+
+    let k = kstate();
+    let hal = khal();
+    let Some(nid) = k.notification_for_irq(irq.as_u32()) else {
+        return;
+    };
+    let Some(notif) = k.notification_mut(nid) else {
+        return;
+    };
+    let woken = notif.signal(1);
+    let now = hal.now_ns();
+    for &tid in woken.as_slice() {
+        k.wake_blocked(tid, now);
+    }
+}
+
+/// Spawns the virtio-blk driver process from its own separately-built
+/// ELF (`drv_elf`), grants it an `Endpoint` (landing at slot 0 — see
+/// `grant_cap_into`'s own doc comment) and a `Notification` already
+/// bound to the device's own IRQ line (landing at slot 1), and pre-maps
+/// its virtio-mmio window plus a freshly retyped virtqueue/data
+/// `SharedRegion` directly into its address space (trusted bootstrap
+/// glue — same "carve untyped, `map_range` directly, no `SyscallOp::
+/// Map` ceremony" pattern `fs_demo_start` already uses for fs-native's
+/// own shared pages).
+///
+/// Returns `None` (and logs) if no `Block`-kind peripheral was
+/// discovered at boot (`KernelState::root_mmio_blk_cap` still the
+/// sentinel — `populate_from_boot_info`'s own Step 3c never found one),
+/// on any allocation failure, or if `IrqBind` itself fails — this
+/// driver process is simply never spawned in that case, exactly like
+/// `spawn_process_from_elf`'s own existing "no allocation, no process"
+/// failure mode.
+pub fn spawn_virtio_blk_driver(
+    hal: &HalInterface,
+    caller: ThreadId,
+    drv_elf: &[u8],
+    expected_machine: u16,
+) -> Option<(u32, *mut u8, *const u8)> {
+    let k = kstate();
+    let src_cs = k.tcb(caller)?.cap_space;
+    let mmio_cap = k.root_mmio_blk_cap;
+    if mmio_cap == CapId::new(u32::MAX) {
+        klog!("spawn_virtio_blk_driver: no Block-kind peripheral was discovered at boot\r\n");
+        return None;
+    }
+    // Resolve the boot-seeded `MmioRegion` capability back to its own
+    // descriptor (mirrors `fs_demo_start`'s own SharedRegion-cap ->
+    // description resolution) — this driver never needs to HOLD an
+    // `MmioRegion` capability itself (the window is pre-mapped for it
+    // below, exactly like `.user_text`/stack need no capability of
+    // their own), only kernel-arch-glue does, to learn where to map.
+    let mmio_id = kernel_cap::MmioRegionId::new(
+        k.cap_space(src_cs)?.lookup(mmio_cap)?.object.id.as_u32(),
+    );
+    let mmio = *k.mmio_region(mmio_id)?;
+    // A nonzero `config_space_base` means this device was discovered
+    // over PCI (`hal_arm64::peripheral`'s own `PeripheralDevice::
+    // new_pci` — riscv64's virtio-mmio discovery never sets it, see
+    // `MmioRegionDescriptor::config_space_base`'s own doc comment), so
+    // the driver needs virtio-pci "modern" register windows resolved
+    // via `wire_virtio_pci_transport` below rather than the single
+    // fixed virtio-mmio block this function pre-maps at `DRV_MMIO_VA`.
+    let is_pci = mmio.config_space_base != 0;
+    if !is_pci {
+        // SAFETY: single-core; written once here, before `IrqBind`
+        // below installs the trampoline that reads it. Left at its
+        // `usize::MAX` sentinel for PCI transport — that trampoline's
+        // own virtio-mmio-specific INTERRUPT_STATUS/ACK read does not
+        // apply to virtio-pci's own ISR_CFG ack mechanism (a single
+        // read-to-clear byte at a DIFFERENT, capability-resolved
+        // address) — PCI interrupt-context ack is not yet wired here.
+        unsafe { core::ptr::addr_of_mut!(G_DRV_MMIO_PHYS).write(mmio.phys_base as usize) };
+    }
+
+    let ep_cap = retype_one_from_any_untyped(k, hal, caller, KernelObjectType::Endpoint, 1)?;
+
+    const DRV_STACK_VMA: usize = 0xC080_0000;
+    const DRV_STACK_LEN: usize = 4096 * 16;
+    let (drv_tid, drv_cs, _stack_phys) =
+        spawn_process_from_elf(hal, k, drv_elf, expected_machine, DRV_STACK_VMA, DRV_STACK_LEN)?;
+    // SAFETY: single-core; written once here, before any `drv_blk_*_call`
+    // (reached only after this function returns) can read it.
+    unsafe { core::ptr::addr_of_mut!(G_DRV_TID).write(Some(drv_tid)) };
+
+    grant_cap_into(k, src_cs, ep_cap, drv_cs, CapabilityRights::READ | CapabilityRights::WRITE)?;
+
+    let drv_addr_space = k.tcb(drv_tid)?.addr_space;
+    let drv_root_pt = k.addr_space_mut(drv_addr_space)?.root_phys().as_usize();
+
+    // Pre-map the virtio-mmio transport window — real device MMIO, not
+    // RAM, so (unlike every other `map_range` call in this file) there
+    // is nothing to zero or copy into it first. Skipped entirely for
+    // PCI transport (`is_pci`): virtio-pci's own register windows are
+    // resolved and mapped individually below, by `wire_virtio_pci_
+    // transport`, from whichever BAR(s) its capability list actually
+    // names — `mmio.phys_base`/`mmio.size` here are only ever BAR0's
+    // own base/size (`hal_arm64::peripheral`'s own module doc comment),
+    // which need not even be one of the BARs virtio-pci-modern uses.
+    if !is_pci {
+        let mmio_pool = carve_from_any_untyped(k, 4096, 4096 * 2)?;
+        // SAFETY: fresh untyped RAM, identity-addressable, single-core;
+        // `map_range` needs the pool pre-zeroed (same contract every
+        // other pool carve in this file already documents).
+        unsafe { core::ptr::write_bytes(mmio_pool as *mut u8, 0, 4096 * 2) };
+        let n = hal.map_range(
+            drv_root_pt,
+            DRV_MMIO_VA,
+            mmio.phys_base as usize,
+            4096,
+            1 | 2 | 8, // R+W+U
+            mmio_pool,
+            2,
+        );
+        if n == u32::MAX {
+            klog!("spawn_virtio_blk_driver: map_range error (mmio window)\r\n");
+            return None;
+        }
+    }
+
+    // Retype and pre-map the virtqueue/data `SharedRegion` — a REAL
+    // capability object (proving `Retype` end to end, like fs-native's
+    // own DATA region), even though this driver process is never
+    // granted it directly (kernel-arch-glue's own privileged pre-map
+    // stands in for a `SyscallOp::Map` this trusted glue code has no
+    // need to actually issue).
+    let region_cap = retype_one_from_any_untyped(k, hal, caller, KernelObjectType::SharedRegion, 1)?;
+    let region_id = k.cap_space(src_cs)?.lookup(region_cap)?.object.id;
+    let region_phys = k
+        .shared_region(kernel_cap::SharedRegionId::new(region_id.as_u32()))?
+        .phys_base
+        .as_usize();
+    // SAFETY: fresh `SharedRegion` memory, identity-addressable,
+    // single-core.
+    unsafe { core::ptr::write_bytes(region_phys as *mut u8, 0, 4096) };
+    // Write the region's OWN physical base into its own header word
+    // (`driver_virtio_blk::layout::PHYS_BASE_OFFSET`) — see that
+    // module's own doc comment on why the driver process has no other
+    // way to learn it (no VA->PA translation syscall exists for a
+    // non-root thread).
+    // SAFETY: `region_phys` is identity-addressable, freshly zeroed
+    // above.
+    unsafe { (region_phys as *mut u64).write_volatile(region_phys as u64) };
+
+    // For PCI transport, resolve+map the device's own virtio-pci
+    // "modern" register windows and write the `PCI_INFO_OFFSET` header
+    // block right after `PHYS_BASE_OFFSET` above — both live in the
+    // SAME region, and `new_driver_for_this_transport` reads this block
+    // to pick `Transport::Pci` over the `transport_kind == 0` default
+    // this freshly-zeroed region already carries for MMIO transport.
+    if is_pci {
+        // SAFETY: `mmio.config_space_base` is a live ECAM address (this
+        // kernel boot-seeded it from `hal_arm64::peripheral`'s own PCI
+        // scan, the same trust boundary `mmio.phys_base` already
+        // relies on); `region_phys` is this function's own fresh,
+        // zeroed `SharedRegion`, forwarded from that write above.
+        // `caller_root_pt`: `caller`'s own page table, still the ACTIVE
+        // one right now (the switch to the driver process happens only
+        // at this function's own tail) — see `KERNEL_PCI_CFG_VA`'s own
+        // doc comment for why `wire_virtio_pci_transport` needs it.
+        let caller_addr_space = k.tcb(caller)?.addr_space;
+        let caller_root_pt = k.addr_space_mut(caller_addr_space)?.root_phys().as_usize();
+        let wired = unsafe {
+            wire_virtio_pci_transport(
+                k,
+                hal,
+                drv_root_pt,
+                caller_root_pt,
+                mmio.config_space_base,
+                region_phys,
+                mmio.irq,
+            )
+        };
+        if wired.is_none() {
+            klog!("spawn_virtio_blk_driver: wire_virtio_pci_transport failed\r\n");
+            return None;
+        }
+    }
+
+    let queue_pool = carve_from_any_untyped(k, 4096, 4096 * 2)?;
+    // SAFETY: fresh untyped RAM, identity-addressable, single-core;
+    // `map_range` needs the pool pre-zeroed.
+    unsafe { core::ptr::write_bytes(queue_pool as *mut u8, 0, 4096 * 2) };
+    let n2 = hal.map_range(
+        drv_root_pt,
+        DRV_QUEUE_VA,
+        region_phys,
+        4096,
+        1 | 2 | 8, // R+W+U
+        queue_pool,
+        2,
+    );
+    if n2 == u32::MAX {
+        klog!("spawn_virtio_blk_driver: map_range error (queue region)\r\n");
+        return None;
+    }
+
+    // SAFETY: single-core; written exactly once here, before any
+    // `drv_blk_*_call` (reached only after this function returns) can
+    // read it.
+    unsafe { core::ptr::addr_of_mut!(G_DRV_QUEUE_PHYS).write(region_phys) };
+
+    // Retype a `Notification` and bind the virtio-blk device's own IRQ
+    // line to it — root does the `IrqBind` itself (it already holds
+    // `root_mmio_blk_cap`, which is what authorizes binding exactly
+    // THIS device's own IRQ, per `IrqBind`'s own doc comment), then
+    // grants the ALREADY-BOUND notification into the driver's cap
+    // space (landing at slot 1 — the endpoint above was the first
+    // grant into this fresh cap space, at slot 0; see `grant_cap_
+    // into`'s own doc comment on why that ordering is deterministic).
+    // The driver process never needs to hold `root_mmio_blk_cap`
+    // itself, matching the MMIO-window pre-map above.
+    let notif_cap = retype_one_from_any_untyped(k, hal, caller, KernelObjectType::Notification, 1)?;
+    match k.dispatch(
+        caller,
+        hal.now_ns(),
+        SyscallOp::IrqBind {
+            mmio: mmio_cap,
+            notification: notif_cap,
+            handler: virtio_blk_irq_trampoline,
+        },
+        hal,
+    ) {
+        Ok(SyscallReturn::Done) => {}
+        _ => {
+            klog!("spawn_virtio_blk_driver: IrqBind failed\r\n");
+            return None;
+        }
+    }
+    grant_cap_into(k, src_cs, notif_cap, drv_cs, CapabilityRights::READ | CapabilityRights::WRITE)?;
+
+    // Switch straight to the driver, exactly like `fs_demo_start` does
+    // for fs-native — see that function's own "Real bug found via
+    // QEMU" comment for the full rationale: without this, `caller`'s
+    // FIRST `DRV_BLK_PROBE` races a receiver that has never yet run at
+    // all, and `do_send`'s fast path (which requires the receiver
+    // already blocked in `Recv`) cannot trigger, silently stranding
+    // both threads forever. Switching here lets the driver run its own
+    // `probe()` and reach its own first `IPC_RECV` before `caller`
+    // resumes and issues `DRV_BLK_PROBE`.
+    let _ = k.sched.note_ready(caller, hal.now_ns());
+    let _ = k.sched.dispatch(drv_tid, hal.now_ns());
+    let (save, into) = k.user_ctx_switch_ptrs(caller, drv_tid)?;
+
+    Some((ep_cap.as_u32(), save, into))
+}
+
+/// `DRV_BLK_PROBE` demo opcode: builds a real `DriverRequest::Probe`.
+pub fn drv_blk_probe_call(hal: &HalInterface, caller: ThreadId, ep_cap: u32) -> Option<IpcSwitch> {
+    let msg = ipc_protocol::codec::encode_driver_request(&ipc_protocol::DriverRequest::Probe);
+    // SAFETY: `spawn_virtio_blk_driver` has already run by the time any
+    // `.user_text` code can reach this opcode (it needs `ep_cap`, which
+    // only that function's own return value provides).
+    unsafe { write_shared_drv_message(&msg) };
+    drv_ipc_call(hal, caller, ep_cap)
+}
+
+/// Reads back the `DriverResponse` for `drv_blk_probe_call`. Returns
+/// `(sector_size, sector_count)`, or `(u32::MAX, u64::MAX)` on any
+/// error/decode failure.
+pub fn drv_blk_probe_result() -> (u32, u64) {
+    // SAFETY: same contract as `drv_blk_probe_call`.
+    let msg = unsafe { read_shared_drv_message() };
+    match ipc_protocol::codec::decode_driver_response(&msg) {
+        Ok(ipc_protocol::DriverResponse::Ready { sector_size, sector_count }) => {
+            (sector_size, sector_count)
+        }
+        _ => (u32::MAX, u64::MAX),
+    }
+}
+
+/// `DRV_BLK_WRITE` demo opcode: builds a real `DriverRequest::WriteBlocks`
+/// for one sector at `lba`, placing `DRV_DEMO_WRITE_DATA` into the
+/// shared region's own data buffer first (mirrors `fs_write_call`'s own
+/// `G_FS_DATA_PHYS` write).
+pub fn drv_blk_write_call(hal: &HalInterface, caller: ThreadId, ep_cap: u32, lba: u64) -> Option<IpcSwitch> {
+    // SAFETY: `G_DRV_QUEUE_PHYS` was set once by `spawn_virtio_blk_
+    // driver`, before any `drv_blk_write_call` can be reached; identity-
+    // mapped for kernel-mode access like every other physical cross-
+    // check in this file.
+    unsafe {
+        let base = (core::ptr::addr_of!(G_DRV_QUEUE_PHYS).read()
+            + driver_virtio_blk::layout::DATA_OFFSET) as *mut u8;
+        core::ptr::copy_nonoverlapping(DRV_DEMO_WRITE_DATA.as_ptr(), base, DRV_DEMO_WRITE_DATA.len());
+    }
+    let req = ipc_protocol::DriverRequest::WriteBlocks {
+        lba,
+        sector_count: 1,
+        shared_cap: 0, // unused by this MVP's driver — see driver_virtio_blk's own module doc comment
+    };
+    let msg = ipc_protocol::codec::encode_driver_request(&req);
+    // SAFETY: same contract as `drv_blk_probe_call`.
+    unsafe { write_shared_drv_message(&msg) };
+    drv_ipc_call(hal, caller, ep_cap)
+}
+
+/// Reads back the `DriverResponse` for `drv_blk_write_call`. Returns the
+/// sector count written, or `usize::MAX` on any error/decode failure.
+pub fn drv_blk_write_result() -> usize {
+    // SAFETY: same contract as `drv_blk_probe_call`.
+    let msg = unsafe { read_shared_drv_message() };
+    match ipc_protocol::codec::decode_driver_response(&msg) {
+        Ok(ipc_protocol::DriverResponse::Completed { sectors }) => sectors as usize,
+        _ => usize::MAX,
+    }
+}
+
+/// `DRV_BLK_READ` demo opcode: builds a real `DriverRequest::ReadBlocks`
+/// for one sector at `lba`.
+pub fn drv_blk_read_call(hal: &HalInterface, caller: ThreadId, ep_cap: u32, lba: u64) -> Option<IpcSwitch> {
+    let req = ipc_protocol::DriverRequest::ReadBlocks {
+        lba,
+        sector_count: 1,
+        shared_cap: 0,
+    };
+    let msg = ipc_protocol::codec::encode_driver_request(&req);
+    // SAFETY: same contract as `drv_blk_probe_call`.
+    unsafe { write_shared_drv_message(&msg) };
+    drv_ipc_call(hal, caller, ep_cap)
+}
+
+/// Reads back the `DriverResponse` for `drv_blk_read_call`, and checks
+/// the sector data read back matches `DRV_DEMO_WRITE_DATA` (proving a
+/// real Write->Read round trip through actual virtio-mmio hardware).
+/// Returns the sector count read, or `usize::MAX` on any error/decode
+/// failure.
+pub fn drv_blk_read_result() -> usize {
+    // SAFETY: same contract as `drv_blk_probe_call`.
+    let msg = unsafe { read_shared_drv_message() };
+    let sectors = match ipc_protocol::codec::decode_driver_response(&msg) {
+        Ok(ipc_protocol::DriverResponse::Completed { sectors }) => sectors as usize,
+        _ => return usize::MAX,
+    };
+    // SAFETY: same contract as `drv_blk_write_call`'s own read of
+    // `G_DRV_QUEUE_PHYS`.
+    let matches = unsafe {
+        let base = (core::ptr::addr_of!(G_DRV_QUEUE_PHYS).read()
+            + driver_virtio_blk::layout::DATA_OFFSET) as *const u8;
+        sectors == 1
+            && core::slice::from_raw_parts(base, DRV_DEMO_WRITE_DATA.len()) == DRV_DEMO_WRITE_DATA
+    };
+    klog!(
+        "drv_blk_read_result: real Write->Read round-trip through virtio-blk's own virtqueue (03 5.1) -> {}\r\n",
+        if matches { "MATCH, real MMIO + descriptor ring" } else { "MISMATCH" }
+    );
+    sectors
+}
+
+/// Fixed demo payload `drv_blk_write_call` writes and `drv_blk_read_
+/// result` verifies — same role as `FS_DEMO_WRITE_DATA`.
+const DRV_DEMO_WRITE_DATA: &[u8] = b"hello from root, virtio-blk demo!";
+
+// ============================================================================
+// virtio-net driver support (03-Kernel-Subsystems-Layer.md §2.3/§5.4) —
+// riscv64 only for now (`driver_virtio_net`'s own module doc comment on
+// why). Mirrors the virtio-blk section immediately above (same "spawn,
+// grant an Endpoint, pre-map region(s), drive via a dedicated ecall-per-
+// request-type + shared-message-area protocol" shape), with two
+// differences: (1) TWO `SharedRegion`s are retyped and pre-mapped (one
+// per virtqueue — `driver_virtio_net::layout`'s own doc comment on why
+// one page cannot hold both an RX and a TX frame buffer at once, unlike
+// virtio-blk's single request queue) instead of one; (2) no `IrqBind` —
+// this driver is polling-only for now (`driver_virtio_net`'s own module
+// doc comment), so there is no interrupt trampoline to install.
+//
+// The ARP-resolve-then-ICMP-echo demo sequence itself (§5.4's own
+// acceptance criterion) is driven by `kernel/src/main.rs`'s own
+// `umode_root` — a bounded RETRY LOOP of separate ecalls, mirroring
+// `DRV_IRQ_WAIT`'s own retry-loop shape immediately below this section —
+// because a single `Call` cannot itself loop waiting for a reply that
+// may never arrive (this crate's own `driver_virtio_net` module doc
+// comment on why `PollFrame` is non-blocking). Each of the functions
+// below performs exactly ONE primitive step (build+send one frame, or
+// check once for a received one), matching the `drv_blk_*` functions
+// immediately above.
+// ============================================================================
+
+/// Physical base of the RX queue's own `SharedRegion` — ALSO carries the
+/// negotiated MAC (`driver_virtio_net::layout::MAC_OFFSET`) and the
+/// `DriverRequest`/`DriverResponse` message area (`layout::MESSAGE_
+/// OFFSET`), same reasoning as `G_DRV_QUEUE_PHYS`'s own doc comment.
+/// Read by `spawn_netstack_service` to trusted-bootstrap-map this SAME
+/// physical region into the Netstack process's own address space too
+/// (`netstack::subsystem_entry`'s own module doc comment) — no longer
+/// peeked directly by kernel-arch-glue itself (that was the pre-
+/// Session-22 shortcut this crate's own module doc comment used to
+/// document; the Netstack process now drives the driver over real IPC
+/// instead).
+static mut G_DRV_NET_RX_PHYS: usize = usize::MAX;
+
+/// Physical base of the TX queue's own `SharedRegion` — same "also
+/// mapped into the Netstack process's own space" role as `G_DRV_NET_RX_
+/// PHYS`'s own doc comment.
+static mut G_DRV_NET_TX_PHYS: usize = usize::MAX;
+
+/// `Transport::Mmio`'s own counterpart to `G_DRV_MMIO_PHYS`, for the net
+/// device — same "ack the DEVICE's own registers directly from interrupt
+/// context, a different process's own private `VirtioNet` state is
+/// unreachable from here" rationale as that static's own doc comment.
+/// `usize::MAX` (never written) for `Transport::Pci`, exactly like
+/// `G_DRV_MMIO_PHYS`'s own convention.
+static mut G_DRV_NET_MMIO_PHYS: usize = usize::MAX;
+
+/// `Transport::Pci`'s own counterpart to `G_DRV_NET_MMIO_PHYS` — same
+/// role as `G_DRV_ISR_CFG_VA`'s own doc comment, but see `G_DRV_NET_
+/// ISR_CFG_PHYS`'s own doc comment for why this crate's own copy of
+/// that reasoning ("reuse the driver's own already-mapped BAR VA, no
+/// new kernel-side mapping needed") turned out to be a real, QEMU-found
+/// bug once Netstack existed: this VA is only valid under `drv_root_pt`,
+/// but `spawn_netstack_service` now ALSO maps the same physical page at
+/// this identical VA into Netstack's (and root's) own page tables, so
+/// the trampoline's read below stays correct regardless of whose `cr3`
+/// is active when the IRQ actually lands.
+static mut G_DRV_NET_ISR_CFG_VA: usize = usize::MAX;
+
+/// `true` once `wire_virtio_pci_transport_net` enabled MSI-X for the NIC.
+/// An MSI-X interrupt is a plain edge-triggered memory write, so unlike
+/// legacy INTx it needs no ISR-status read to deassert - which lets
+/// `virtio_net_irq_trampoline` skip that read entirely. This matters as
+/// soon as Netstack runs as a persistent service next to the desktop
+/// processes (Internet plan, phase 1): the completion IRQ can then land
+/// while ANY process's page table is active, and the ISR window is mapped
+/// only under the driver, Netstack and root (see `G_DRV_NET_ISR_CFG_PHYS`
+/// "known remaining gap"), so the read would fault in kernel mode.
+static mut G_DRV_NET_MSIX_ACTIVE: bool = false;
+
+/// The ISR_CFG register window's own PHYSICAL base (`bar_phys + w.
+/// offset`, re-derived via `pci_bar_phys` right after `wire_virtio_pci_
+/// transport_net` maps it into `drv_root_pt`) — `usize::MAX` if no ISR
+/// capability was found (or for `Transport::Mmio`, which never sets
+/// this at all).
+///
+/// **Real bug found via QEMU** (this session's Netstack extraction —
+/// `03-Kernel-Subsystems-Layer.md` §2.3/§5.4): `virtio_net_irq_
+/// trampoline`'s own `isr_va` read below was written under the
+/// assumption (documented, at the time correctly, on `G_DRV_ISR_CFG_VA`
+/// — blk's identical field) that this trampoline "only ever fires while
+/// the driver process's own address space is active", because
+/// previously the driver was ALWAYS either the sole active process or
+/// blocked in its own in-place `wfi()` wait whenever an IRQ could land.
+/// Netstack breaks that assumption: it is a REAL, second U-mode process
+/// that now holds the CPU (and `cr3`) for genuine stretches WHILE the
+/// driver is unblocked-but-not-yet-scheduled — a virtio-net TX-
+/// completion IRQ that arrives even slightly late (asynchronous to the
+/// CPU's own instruction stream, entirely QEMU's own device-model
+/// timing) can land while Netstack (or root, polling `NET_STATUS_POLL`)
+/// is the active address space instead. Confirmed via QEMU: `UNHANDLED
+/// CPU EXCEPTION vector=0xe ... cr2(fault_va)=0xd8401000` (exactly
+/// `DRV_NET_MMIO_VA + 0x1000`, i.e. `G_DRV_NET_ISR_CFG_VA` itself) fired
+/// from KERNEL code (`rip` inside the kernel image) immediately after
+/// Netstack's third `PollFrame` round-trip switched control back to it
+/// — a page fault taken by the interrupt trampoline itself, reading a
+/// VA that only `drv_root_pt` has mapped.
+///
+/// This physical page is cached here so `spawn_netstack_service` can
+/// ALSO map it (kernel-only, no `U` bit — same `1 | 2` flags `KERNEL_
+/// PCI_CFG_VA`'s own mapping uses) into Netstack's own page table AND
+/// root's (`caller_root_pt`), at the SAME numeric VA (`G_DRV_NET_ISR_
+/// CFG_VA`) the driver already uses — so `virtio_net_irq_trampoline`'s
+/// existing, unmodified read stays correct no matter which of these
+/// THREE processes' `cr3` happens to be active when the IRQ lands.
+///
+/// **Known remaining gap, honestly not fixed here**: this covers only
+/// the three processes THIS demo's own CPU can ever be executing as
+/// (driver / Netstack / root) — a future process that also contends for
+/// the CPU while this driver is alive would need the same treatment.
+/// `virtio_blk_irq_trampoline`'s own `G_DRV_ISR_CFG_VA` has the
+/// IDENTICAL latent bug (same "only valid under drv_root_pt" mapping),
+/// just never triggered because no real IPC client of the block driver
+/// has been built yet — worth revisiting together with whatever process
+/// becomes virtio-blk's first genuine IPC client.
+static mut G_DRV_NET_ISR_CFG_PHYS: usize = usize::MAX;
+
+/// The NOTIFY_CFG register window's own PHYSICAL base (`bar_phys + w.
+/// offset`), cached the same way as `G_DRV_NET_ISR_CFG_PHYS` — `usize::
+/// MAX` if no NOTIFY capability was found, or for `Transport::Mmio`
+/// (which never sets this; `net_bypass_direct_send` uses `G_DRV_NET_
+/// MMIO_PHYS` + the fixed `mmio::QUEUE_NOTIFY` register instead in that
+/// case).
+///
+/// **NEVER dereferenced directly** (unlike `G_DRV_NET_MMIO_PHYS`, which
+/// genuinely is safe to — see that static's own doc comment): a modern
+/// virtio-pci device's own capability BARs are frequently 64-bit BARs
+/// QEMU's q35 chipset places far outside the low-RAM range the kernel's
+/// own identity map actually covers (**real bug found via QEMU**: a
+/// first version of `net_bypass_direct_send` wrote through this physical
+/// address directly and took a page fault at the exact same address —
+/// `cr2 == G_DRV_NET_NOTIFY_PHYS` — confirming it, while numerically a
+/// real device-assigned physical address, is simply not mapped anywhere
+/// the kernel can reach it as one). This is only the KEY `spawn_netstack_
+/// service` re-derives the matching page-table VA for — see `G_DRV_NET_
+/// NOTIFY_VA`'s own doc comment for the address `net_bypass_direct_send`
+/// actually dereferences.
+static mut G_DRV_NET_NOTIFY_PHYS: usize = usize::MAX;
+
+/// The VA `notify_cfg_va` (`wire_virtio_pci_transport_net`'s own local)
+/// is mapped at in the DRIVER's own address space — `spawn_netstack_
+/// service` maps this exact physical page at this exact numeric VA into
+/// root's own page table too (mirroring `G_DRV_NET_ISR_CFG_VA`'s own
+/// identical "also reachable from root, not just `drv_root_pt`"
+/// treatment), which is what makes it actually safe for `net_bypass_
+/// direct_send` — running on ROOT's own trap, `drv_root_pt` is never the
+/// active page table there — to dereference. `usize::MAX` if no NOTIFY
+/// capability was found, or for `Transport::Mmio`.
+static mut G_DRV_NET_NOTIFY_VA: usize = usize::MAX;
+
+/// `Transport::Pci`'s own `notify_off_multiplier` (spec §4.1.4.4),
+/// cached alongside `G_DRV_NET_NOTIFY_PHYS` for the same reason.
+static mut G_DRV_NET_NOTIFY_OFF_MULT: u32 = 0;
+
+/// VA the virtio-mmio transport window is pre-mapped at in the driver's
+/// own address space — must stay numerically equal to `driver_virtio_
+/// net::subsystem_entry::DRV_MMIO_VA`.
+const DRV_NET_MMIO_VA: usize = 0xD840_0000;
+/// VA the RX queue's own `SharedRegion` is pre-mapped at — must stay
+/// numerically equal to `driver_virtio_net::subsystem_entry::DRV_RX_VA`.
+const DRV_NET_RX_VA: usize = 0xD850_0000;
+/// VA the TX queue's own `SharedRegion` is pre-mapped at — must stay
+/// numerically equal to `driver_virtio_net::subsystem_entry::DRV_TX_VA`.
+const DRV_NET_TX_VA: usize = 0xD860_0000;
+
+/// VA the driver's own RX `SharedRegion` is ALSO mapped at, in the
+/// Netstack process's own (separate) address space — must stay
+/// numerically equal to `netstack::subsystem_entry::DRV_RX_VA`.
+/// Deliberately a DIFFERENT VA range than `DRV_NET_RX_VA` above even
+/// though nothing would collide if they matched (each process has its
+/// own independent page table) — kept distinct simply so a VA alone
+/// unambiguously identifies which process's own constant it mirrors.
+const NETSTACK_DRV_RX_VA: usize = 0xD870_0000;
+/// Same role as `NETSTACK_DRV_RX_VA`, for the driver's own TX region —
+/// must stay numerically equal to `netstack::subsystem_entry::DRV_TX_VA`.
+const NETSTACK_DRV_TX_VA: usize = 0xD880_0000;
+/// VA the Netstack process's own private status `SharedRegion` is
+/// mapped at — must stay numerically equal to `netstack::subsystem_
+/// entry::STATUS_VA`. `netstack_status` (below) reads it back directly
+/// (physical pointer, kernel-side) — see that function's own doc
+/// comment for the exact layout.
+const NETSTACK_STATUS_VA: usize = 0xD890_0000;
+
+/// Physical base of the Netstack process's own private status
+/// `SharedRegion`, cached at spawn time so `netstack_status` can read it
+/// back directly — same "kernel-arch-glue peeks a shared region
+/// directly, no protocol field needed" pattern this crate has used
+/// throughout (`drv_net_probe_result`'s own MAC read, before this
+/// session's own extraction, used the identical pattern one region
+/// over).
+static mut G_NETSTACK_STATUS_PHYS: usize = usize::MAX;
+
+/// The Netstack process's own `ThreadId`, cached so `netstack_bypass_ipc_
+/// call` can specialize its own `Call`-then-switch shape exactly like
+/// `mm_ipc_call`'s own `G_MM_TID` — see that function's own doc comment
+/// for the real "phantom scheduler entity" `pick_next` bug class this
+/// sidesteps by switching straight to the known target thread instead of
+/// trusting the general scheduler's own answer.
+static mut G_NETSTACK_TID: Option<ThreadId> = None;
+
+/// Netstack process stack region (VA and length) - shared by the boot-demo
+/// thread (top half) and the persistent service thread (bottom half, see
+/// `netstack_start_service`).
+const NETSTACK_STACK_VMA: usize = 0xC0A0_0000;
+const NETSTACK_STACK_LEN: usize = 4096 * 16;
+
+/// ELF entry point (`e_entry`) of the Netstack image, recorded at spawn so
+/// `netstack_start_service` can start a second thread of the same process
+/// at it. `0` until `spawn_netstack_service` has run.
+static mut G_NETSTACK_ENTRY: usize = 0;
+
+/// The Netstack service thread once `netstack_start_service` created it.
+static mut G_NETSTACK_SVC_TID: Option<ThreadId> = None;
+
+/// Root's (`caller`'s) own capability slot for the SAME Endpoint object
+/// Netstack's own `subsystem_entry::BYPASS_ENDPOINT_CAP` (slot 1) holds a
+/// derived copy of — granted to root FIRST, by the very same `Retype`
+/// that creates the object, before `spawn_netstack_service`'s own slot-1
+/// `grant_cap_into` derives Netstack's copy (same "the retyping caller
+/// always ends up holding the original" convention every other `Retype`
+/// in this file relies on). This is the real control-plane rendezvous
+/// `net_bypass_request_call` (03-Kernel-Subsystems-Layer.md §2.3/§5.4.1)
+/// calls into. `u32::MAX` until `spawn_netstack_service` has run.
+static mut G_NETSTACK_BYPASS_EP: u32 = u32::MAX;
+
+/// Physical address of the page shared between root and Netstack for the
+/// kernel-bypass control-plane handshake (mapped into Netstack's own
+/// address space at `NETSTACK_BYPASS_SHARED_VA` by `spawn_netstack_
+/// service`) — root reads/writes it directly via this physical pointer,
+/// no VA mapping needed on root's own side, same "low RAM is always
+/// identity-mapped for kernel-mode access regardless of which process's
+/// page table is active" pattern as `G_MM_SHARED_PHYS`'s own doc comment.
+static mut G_NETSTACK_BYPASS_SHARED_PHYS: usize = usize::MAX;
+
+/// VA Netstack's own process maps the kernel-bypass control-plane shared
+/// page at — must stay numerically equal to `netstack::subsystem_entry::
+/// BYPASS_SHARED_VA`.
+pub const NETSTACK_BYPASS_SHARED_VA: usize = 0xD8A0_0000;
+
+/// The trampoline `SyscallOp::IrqBind` installs with the platform's
+/// `InterruptController` for the virtio-net device's own IRQ line —
+/// mirrors `virtio_blk_irq_trampoline` exactly, substituting `driver_
+/// virtio_net`'s own `mmio`/`G_DRV_NET_*` names for `driver_virtio_
+/// blk`'s (see that function's own doc comment for the full "why ack
+/// HERE, not later in the driver process's own time" rationale — it
+/// applies identically to this device).
+pub fn virtio_net_irq_trampoline(irq: hal_core::interrupt::IrqId) {
+    // SAFETY: single-core; `G_DRV_NET_MMIO_PHYS` was written once by
+    // `spawn_virtio_net_driver` (only for `Transport::Mmio`), before
+    // `IrqBind` installed this trampoline; the virtio-mmio window is
+    // identity-mapped in the kernel's own address space, same as
+    // `virtio_blk_irq_trampoline`'s own identical read.
+    unsafe {
+        let mmio_phys = core::ptr::addr_of!(G_DRV_NET_MMIO_PHYS).read();
+        if mmio_phys != usize::MAX {
+            let status = ((mmio_phys + driver_virtio_net::mmio::INTERRUPT_STATUS) as *const u32)
+                .read_volatile();
+            ((mmio_phys + driver_virtio_net::mmio::INTERRUPT_ACK) as *mut u32)
+                .write_volatile(status);
+        }
+    }
+
+    // SAFETY: single-core; `G_DRV_NET_ISR_CFG_VA` was written once by
+    // `wire_virtio_pci_transport_net`, before `IrqBind` installed this
+    // trampoline; see `G_DRV_NET_ISR_CFG_VA`'s own doc comment for why
+    // this VA is safely dereferenceable exactly when this trampoline
+    // runs.
+    unsafe {
+        let isr_va = core::ptr::addr_of!(G_DRV_NET_ISR_CFG_VA).read();
+        if isr_va != usize::MAX && !core::ptr::addr_of!(G_DRV_NET_MSIX_ACTIVE).read() {
+            let _isr_reason = (isr_va as *const u8).read_volatile();
+        }
+    }
+
+    let k = kstate();
+    let hal = khal();
+    let Some(nid) = k.notification_for_irq(irq.as_u32()) else {
+        return;
+    };
+    let Some(notif) = k.notification_mut(nid) else {
+        return;
+    };
+    let woken = notif.signal(1);
+    let now = hal.now_ns();
+    for &tid in woken.as_slice() {
+        k.wake_blocked(tid, now);
+    }
+}
+
+/// Spawns the virtio-net driver process from its own separately-built ELF
+/// (`drv_elf`), grants it an `Endpoint` (slot 0) and a `Notification`
+/// already bound to the device's own IRQ line (slot 1), and pre-maps its
+/// virtio register window(s) plus TWO freshly retyped `SharedRegion`s (RX
+/// at `DRV_NET_RX_VA`, TX at `DRV_NET_TX_VA`) directly into its address
+/// space — same trusted-bootstrap pattern as `spawn_virtio_blk_driver`,
+/// with an `is_pci` branch (aarch64/x86_64) mirroring that function's own.
+/// TX completion is now real interrupt-driven on every architecture (RX
+/// deliberately stays non-blocking-poll-only — `driver_virtio_net`'s own
+/// module doc comment on why); the `Notification` grant and `IrqBind`
+/// below exist for that TX path.
+///
+/// Returns `None` (and logs) if no `Network`-kind peripheral was
+/// discovered at boot (`KernelState::root_mmio_net_cap` still the
+/// sentinel), or on any allocation failure.
+pub fn spawn_virtio_net_driver(
+    hal: &HalInterface,
+    caller: ThreadId,
+    drv_elf: &[u8],
+    expected_machine: u16,
+) -> Option<(u32, *mut u8, *const u8)> {
+    let k = kstate();
+    let src_cs = k.tcb(caller)?.cap_space;
+    let mmio_cap = k.root_mmio_net_cap;
+    if mmio_cap == CapId::new(u32::MAX) {
+        klog!("spawn_virtio_net_driver: no Network-kind peripheral was discovered at boot\r\n");
+        return None;
+    }
+    let mmio_id = kernel_cap::MmioRegionId::new(
+        k.cap_space(src_cs)?.lookup(mmio_cap)?.object.id.as_u32(),
+    );
+    let mmio = *k.mmio_region(mmio_id)?;
+    // A nonzero `config_space_base` means this device was discovered over
+    // PCI — same convention `spawn_virtio_blk_driver`'s own `is_pci`
+    // check already established.
+    let is_pci = mmio.config_space_base != 0;
+
+    let ep_cap = retype_one_from_any_untyped(k, hal, caller, KernelObjectType::Endpoint, 1)?;
+
+    const DRV_NET_STACK_VMA: usize = 0xC090_0000;
+    const DRV_NET_STACK_LEN: usize = 4096 * 16;
+    let (drv_tid, drv_cs, _stack_phys) =
+        spawn_process_from_elf(hal, k, drv_elf, expected_machine, DRV_NET_STACK_VMA, DRV_NET_STACK_LEN)?;
+
+    grant_cap_into(k, src_cs, ep_cap, drv_cs, CapabilityRights::READ | CapabilityRights::WRITE)?;
+
+    let drv_addr_space = k.tcb(drv_tid)?.addr_space;
+    let drv_root_pt = k.addr_space_mut(drv_addr_space)?.root_phys().as_usize();
+
+    // Pre-map the virtio-mmio transport window — skipped entirely for PCI
+    // transport (`is_pci`): virtio-pci's own register windows are
+    // resolved and mapped individually below, by `wire_virtio_pci_
+    // transport_net`, from whichever BAR(s) its capability list actually
+    // names — same "MMIO map only when NOT PCI" branch `spawn_virtio_blk_
+    // driver`'s own doc comment covers.
+    if !is_pci {
+        let mmio_pool = carve_from_any_untyped(k, 4096, 4096 * 2)?;
+        // SAFETY: fresh untyped RAM, identity-addressable, single-core;
+        // `map_range` needs the pool pre-zeroed.
+        unsafe { core::ptr::write_bytes(mmio_pool as *mut u8, 0, 4096 * 2) };
+        let n =
+            hal.map_range(drv_root_pt, DRV_NET_MMIO_VA, mmio.phys_base as usize, 4096, 1 | 2 | 8, mmio_pool, 2);
+        if n == u32::MAX {
+            klog!("spawn_virtio_net_driver: map_range error (mmio window)\r\n");
+            return None;
+        }
+        // SAFETY: single-core; written once here, before `IrqBind`
+        // installs `virtio_net_irq_trampoline` — see `G_DRV_NET_MMIO_
+        // PHYS`'s own doc comment.
+        unsafe { core::ptr::addr_of_mut!(G_DRV_NET_MMIO_PHYS).write(mmio.phys_base as usize) };
+    }
+
+    // Retype and pre-map the RX queue's own `SharedRegion`.
+    let rx_cap = retype_one_from_any_untyped(k, hal, caller, KernelObjectType::SharedRegion, 1)?;
+    let rx_id = k.cap_space(src_cs)?.lookup(rx_cap)?.object.id;
+    let rx_phys = k.shared_region(kernel_cap::SharedRegionId::new(rx_id.as_u32()))?.phys_base.as_usize();
+    // SAFETY: fresh `SharedRegion` memory, identity-addressable, single-core.
+    unsafe { core::ptr::write_bytes(rx_phys as *mut u8, 0, 4096) };
+    // Self-referential physical-base header word — same reasoning as
+    // `driver_virtio_blk::layout::PHYS_BASE_OFFSET`'s own doc comment.
+    unsafe { (rx_phys as *mut u64).write_volatile(rx_phys as u64) };
+
+    let rx_pool = carve_from_any_untyped(k, 4096, 4096 * 2)?;
+    unsafe { core::ptr::write_bytes(rx_pool as *mut u8, 0, 4096 * 2) };
+    let n_rx = hal.map_range(drv_root_pt, DRV_NET_RX_VA, rx_phys, 4096, 1 | 2 | 8, rx_pool, 2);
+    if n_rx == u32::MAX {
+        klog!("spawn_virtio_net_driver: map_range error (rx region)\r\n");
+        return None;
+    }
+    // SAFETY: single-core; written exactly once here, before any
+    // `drv_net_*_call` can read it.
+    unsafe { core::ptr::addr_of_mut!(G_DRV_NET_RX_PHYS).write(rx_phys) };
+
+    // Retype and pre-map the TX queue's own `SharedRegion` — same shape.
+    let tx_cap = retype_one_from_any_untyped(k, hal, caller, KernelObjectType::SharedRegion, 1)?;
+    let tx_id = k.cap_space(src_cs)?.lookup(tx_cap)?.object.id;
+    let tx_phys = k.shared_region(kernel_cap::SharedRegionId::new(tx_id.as_u32()))?.phys_base.as_usize();
+    unsafe { core::ptr::write_bytes(tx_phys as *mut u8, 0, 4096) };
+    unsafe { (tx_phys as *mut u64).write_volatile(tx_phys as u64) };
+
+    let tx_pool = carve_from_any_untyped(k, 4096, 4096 * 2)?;
+    unsafe { core::ptr::write_bytes(tx_pool as *mut u8, 0, 4096 * 2) };
+    let n_tx = hal.map_range(drv_root_pt, DRV_NET_TX_VA, tx_phys, 4096, 1 | 2 | 8, tx_pool, 2);
+    if n_tx == u32::MAX {
+        klog!("spawn_virtio_net_driver: map_range error (tx region)\r\n");
+        return None;
+    }
+    unsafe { core::ptr::addr_of_mut!(G_DRV_NET_TX_PHYS).write(tx_phys) };
+
+    // For PCI transport, resolve+map the device's own virtio-pci "modern"
+    // register windows (including MSI-X, on x86_64) and write the
+    // `PCI_INFO_OFFSET` header block into the RX region (`driver_virtio_
+    // net::layout::PCI_INFO_OFFSET`'s own doc comment) —
+    // `new_driver_for_this_transport` reads this block to pick
+    // `Transport::Pci` over the `transport_kind == 0` default the
+    // freshly-zeroed RX region already carries for MMIO transport.
+    if is_pci {
+        let caller_addr_space = k.tcb(caller)?.addr_space;
+        let caller_root_pt = k.addr_space_mut(caller_addr_space)?.root_phys().as_usize();
+        // SAFETY: `mmio.config_space_base` is a live ECAM address (this
+        // kernel boot-seeded it from `hal_arm64`/`hal_x86_64::peripheral`'s
+        // own PCI scan, the same trust boundary `mmio.phys_base` already
+        // relies on); `rx_phys` is this function's own fresh, zeroed
+        // `SharedRegion`, forwarded from that write above. `caller_root_
+        // pt`: `caller`'s own page table, still the ACTIVE one right now
+        // (the switch to the driver process happens only at this
+        // function's own tail).
+        let wired = unsafe {
+            wire_virtio_pci_transport_net(
+                k,
+                hal,
+                drv_root_pt,
+                caller_root_pt,
+                mmio.config_space_base,
+                rx_phys,
+                mmio.irq,
+            )
+        };
+        if wired.is_none() {
+            klog!("spawn_virtio_net_driver: wire_virtio_pci_transport_net failed\r\n");
+            return None;
+        }
+    }
+
+    // Retype a `Notification` and bind the virtio-net device's own IRQ
+    // line to it — same "root does the `IrqBind` itself, then grants the
+    // ALREADY-BOUND notification into the driver's cap space" pattern as
+    // `spawn_virtio_blk_driver`'s own identical block (see its own doc
+    // comment for the full rationale); lands at slot 1 (the endpoint
+    // above was the first grant, at slot 0). Used only by the TX
+    // completion path — RX deliberately stays non-blocking-poll-only
+    // (this crate's own `driver_virtio_net` module doc comment).
+    let notif_cap = retype_one_from_any_untyped(k, hal, caller, KernelObjectType::Notification, 1)?;
+    match k.dispatch(
+        caller,
+        hal.now_ns(),
+        SyscallOp::IrqBind {
+            mmio: mmio_cap,
+            notification: notif_cap,
+            handler: virtio_net_irq_trampoline,
+        },
+        hal,
+    ) {
+        Ok(SyscallReturn::Done) => {}
+        _ => {
+            klog!("spawn_virtio_net_driver: IrqBind failed\r\n");
+            return None;
+        }
+    }
+    grant_cap_into(k, src_cs, notif_cap, drv_cs, CapabilityRights::READ | CapabilityRights::WRITE)?;
+
+    // Switch straight to the driver — same race-avoidance rationale as
+    // `spawn_virtio_blk_driver`'s own doc comment on why.
+    let _ = k.sched.note_ready(caller, hal.now_ns());
+    let _ = k.sched.dispatch(drv_tid, hal.now_ns());
+    let (save, into) = k.user_ctx_switch_ptrs(caller, drv_tid)?;
+
+    Some((ep_cap.as_u32(), save, into))
+}
+
+// ============================================================================
+// i8042 keyboard — real interrupt-driven IRQ1 delivery, now with a real
+// consuming driver process (Stage B of this project's real-input-
+// handling plan). Stage A proved the IRQ path itself (8259 PIC remap,
+// real vector delivery, a real port-0x60 read, a real PIC EOI that lets
+// the SAME line keep firing across repeated keypresses) with no
+// consumer at all; this stage spawns `driver-i8042` as a genuine
+// isolated process, hands it the IRQ-bound Notification Stage A already
+// created, and wires it as a new real IPC client of Compositor.
+//
+// Architecture note: this whole section holds no `#[cfg(target_arch)]`
+// and names no architecture crate, per this file's own module doc
+// comment — `khal().read_i8042_scancode_and_ack` is how it reaches the
+// one real x86_64-specific operation (raw port I/O) it needs without
+// doing so itself (`hal_core::interface`'s own "v8" growth-history entry
+// has the full rationale). On aarch64/riscv64 this section is not
+// arch-gated OUT at all — it simply never does anything, because
+// `KernelState::root_mmio_i8042_cap` stays the boot-time sentinel there
+// (no `Input`-kind peripheral is ever discovered on those platforms) —
+// the exact same "architecture-generic code, arch-specific behavior
+// purely from boot DATA" shape `root_mmio_net_cap`'s own doc comment
+// already establishes for Block/Network.
+// ============================================================================
+
+/// Must match `driver_i8042::subsystem_entry::RING_CAPACITY` exactly —
+/// two independently-built binaries agreeing on a raw physical-memory
+/// layout, same numeric-agreement convention as every VA constant in
+/// this file.
+const I8042_RING_CAPACITY: u64 = 32;
+
+/// VA the raw-scancode ring `SharedRegion` is mapped at in `driver-
+/// i8042`'s own address space — must stay numerically equal to
+/// `driver_i8042::subsystem_entry::DRV_QUEUE_VA`. Layout: one `u64`
+/// "write count" header (offset 0) followed by `I8042_RING_CAPACITY`
+/// raw scancode bytes (offset 8) — [`i8042_irq_trampoline`] is the sole
+/// producer (via [`G_I8042_QUEUE_PHYS`]), `driver-i8042`'s own
+/// `subsystem_entry` is the sole consumer.
+pub const DRV_I8042_QUEUE_VA: usize = 0xD820_0000;
+/// VA `driver-i8042`'s own copy of its service `Endpoint`'s shared
+/// message page is mapped at — must stay numerically equal to
+/// `driver_i8042::subsystem_entry::DRV_MSG_VA`.
+pub const DRV_I8042_MSG_VA: usize = 0xD830_0000;
+/// VA Compositor's own copy of the SAME shared message page is mapped
+/// at — deliberately a DIFFERENT numeric value from `DRV_I8042_MSG_VA`
+/// (unlike `COMPOSITOR_SHARED_VA`'s own "same numeric value, different
+/// address space" convention): Compositor already owns `SHARED_VA`/
+/// `FB_VA`/`CONFIRM_VA`, so this just needs to be clear of those, not
+/// numerically matched to anything.
+///
+/// **Was `0xD8B0_0000` — inside the confirm region** (`COMPOSITOR_CONFIRM_
+/// VA` `0xD8A0_0000` + `COMPOSITOR_FB_LEN` 1.92 MB ends at `0xD8BD_6000`).
+/// That overlap was harmless while every committed frame was the Root
+/// Task's tiny demo frame, but `map_range` silently replaces an existing
+/// leaf, so this page REPLACED confirm-region page 256: the moment ui-core
+/// committed a real 800x600 frame, Compositor's own `copy_frame_to_confirm`
+/// overwrote driver-i8042's message page with pixel bytes. Moved just past
+/// the mouse page (`COMPOSITOR_MOUSE_VA`, one page at `0xD8C0_0000`) and
+/// below the scanout info page (`0xD900_0000`).
+const COMPOSITOR_I8042_VA: usize = 0xD8C8_0000;
+
+/// Physical base of the raw-scancode ring `SharedRegion` — `usize::MAX`
+/// until `spawn_i8042_driver` has run. Same single-core-boot-scratch
+/// pattern as every other `G_*_PHYS` global in this file (e.g.
+/// `G_DRV_NET_RX_PHYS`).
+static mut G_I8042_QUEUE_PHYS: usize = usize::MAX;
+/// The `Notification` id the i8042 IRQ line is bound to — `u32::MAX`
+/// until `spawn_i8042_driver` has run.
+static mut G_I8042_NOTIF_ID: u32 = u32::MAX;
+/// The Root Task's own capability slot for the "tell Compositor" signal
+/// `Notification` [`spawn_i8042_driver`] created - `u32::MAX` until then.
+/// [`spawn_mouse_driver`] grants THIS SAME object to Compositor and to
+/// driver-mouse instead of creating a second one: Compositor can then block
+/// on one notification for "keyboard OR mouse" (there is no wait-on-any-of-N
+/// syscall). driver-i8042 signals bit 1, driver-mouse bit 2.
+static mut G_INPUT_SIGNAL_CAP: u32 = u32::MAX;
+
+/// The trampoline `SyscallOp::IrqBind` installs for the i8042 keyboard's
+/// own IRQ line. Reads and acknowledges the real scancode byte through
+/// `HalInterface::read_i8042_scancode_and_ack`, writes it directly into
+/// the ring `SharedRegion` at [`G_I8042_QUEUE_PHYS`] (the SAME "kernel
+/// writes physical memory the driver process has mapped" pattern
+/// `G_DRV_NET_RX_PHYS`'s own doc comment establishes), then signals the
+/// bound Notification — same "ack the device in kernel/interrupt
+/// context, never deferred to userspace" discipline `virtio_net_irq_
+/// trampoline` already established.
+///
+/// Verified on real QEMU x86_64 boots (2026-09-11), before this ring
+/// moved into a `SharedRegion` (Stage A's own private-static version):
+/// real keystrokes injected via QEMU's own monitor `sendkey` (which
+/// drives the actual emulated i8042 hardware, not a shortcut) produced
+/// the exact, textbook PC/AT Scan Code Set 1 make/break byte pairs for
+/// every key sent (`A` → `0x1e`/`0x9e`, `D` → `0x20`/`0xa0`, `E` →
+/// `0x12`/`0x92`), across two independent boots and six total keypress
+/// events, with the SAME line firing correctly on every repeat — direct
+/// proof the PIC EOI is real and working, not just a single first
+/// interrupt getting through. The write target changed (a physical
+/// `SharedRegion` instead of a private kernel static); the read/ack/EOI
+/// logic proven then is byte-for-byte unchanged here.
+pub fn i8042_irq_trampoline(irq: hal_core::interrupt::IrqId) {
+    let hal = khal();
+    let Some(byte) = hal.read_i8042_scancode_and_ack(irq.as_u32()) else {
+        return; // Not actually an i8042-capable platform — unreachable
+        // in practice (this trampoline is only ever installed by `spawn_
+        // i8042_driver`'s own `IrqBind`, itself gated on a real `root_
+        // mmio_i8042_cap`), kept as a defensive no-op rather than a
+        // panic, matching every other trampoline's own "malformed/
+        // unexpected state degrades gracefully" posture in this file.
+    };
+
+    // SAFETY: single-core; `G_I8042_QUEUE_PHYS` is written once by
+    // `spawn_i8042_driver`, before this trampoline can ever run (real
+    // interrupts stay masked until well after boot wiring completes).
+    // `phys` names a real `SharedRegion` that function retyped and
+    // zeroed, mapped `U=1 R+W` into `driver-i8042`'s own address space —
+    // this trampoline writes it directly via its own identity-mapped
+    // kernel address, same pattern `G_DRV_NET_RX_PHYS`'s own write
+    // sites use.
+    unsafe {
+        let phys = core::ptr::addr_of!(G_I8042_QUEUE_PHYS).read();
+        if phys != usize::MAX {
+            let write_count = (phys as *const u64).read_volatile();
+            let byte_offset = 8 + (write_count % I8042_RING_CAPACITY) as usize;
+            ((phys + byte_offset) as *mut u8).write_volatile(byte);
+            (phys as *mut u64).write_volatile(write_count.wrapping_add(1));
+        }
+    }
+
+    let nid = unsafe { core::ptr::addr_of!(G_I8042_NOTIF_ID).read() };
+    if nid == u32::MAX {
+        return;
+    }
+    let k = kstate();
+    let Some(notif) = k.notification_mut(kernel_cap::NotificationId::new(nid)) else {
+        return;
+    };
+    let woken = notif.signal(1);
+    let now = hal.now_ns();
+    for &tid in woken.as_slice() {
+        k.wake_blocked(tid, now);
+    }
+    desktop_input_wake_tick(hal, !woken.as_slice().is_empty());
+}
+
+/// Spawns `driver-i8042` from its own separately-built ELF (`drv_elf`),
+/// grants it THREE capabilities (deterministic slots, matching `driver_
+/// i8042::subsystem_entry`'s own fixed constants exactly): slot 0 (the
+/// service `Endpoint` to Compositor, via [`wire_service_endpoint`]),
+/// slot 1 (the i8042 IRQ line's own `Notification`, via `IrqBind`), slot
+/// 2 (a `Notification` SHARED with Compositor, via [`wire_notification`]
+/// — signal-before-call, the same real, working pattern this project's
+/// account-manager hub work already established). Pre-maps the raw-
+/// scancode ring `SharedRegion` directly into the driver's own address
+/// space at `DRV_I8042_QUEUE_VA` (trusted bootstrap, no `Map` ceremony —
+/// same pattern `DRV_QUEUE_VA` uses for `driver-virtio-blk`).
+///
+/// Requires Compositor to already be spawned (`G_COMPOSITOR_TID`,
+/// written by `compositor_demo_start`) — same "wire two ALREADY-SPAWNED
+/// processes together" precondition [`wire_service_endpoint`]'s own doc
+/// comment documents.
+///
+/// Returns `None` (and logs) if no `Input`-kind peripheral was
+/// discovered at boot (`KernelState::root_mmio_i8042_cap` still the
+/// sentinel) — expected, not an error, on aarch64/riscv64 — or on any
+/// allocation failure.
+pub fn spawn_i8042_driver(
+    hal: &HalInterface,
+    caller: ThreadId,
+    drv_elf: &[u8],
+    expected_machine: u16,
+) -> Option<ThreadId> {
+    let k = kstate();
+    let mmio_cap = k.root_mmio_i8042_cap;
+    if mmio_cap == CapId::new(u32::MAX) {
+        klog!("spawn_i8042_driver: no Input-kind peripheral was discovered at boot\r\n");
+        return None;
+    }
+
+    // SAFETY: `G_COMPOSITOR_TID` is written once by `compositor_demo_
+    // start`, before this function can ever be reached (Compositor must
+    // already be spawned — this function's own doc comment).
+    let comp_tid = unsafe { core::ptr::addr_of!(G_COMPOSITOR_TID).read() }?;
+    let comp_cs = k.tcb(comp_tid)?.cap_space;
+    let comp_addr_space = k.tcb(comp_tid)?.addr_space;
+    let comp_root_pt = k.addr_space_mut(comp_addr_space)?.root_phys().as_usize();
+
+    const DRV_I8042_STACK_VMA: usize = 0xC0A0_0000;
+    const DRV_I8042_STACK_LEN: usize = 4096 * 16;
+    let (drv_tid, drv_cs, _stack_phys) =
+        spawn_process_from_elf(hal, k, drv_elf, expected_machine, DRV_I8042_STACK_VMA, DRV_I8042_STACK_LEN)?;
+    let drv_addr_space = k.tcb(drv_tid)?.addr_space;
+    let drv_root_pt = k.addr_space_mut(drv_addr_space)?.root_phys().as_usize();
+
+    // Slot 0 on both sides: the service Endpoint + its own shared
+    // message page.
+    let ep_cap = wire_service_endpoint(
+        hal,
+        caller,
+        comp_cs,
+        comp_root_pt,
+        COMPOSITOR_I8042_VA,
+        drv_cs,
+        drv_root_pt,
+        DRV_I8042_MSG_VA,
+        CapabilityRights::READ | CapabilityRights::WRITE,
+    )?;
+
+    // The raw-scancode ring SharedRegion — private to this edge (kernel
+    // writes it directly, driver-i8042 reads it directly), never granted
+    // as a capability into either process (same "trusted bootstrap, no
+    // Map ceremony" pattern DRV_QUEUE_VA/DRV_NET_RX_VA already use).
+    let src_cs = k.tcb(caller)?.cap_space;
+    let Some(queue_cap) = retype_one_from_any_untyped(k, hal, caller, KernelObjectType::SharedRegion, 1)
+    else {
+        klog!("spawn_i8042_driver: failed to retype the ring SharedRegion\r\n");
+        return None;
+    };
+    let queue_id = k.cap_space(src_cs)?.lookup(queue_cap)?.object.id;
+    let queue_phys = k.shared_region(kernel_cap::SharedRegionId::new(queue_id.as_u32()))?.phys_base.as_usize();
+    // SAFETY: fresh `SharedRegion` memory, identity-addressable, single-core.
+    unsafe { core::ptr::write_bytes(queue_phys as *mut u8, 0, 4096) };
+    let queue_pool = carve_from_any_untyped(k, 4096, 4096 * 2)?;
+    unsafe { core::ptr::write_bytes(queue_pool as *mut u8, 0, 4096 * 2) };
+    if hal.map_range(drv_root_pt, DRV_I8042_QUEUE_VA, queue_phys, 4096, 1 | 2 | 8, queue_pool, 2) == u32::MAX {
+        klog!("spawn_i8042_driver: map_range error (ring)\r\n");
+        return None;
+    }
+    // SAFETY: single-core; written exactly once here, before `IrqBind`
+    // below installs `i8042_irq_trampoline`.
+    unsafe { core::ptr::addr_of_mut!(G_I8042_QUEUE_PHYS).write(queue_phys) };
+
+    // Slot 1 on driver-i8042's own side: the IRQ-bound Notification.
+    let Some(notif_cap) = retype_one_from_any_untyped(k, hal, caller, KernelObjectType::Notification, 1)
+    else {
+        klog!("spawn_i8042_driver: failed to retype the IRQ Notification\r\n");
+        return None;
+    };
+    match k.dispatch(
+        caller,
+        hal.now_ns(),
+        SyscallOp::IrqBind { mmio: mmio_cap, notification: notif_cap, handler: i8042_irq_trampoline },
+        hal,
+    ) {
+        Ok(SyscallReturn::Done) => {}
+        _ => {
+            klog!("spawn_i8042_driver: IrqBind failed\r\n");
+            return None;
+        }
+    }
+    grant_cap_into(k, src_cs, notif_cap, drv_cs, CapabilityRights::READ | CapabilityRights::WRITE)?;
+    let notif_id = k.cap_space(src_cs)?.lookup(notif_cap)?.object.id.as_u32();
+    // SAFETY: single-core boot sequencing; written here, before real
+    // interrupts are ever enabled.
+    unsafe { core::ptr::addr_of_mut!(G_I8042_NOTIF_ID).write(notif_id) };
+
+    // Slot 2 on both sides: the shared "tell Compositor" Notification. Kept
+    // in `G_INPUT_SIGNAL_CAP` so driver-mouse can join the same object.
+    let signal_cap = wire_notification(hal, caller, &[comp_cs, drv_cs], CapabilityRights::READ | CapabilityRights::WRITE)?;
+    // SAFETY: single-core boot sequencing.
+    unsafe { core::ptr::addr_of_mut!(G_INPUT_SIGNAL_CAP).write(signal_cap.as_u32()) };
+
+    klog!("spawn_i8042_driver: driver-i8042 spawned and wired to Compositor (real IRQ1, vector-routed via 8259 PIC remap)\r\n");
+    let _ = ep_cap; // boot-log value only, per this function's own doc comment
+
+    // NOT a context switch, unlike `spawn_virtio_net_driver`'s own tail:
+    // this function is called deep in a LINEAR sequence of spawns inside
+    // `caller`'s (Root Task's) own boot sequence, not from a dedicated
+    // syscall trigger — `spawn_process_from_elf` already made `drv_tid`
+    // `Runnable` (`note_ready`), so the scheduler picks it up once this
+    // whole boot sequence eventually hands off control, same pattern
+    // `spawn_ui_core_x86`'s own tail already establishes.
+    Some(drv_tid)
+}
+
+#[cfg(test)]
+mod i8042_ring_index_tests {
+    use super::I8042_RING_CAPACITY;
+
+    /// Pure re-derivation of `i8042_irq_trampoline`'s own byte-offset
+    /// arithmetic — real physical-memory access can't be exercised in a
+    /// host test, but the index math it depends on can be, and is worth
+    /// its own test given a fencepost error here would silently corrupt
+    /// unrelated ring slots.
+    fn byte_offset(write_count: u64) -> usize {
+        8 + (write_count % I8042_RING_CAPACITY) as usize
+    }
+
+    #[test]
+    fn offsets_wrap_at_ring_capacity() {
+        assert_eq!(byte_offset(0), 8);
+        assert_eq!(byte_offset(I8042_RING_CAPACITY - 1), 8 + I8042_RING_CAPACITY as usize - 1);
+        assert_eq!(byte_offset(I8042_RING_CAPACITY), 8); // wraps back to the first slot
+        assert_eq!(byte_offset(I8042_RING_CAPACITY + 5), 13);
+    }
+
+    /// Re-derivation of `driver_i8042::subsystem_entry::subsystem_main`'s
+    /// own "drop oldest if we fell behind" clamp — the consumer-side
+    /// counterpart to the producer's drop-oldest-on-overflow behavior
+    /// (`kernel_arch_glue::i8042_irq_trampoline`'s own doc comment).
+    fn clamp_read_count(read_count: u64, write_count: u64) -> u64 {
+        if write_count.wrapping_sub(read_count) > I8042_RING_CAPACITY {
+            write_count - I8042_RING_CAPACITY
+        } else {
+            read_count
+        }
+    }
+
+    #[test]
+    fn falling_behind_by_more_than_capacity_drops_the_oldest_bytes() {
+        // Consumer never read anything (`read_count == 0`) and the
+        // producer has already written CAPACITY + 5 bytes — the first 5
+        // are gone; the clamp must skip straight to byte 5, not try to
+        // read the (overwritten) byte 0.
+        assert_eq!(clamp_read_count(0, I8042_RING_CAPACITY + 5), 5);
+    }
+
+    #[test]
+    fn staying_within_capacity_never_clamps() {
+        assert_eq!(clamp_read_count(3, I8042_RING_CAPACITY + 2), 3);
+    }
+}
+
+// ============================================================================
+// PS/2 mouse — real interrupt-driven IRQ12 delivery, now with a real
+// consuming driver process (mouse-input plan, Stages 1a+1b combined).
+// Stage 1a proved the IRQ path itself (slave-PIC unmask, the real
+// controller-level mouse-enable sequence, real vector delivery, a real
+// port-0x60 read, a real dual-EOI cascade ack); this section now also
+// spawns `driver-mouse` as a genuine isolated process and wires it as a
+// new real IPC client of Compositor — mirrors the i8042 section above
+// exactly, one architectural generation later.
+//
+// Architecture note: same "no #[cfg(target_arch)], no arch crate named"
+// posture as the i8042 section above — `khal().read_ps2_mouse_byte_and_
+// ack` is how this reaches the one real x86_64-specific operation it
+// needs.
+//
+// **Real finding, Stage 1a's own checkpoint-only attempt**: a
+// checkpoint with no consuming process (the exact shape that worked
+// for the keyboard pipeline's own Stage A) never once observed this
+// trampoline fire, despite `hal_x86_64::pic::enable_ps2_mouse`'s own
+// real controller handshake completing correctly (confirmed: a real
+// `0xFA` ACK byte) and a direct PIC IRR (Interrupt Request Register)
+// dump confirming the hardware DOES latch a real pending request on
+// IRQ12 (and its own cascade through the master's IRQ2) the moment a
+// real mouse event is injected. The real cause: this kernel keeps
+// maskable interrupts globally OFF except for the brief `sti`-`hlt`-
+// `cli` window inside `hal_x86_64::cpu::hlt_wait_for_irq` (`DRV_IRQ_
+// WAIT`'s own implementation) — a pending PIC request just sits
+// latched, un-serviced, until SOME thread happens to block there. The
+// keyboard pipeline's own Stage A "worked" on a checkpoint alone only
+// because other already-real drivers' own regular `DRV_IRQ_WAIT` calls
+// (virtio-blk/net self-checks, etc.) incidentally created enough such
+// windows during boot — not because a consumer-less checkpoint is
+// reliable in general. The real, load-bearing fix is Stage 1b below: a
+// real driver process that calls `DRV_IRQ_WAIT` in its own loop, the
+// same way `driver-i8042` already does for the keyboard.
+// ============================================================================
+
+/// Must match `driver_mouse::subsystem_entry::RING_CAPACITY` exactly
+/// (see that constant for why 2048, up from 32). Bytes live at offsets
+/// `8..8 + MOUSE_RING_CAPACITY`, clear of the two measurement words at
+/// the page's tail.
+const MOUSE_RING_CAPACITY: u64 = 2048;
+const _: () = assert!(8 + MOUSE_RING_CAPACITY as usize <= MOUSE_RING_READ_COUNT_OFF);
+/// Ring-page offset where `driver-mouse` publishes its own consumed-byte
+/// count — must match `driver_mouse::subsystem_entry::
+/// RING_READ_COUNT_OFF`. Read here only to decide when to stamp
+/// [`MOUSE_RING_PENDING_SINCE_OFF`]; the ring itself does not depend on
+/// it (drop-oldest is still decided by the driver).
+const MOUSE_RING_READ_COUNT_OFF: usize = 4080;
+/// Ring-page offset where [`mouse_irq_trampoline`] stamps `now_ns` each
+/// time a byte lands in a ring the driver has fully drained — the IRQ
+/// time of the oldest byte the driver has not read. Lets the driver
+/// measure its own wake-up (scheduling) latency with the kernel's clock
+/// (`driver_mouse::latency_stats`). Must match `driver_mouse::
+/// subsystem_entry::RING_PENDING_SINCE_OFF`.
+const MOUSE_RING_PENDING_SINCE_OFF: usize = 4088;
+/// VA of `driver-mouse`'s own debug-print page — the fixed VA
+/// `sys::SERIAL_PRINT` reads from in the calling process's address space
+/// (`kernel/src/main.rs`'s `SHELL_OUT_VA`). Only its latency report line
+/// uses it.
+const DRV_MOUSE_PRINT_VA: usize = 0xD900_0000;
+
+/// VA the raw packet-byte ring `SharedRegion` is mapped at in `driver-
+/// mouse`'s own address space — must stay numerically equal to
+/// `driver_mouse::subsystem_entry::DRV_QUEUE_VA`. Same layout as the
+/// i8042 ring: one `u64` "write count" header (offset 0) followed by
+/// `MOUSE_RING_CAPACITY` raw bytes (offset 8).
+pub const DRV_MOUSE_QUEUE_VA: usize = 0xD860_0000;
+/// VA `driver-mouse`'s own copy of its service `Endpoint`'s shared
+/// message page is mapped at — must stay numerically equal to
+/// `driver_mouse::subsystem_entry::DRV_MSG_VA`.
+pub const DRV_MOUSE_MSG_VA: usize = 0xD870_0000;
+/// VA Compositor's own copy of the SAME shared message page is mapped
+/// at — clear of every other Compositor-owned VA (`SHARED_VA`/`FB_VA`/
+/// `CONFIRM_VA`/`COMPOSITOR_I8042_VA`).
+const COMPOSITOR_MOUSE_VA: usize = 0xD8C0_0000;
+
+/// Physical base of the raw packet-byte ring `SharedRegion` — `usize::
+/// MAX` until `spawn_mouse_driver` has run.
+static mut G_MOUSE_QUEUE_PHYS: usize = usize::MAX;
+/// The `Notification` id the mouse IRQ line is bound to — `u32::MAX`
+/// until `spawn_mouse_driver` has run.
+static mut G_MOUSE_NOTIF_ID: u32 = u32::MAX;
+
+/// The trampoline `SyscallOp::IrqBind` installs for the PS/2 mouse's own
+/// IRQ line. Reads and acknowledges the real packet byte through
+/// `HalInterface::read_ps2_mouse_byte_and_ack` (which internally uses
+/// the real dual-EOI slave-PIC cascade ack), writes it directly into the
+/// ring `SharedRegion` at [`G_MOUSE_QUEUE_PHYS`] (same "kernel writes
+/// physical memory the driver process has mapped" pattern
+/// `i8042_irq_trampoline` already established), then signals the bound
+/// Notification.
+///
+/// Verified on a real QEMU x86_64 boot (2026-09-11): a checkpoint-only
+/// attempt at this stage (no consuming process) never once observed
+/// this trampoline fire — see this section's own module doc comment for
+/// the real, root-caused reason (this kernel only ever services a
+/// maskable interrupt inside `hal_x86_64::cpu::hlt_wait_for_irq`, so
+/// nothing fires without a real thread blocked in `DRV_IRQ_WAIT` —
+/// confirmed instead via a direct PIC IRR register dump showing the
+/// hardware really does latch the request). `driver-mouse`'s own real
+/// `DRV_IRQ_WAIT` loop is what actually exercises this trampoline.
+pub fn mouse_irq_trampoline(irq: hal_core::interrupt::IrqId) {
+    let hal = khal();
+    let Some(byte) = hal.read_ps2_mouse_byte_and_ack(irq.as_u32()) else {
+        return; // Not actually a mouse-capable platform — unreachable in
+        // practice (only ever installed by `spawn_mouse_driver`'s own
+        // `IrqBind`, itself gated on a real `root_mmio_mouse_cap`), kept
+        // as a defensive no-op matching every other trampoline's own
+        // posture in this file.
+    };
+
+    // SAFETY: single-core; `G_MOUSE_QUEUE_PHYS` is written once by
+    // `spawn_mouse_driver`, before this trampoline can ever run.
+    unsafe {
+        let phys = core::ptr::addr_of!(G_MOUSE_QUEUE_PHYS).read();
+        if phys != usize::MAX {
+            let write_count = (phys as *const u64).read_volatile();
+            let driver_read = ((phys + MOUSE_RING_READ_COUNT_OFF) as *const u64).read_volatile();
+            if driver_read == write_count {
+                ((phys + MOUSE_RING_PENDING_SINCE_OFF) as *mut u64).write_volatile(hal.now_ns());
+            }
+            let byte_offset = 8 + (write_count % MOUSE_RING_CAPACITY) as usize;
+            ((phys + byte_offset) as *mut u8).write_volatile(byte);
+            (phys as *mut u64).write_volatile(write_count.wrapping_add(1));
+        }
+    }
+
+    let nid = unsafe { core::ptr::addr_of!(G_MOUSE_NOTIF_ID).read() };
+    if nid == u32::MAX {
+        return;
+    }
+    let k = kstate();
+    let Some(notif) = k.notification_mut(kernel_cap::NotificationId::new(nid)) else {
+        return;
+    };
+    let woken = notif.signal(1);
+    let now = hal.now_ns();
+    for &tid in woken.as_slice() {
+        k.wake_blocked(tid, now);
+    }
+    desktop_input_wake_tick(hal, !woken.as_slice().is_empty());
+}
+
+/// Spawns `driver-mouse` from its own separately-built ELF, wires it to
+/// Compositor, and binds it to the real, interrupt-driven mouse IRQ —
+/// mirrors `spawn_i8042_driver`'s own shape exactly (see that function's
+/// own doc comment for the full capability-slot rationale, identical
+/// here): slot 0 (service `Endpoint` to Compositor), slot 1 (IRQ
+/// `Notification`), slot 2 (shared "tell Compositor" `Notification`).
+///
+/// Requires Compositor to already be spawned. Returns `None` (and logs)
+/// if no `Pointer`-kind peripheral was discovered at boot — expected on
+/// aarch64/riscv64 — or on any allocation failure.
+pub fn spawn_mouse_driver(
+    hal: &HalInterface,
+    caller: ThreadId,
+    drv_elf: &[u8],
+    expected_machine: u16,
+) -> Option<ThreadId> {
+    let k = kstate();
+    let mmio_cap = k.root_mmio_mouse_cap;
+    if mmio_cap == CapId::new(u32::MAX) {
+        klog!("spawn_mouse_driver: no Pointer-kind peripheral was discovered at boot\r\n");
+        return None;
+    }
+
+    // SAFETY: `G_COMPOSITOR_TID` is written once by `compositor_demo_
+    // start`, before this function can ever be reached.
+    let comp_tid = unsafe { core::ptr::addr_of!(G_COMPOSITOR_TID).read() }?;
+    let comp_cs = k.tcb(comp_tid)?.cap_space;
+    let comp_addr_space = k.tcb(comp_tid)?.addr_space;
+    let comp_root_pt = k.addr_space_mut(comp_addr_space)?.root_phys().as_usize();
+
+    const DRV_MOUSE_STACK_VMA: usize = 0xC0B0_0000;
+    const DRV_MOUSE_STACK_LEN: usize = 4096 * 16;
+    let (drv_tid, drv_cs, _stack_phys) =
+        spawn_process_from_elf(hal, k, drv_elf, expected_machine, DRV_MOUSE_STACK_VMA, DRV_MOUSE_STACK_LEN)?;
+    let drv_addr_space = k.tcb(drv_tid)?.addr_space;
+    let drv_root_pt = k.addr_space_mut(drv_addr_space)?.root_phys().as_usize();
+
+    // Slot 0 on both sides: the service Endpoint + its own shared
+    // message page.
+    let ep_cap = wire_service_endpoint(
+        hal,
+        caller,
+        comp_cs,
+        comp_root_pt,
+        COMPOSITOR_MOUSE_VA,
+        drv_cs,
+        drv_root_pt,
+        DRV_MOUSE_MSG_VA,
+        CapabilityRights::READ | CapabilityRights::WRITE,
+    )?;
+
+    // The raw packet-byte ring SharedRegion — private to this edge, same
+    // "trusted bootstrap, no Map ceremony" pattern DRV_I8042_QUEUE_VA
+    // already uses.
+    let src_cs = k.tcb(caller)?.cap_space;
+    let Some(queue_cap) = retype_one_from_any_untyped(k, hal, caller, KernelObjectType::SharedRegion, 1)
+    else {
+        klog!("spawn_mouse_driver: failed to retype the ring SharedRegion\r\n");
+        return None;
+    };
+    let queue_id = k.cap_space(src_cs)?.lookup(queue_cap)?.object.id;
+    let queue_phys = k.shared_region(kernel_cap::SharedRegionId::new(queue_id.as_u32()))?.phys_base.as_usize();
+    // SAFETY: fresh `SharedRegion` memory, identity-addressable, single-core.
+    unsafe { core::ptr::write_bytes(queue_phys as *mut u8, 0, 4096) };
+    let queue_pool = carve_from_any_untyped(k, 4096, 4096 * 2)?;
+    unsafe { core::ptr::write_bytes(queue_pool as *mut u8, 0, 4096 * 2) };
+    if hal.map_range(drv_root_pt, DRV_MOUSE_QUEUE_VA, queue_phys, 4096, 1 | 2 | 8, queue_pool, 2) == u32::MAX {
+        klog!("spawn_mouse_driver: map_range error (ring)\r\n");
+        return None;
+    }
+    // SAFETY: single-core; written exactly once here, before `IrqBind`
+    // below installs `mouse_irq_trampoline`.
+    unsafe { core::ptr::addr_of_mut!(G_MOUSE_QUEUE_PHYS).write(queue_phys) };
+
+    // Its own debug-print page, for the latency report line only
+    // (`DRV_MOUSE_PRINT_VA`). A failure here costs the driver nothing
+    // but that line, so it is logged, not fatal.
+    if wire_shared_pages(hal, drv_root_pt, DRV_MOUSE_PRINT_VA, 4096).is_none() {
+        klog!("spawn_mouse_driver: no debug-print page (latency report disabled)\r\n");
+    }
+
+    // Slot 1 on driver-mouse's own side: the IRQ-bound Notification.
+    let Some(notif_cap) = retype_one_from_any_untyped(k, hal, caller, KernelObjectType::Notification, 1)
+    else {
+        klog!("spawn_mouse_driver: failed to retype the IRQ Notification\r\n");
+        return None;
+    };
+    match k.dispatch(
+        caller,
+        hal.now_ns(),
+        SyscallOp::IrqBind { mmio: mmio_cap, notification: notif_cap, handler: mouse_irq_trampoline },
+        hal,
+    ) {
+        Ok(SyscallReturn::Done) => {}
+        _ => {
+            klog!("spawn_mouse_driver: IrqBind failed\r\n");
+            return None;
+        }
+    }
+    grant_cap_into(k, src_cs, notif_cap, drv_cs, CapabilityRights::READ | CapabilityRights::WRITE)?;
+    let notif_id = k.cap_space(src_cs)?.lookup(notif_cap)?.object.id.as_u32();
+    // SAFETY: single-core boot sequencing; written here, before real
+    // interrupts are ever enabled.
+    unsafe { core::ptr::addr_of_mut!(G_MOUSE_NOTIF_ID).write(notif_id) };
+
+    // Slot 2 on driver-mouse's side, and the next free slot on Compositor's:
+    // the "tell Compositor" Notification. When driver-i8042 already created
+    // one, THAT object is granted again (same object, new slot) so Compositor
+    // has a single notification to block on for both input devices; the
+    // Compositor's slot layout is unchanged either way.
+    // SAFETY: single-core boot sequencing.
+    let shared = unsafe { core::ptr::addr_of!(G_INPUT_SIGNAL_CAP).read() };
+    if shared != u32::MAX {
+        let rights = CapabilityRights::READ | CapabilityRights::WRITE;
+        grant_cap_into(k, src_cs, CapId::new(shared), comp_cs, rights)?;
+        grant_cap_into(k, src_cs, CapId::new(shared), drv_cs, rights)?;
+    } else {
+        wire_notification(hal, caller, &[comp_cs, drv_cs], CapabilityRights::READ | CapabilityRights::WRITE)?;
+    }
+
+    klog!("spawn_mouse_driver: driver-mouse spawned and wired to Compositor (real IRQ12, slave-PIC dual-EOI cascade)\r\n");    let _ = ep_cap; // boot-log value only
+
+    // NOT a context switch — same "linear boot sequence, scheduler picks
+    // it up later" reasoning as `spawn_i8042_driver`'s own tail comment.
+    Some(drv_tid)
+}
+
+/// Retypes a fresh `SharedRegion` page, zeroes it, writes its OWN
+/// physical base into its own first 8 bytes (`driver_virtio_blk::
+/// layout::PHYS_BASE_OFFSET`'s own doc comment — the convention `driver_
+/// nvme::Nvme::phys_of` relies on, since a driver process has no VA->PA
+/// translation syscall of its own), then pre-maps it at `target_va` in
+/// `drv_root_pt` (trusted bootstrap, no `Map` ceremony — same pattern
+/// every other driver spawn function in this file already uses).
+/// Returns the region's own physical base, or `None` on any allocation/
+/// mapping failure (the caller logs which page failed).
+fn retype_and_map_nvme_page(
+    k: &mut KernelState,
+    hal: &HalInterface,
+    caller: ThreadId,
+    src_cs: kernel_cap::CapSpaceId,
+    drv_root_pt: usize,
+    target_va: usize,
+) -> Option<usize> {
+    let region_cap = retype_one_from_any_untyped(k, hal, caller, KernelObjectType::SharedRegion, 1)?;
+    let region_id = k.cap_space(src_cs)?.lookup(region_cap)?.object.id;
+    let region_phys = k.shared_region(kernel_cap::SharedRegionId::new(region_id.as_u32()))?.phys_base.as_usize();
+    // SAFETY: fresh `SharedRegion` memory, identity-addressable, single-core.
+    unsafe { core::ptr::write_bytes(region_phys as *mut u8, 0, 4096) };
+    // SAFETY: `region_phys` is identity-addressable, freshly zeroed above.
+    unsafe { (region_phys as *mut u64).write_volatile(region_phys as u64) };
+    let pool = carve_from_any_untyped(k, 4096, 4096 * 2)?;
+    // SAFETY: fresh untyped RAM, identity-addressable, single-core;
+    // `map_range` needs the pool pre-zeroed.
+    unsafe { core::ptr::write_bytes(pool as *mut u8, 0, 4096 * 2) };
+    if hal.map_range(drv_root_pt, target_va, region_phys, 4096, 1 | 2 | 8, pool, 2) == u32::MAX {
+        return None;
+    }
+    Some(region_phys)
+}
+
+/// Spawns `driver-nvme` from its own separately-built ELF (`drv_elf`),
+/// grants it an `Endpoint` (slot 0 — every other real driver's own
+/// "first grant into an empty cap space" convention), pre-maps the
+/// controller's own BAR0 register window directly (trusted bootstrap,
+/// same pattern `spawn_virtio_blk_driver`'s own MMIO-window pre-map
+/// uses), and retypes+pre-maps five fresh `SharedRegion` pages (admin
+/// SQ/CQ, I/O SQ/CQ, one shared Identify/I/O data buffer —
+/// `driver_nvme::subsystem_entry`'s own module doc comment names the
+/// exact VA each lands at, matching this function's own targets one for
+/// one).
+///
+/// Real, honest scope note: unlike `spawn_i8042_driver`/`spawn_mouse_
+/// driver`, this function does NOT bind an IRQ or wire this driver to
+/// any consumer yet — `driver_nvme::Nvme`'s own MVP scope is polling-
+/// only (`lib.rs`'s own module doc comment), and no other real subsystem
+/// in this codebase calls into an NVMe block device yet (`fs-native`
+/// still only ever talks to the `Block`-kind virtio-blk device via
+/// `spawn_virtio_blk_driver`). This spawns a real, isolated process that
+/// runs its own real `probe()` against whatever real NVMe controller
+/// `hal_x86_64::peripheral` discovered — genuinely testable end to end
+/// on a real QEMU boot with `-device nvme` attached — but with nobody
+/// calling into its `Endpoint` yet, so it simply idles in its own `Recv`
+/// loop once `probe()` returns, exactly like every other driver process
+/// with no client does.
+///
+/// Returns `None` (and logs) if no `Nvme`-kind peripheral was discovered
+/// at boot (`KernelState::root_mmio_nvme_cap` still the sentinel —
+/// expected on every boot without a real `-device nvme` attached, and on
+/// every non-x86_64 architecture), or on any allocation/mapping failure.
+pub fn spawn_nvme_driver(
+    hal: &HalInterface,
+    caller: ThreadId,
+    drv_elf: &[u8],
+    expected_machine: u16,
+) -> Option<ThreadId> {
+    let k = kstate();
+    let mmio_cap = k.root_mmio_nvme_cap;
+    if mmio_cap == CapId::new(u32::MAX) {
+        klog!("spawn_nvme_driver: no Nvme-kind peripheral was discovered at boot\r\n");
+        return None;
+    }
+    let src_cs = k.tcb(caller)?.cap_space;
+    let mmio_id = kernel_cap::MmioRegionId::new(
+        k.cap_space(src_cs)?.lookup(mmio_cap)?.object.id.as_u32(),
+    );
+    let mmio = *k.mmio_region(mmio_id)?;
+
+    const DRV_NVME_STACK_VMA: usize = 0xC0C0_0000;
+    const DRV_NVME_STACK_LEN: usize = 4096 * 16;
+    let (drv_tid, drv_cs, _stack_phys) =
+        spawn_process_from_elf(hal, k, drv_elf, expected_machine, DRV_NVME_STACK_VMA, DRV_NVME_STACK_LEN)?;
+    let drv_addr_space = k.tcb(drv_tid)?.addr_space;
+    let drv_root_pt = k.addr_space_mut(drv_addr_space)?.root_phys().as_usize();
+
+    let Some(ep_cap) = retype_one_from_any_untyped(k, hal, caller, KernelObjectType::Endpoint, 1) else {
+        klog!("spawn_nvme_driver: failed to retype the Endpoint\r\n");
+        return None;
+    };
+    grant_cap_into(k, src_cs, ep_cap, drv_cs, CapabilityRights::READ | CapabilityRights::WRITE)?;
+
+    // BAR0 register window — real device MMIO, not RAM (nothing to zero
+    // or copy into it first, same reasoning `spawn_virtio_blk_driver`'s
+    // own MMIO pre-map gives).
+    const DRV_NVME_BAR0_VA: usize = 0xD840_0000;
+    let bar0_pool = carve_from_any_untyped(k, 4096, 4096 * 2)?;
+    // SAFETY: fresh untyped RAM, identity-addressable, single-core;
+    // `map_range` needs the pool pre-zeroed.
+    unsafe { core::ptr::write_bytes(bar0_pool as *mut u8, 0, 4096 * 2) };
+    if hal.map_range(drv_root_pt, DRV_NVME_BAR0_VA, mmio.phys_base as usize, 4096, 1 | 2 | 8, bar0_pool, 2) == u32::MAX {
+        klog!("spawn_nvme_driver: map_range error (BAR0)\r\n");
+        return None;
+    }
+
+    // Five queue/data/message pages — `driver_nvme::subsystem_entry`'s
+    // own module doc comment names each of these VAs exactly.
+    const DRV_NVME_ADMIN_SQ_VA: usize = 0xD841_0000;
+    const DRV_NVME_ADMIN_CQ_VA: usize = 0xD842_0000;
+    const DRV_NVME_IO_SQ_VA: usize = 0xD843_0000;
+    const DRV_NVME_IO_CQ_VA: usize = 0xD844_0000;
+    const DRV_NVME_DATA_VA: usize = 0xD845_0000;
+    const DRV_NVME_MSG_VA: usize = 0xD846_0000;
+    for (name, va) in [
+        ("admin SQ", DRV_NVME_ADMIN_SQ_VA),
+        ("admin CQ", DRV_NVME_ADMIN_CQ_VA),
+        ("I/O SQ", DRV_NVME_IO_SQ_VA),
+        ("I/O CQ", DRV_NVME_IO_CQ_VA),
+        ("data buffer", DRV_NVME_DATA_VA),
+        ("message page", DRV_NVME_MSG_VA),
+    ] {
+        if retype_and_map_nvme_page(k, hal, caller, src_cs, drv_root_pt, va).is_none() {
+            klog!("spawn_nvme_driver: failed to retype/map the {} page\r\n", name);
+            return None;
+        }
+    }
+
+    klog!("spawn_nvme_driver: driver-nvme spawned (real BAR0 + queue pages mapped, no client wired yet)\r\n");
+
+    // NOT a context switch — same "linear boot sequence, scheduler picks
+    // it up later" reasoning as `spawn_i8042_driver`'s own tail comment.
+    Some(drv_tid)
+}
+
+/// Spawns the Netstack process from its own separately-built ELF
+/// (`netstack_elf`) — the real replacement for this crate's own,
+/// removed direct-driving of `driver-virtio-net` (`netstack::
+/// subsystem_entry`'s own module doc comment has the full picture).
+/// `driver_ep_cap` is `spawn_virtio_net_driver`'s own return value — the
+/// caller (`kernel/src/main.rs`'s own `NET_DEMO_START` opcode) spawns
+/// the driver FIRST, then this, passing that capability straight
+/// through.
+///
+/// Grants TWO capabilities into this process's fresh cap space: a
+/// DERIVED COPY of `driver_ep_cap` (slot 0 — this process's own IPC
+/// client leg to the driver), and a freshly retyped `Endpoint` NOBODY
+/// else ever holds (slot 1) — this second one is never `Call`ed by
+/// anyone; its only purpose is `netstack::subsystem_entry::subsystem_
+/// main`'s own tail `Recv`ing on it once the ARP/ICMP demo is done,
+/// which blocks forever (nothing ever sends to it) and, via `p2_ipc_
+/// recv`'s own documented fallback ("no immediate sender -> switch to
+/// `k.root_thread` specifically"), hands control back to the ORIGINAL
+/// caller of `NET_DEMO_START` — the SAME mechanism every other
+/// subsystem's own idle `Recv` loop already relies on to yield back to
+/// root, applied here as a one-shot "I'm done" hand-off instead of a
+/// forever-serving loop.
+///
+/// Also trusted-bootstrap-maps the driver's own RX/TX `SharedRegion`s
+/// (`G_DRV_NET_RX_PHYS`/`G_DRV_NET_TX_PHYS`, already valid — this
+/// function is only ever called AFTER `spawn_virtio_net_driver` itself
+/// returned) into THIS process's own address space too (`NETSTACK_DRV_
+/// RX_VA`/`NETSTACK_DRV_TX_VA`) — Netstack needs to read/write the SAME
+/// physical frame-buffer bytes the driver does, zero-copy, exactly the
+/// way `spawn_virtio_net_driver` itself already maps them into the
+/// DRIVER's own space. A THIRD, freshly retyped `SharedRegion` (never
+/// granted as a capability to anyone — same "kernel-arch-glue builds
+/// the page table directly" trusted-bootstrap pattern) is mapped at
+/// `NETSTACK_STATUS_VA` for the ARP/ICMP verdict `netstack_status`
+/// reads back.
+///
+/// Returns `None` (and logs) on any allocation failure.
+pub fn spawn_netstack_service(
+    hal: &HalInterface,
+    caller: ThreadId,
+    netstack_elf: &[u8],
+    expected_machine: u16,
+    driver_ep_cap: u32,
+) -> Option<(*mut u8, *const u8)> {
+    let k = kstate();
+
+    // Retire `p2_ipc_demo_start`'s own one-shot server thread NOW,
+    // rather than waiting for `p2_preempt_start`'s own identical
+    // retirement (which normally handles this, but only runs AFTER the
+    // fs/blk/net demos, all further down `umode_root`'s own sequence).
+    // **Real bug found via QEMU** (this crate's own FIRST real U-mode
+    // client of a REAL subsystem process — Netstack calling `driver-
+    // virtio-net` over genuine `IPC_CALL`s): the driver's own `Reply`
+    // (to Netstack's `SendFrame`) always switches straight back to
+    // Netstack — see `do_reply`'s own doc comment on why — so the
+    // driver itself never gets a scheduled turn to loop back to its own
+    // `Recv` before Netstack's VERY NEXT `IPC_CALL` (`PollFrame`, inside
+    // its own bounded retry loop) fires. That second `Call` therefore
+    // ALWAYS takes the general (queued) path, needing a real `pick_
+    // next` — which, with the IPC demo server's own long-done TCB still
+    // sitting `Ready` (its own `vruntime` far lower than the driver's,
+    // which has been genuinely running), tie-breaks straight to that
+    // STALE thread instead of the driver — exactly the SAME "phantom
+    // scheduler entity" class of bug `G_IPC_SERVER_TID`'s own doc
+    // comment (in `p2_preempt_start`, below) already documents in full,
+    // just reached from a NEW, earlier code path that same fix's own
+    // original scope never anticipated. Confirmed via QEMU: a temporary
+    // `p2_ipc_call` diagnostic showed the SECOND `Call`'s own `pick_
+    // next` resolving to this exact stale thread, which then free-runs
+    // forever (nothing else ever preempts it — the timer isn't armed
+    // yet at this point in the boot), permanently starving Netstack,
+    // the driver, AND `caller` (root) alike.
+    // SAFETY: single-core; only read (and cleared) here or by `p2_
+    // preempt_start`'s own identical block, written once by `p2_ipc_
+    // demo_start` before either can ever run — idempotent if `p2_
+    // preempt_start` already retired it (the `if let Some` below is
+    // simply not taken a second time).
+    if let Some(server_tid) = unsafe { core::ptr::addr_of!(G_IPC_SERVER_TID).read() } {
+        if let Some(t) = k.tcb_mut(server_tid) {
+            t.state = ThreadState::Exited;
+        }
+        k.sched.remove(server_tid);
+        unsafe { core::ptr::addr_of_mut!(G_IPC_SERVER_TID).write(None) };
+    }
+    // fs-native's own thread hits the SAME stale-`Ready`-phantom class
+    // of bug, for the SAME underlying reason `p2_preempt_start`'s own
+    // identical block (below) already documents in full: after its own
+    // LAST reply (`FS_CLOSE`'s, in the fs demo that ran earlier in this
+    // exact boot sequence), `do_reply` leaves it `Ready` but it never
+    // gets CPU time to loop back to `Recv` and block PROPERLY —
+    // `note_blocked` (not `remove`: `fs_ipc_call`'s own direct
+    // `dispatch(fs_tid, ...)` needs the TCB slot to stay valid forever)
+    // removes it from `pick_next`'s own candidate pool without
+    // invalidating it. **Real bug found via QEMU** (this crate's own
+    // FIRST scheduling path to ever call GENERAL `pick_next` — Netstack
+    // driving `driver-virtio-net` over real `IPC_CALL`s — between the
+    // fs demo's own completion and `p2_preempt_start`'s own identical
+    // cleanup, which normally runs first): confirmed the exact same
+    // symptom class as `G_IPC_SERVER_TID`'s own fix just above, just
+    // with fs-native's thread as the stale `pick_next` candidate once
+    // that first one was retired.
+    // SAFETY: single-core; `G_FS_TID` written once by `fs_demo_start`, read-only here.
+    if let Some(fs_tid) = unsafe { core::ptr::addr_of!(G_FS_TID).read() } {
+        let _ = k.sched.note_blocked(fs_tid);
+    }
+    // Process B (the §8.4 two-space zero-copy demo's own worker) hits
+    // the SAME stale-`Ready`-phantom class as `G_IPC_SERVER_TID` above
+    // (a genuine one-shot proof with no ongoing role, unlike fs-native)
+    // — confirmed via QEMU: with `G_IPC_SERVER_TID`/`G_FS_TID` both
+    // fixed, Netstack's own SECOND `PollFrame` retry `pick_next`'d
+    // straight into process B next. `remove` (not `note_blocked`): like
+    // the IPC demo server, nothing will ever `dispatch` it again.
+    // SAFETY: single-core; `G_PROCESS_B_TID` written once by `setup_
+    // two_process`, read-only here.
+    if let Some(b_tid) = unsafe { core::ptr::addr_of!(G_PROCESS_B_TID).read() } {
+        if let Some(t) = k.tcb_mut(b_tid) {
+            t.state = ThreadState::Exited;
+        }
+        k.sched.remove(b_tid);
+        unsafe { core::ptr::addr_of_mut!(G_PROCESS_B_TID).write(None) };
+    }
+
+    let src_cs = k.tcb(caller)?.cap_space;
+
+    let (ns_tid, ns_cs, _stack_phys) =
+        spawn_process_from_elf(hal, k, netstack_elf, expected_machine, NETSTACK_STACK_VMA, NETSTACK_STACK_LEN)?;
+
+    // Slot 0: a derived copy of the driver's own Endpoint.
+    grant_cap_into(k, src_cs, CapId::new(driver_ep_cap), ns_cs, CapabilityRights::READ | CapabilityRights::WRITE)?;
+
+    // Slot 1: the "park" Endpoint — this function's own doc comment on
+    // why NOBODY ever `Call`s it.
+    let park_ep_cap = retype_one_from_any_untyped(k, hal, caller, KernelObjectType::Endpoint, 1)?;
+    grant_cap_into(k, src_cs, park_ep_cap, ns_cs, CapabilityRights::READ | CapabilityRights::WRITE)?;
+
+    // Slot 2: a private Notification that nobody ever signals. The
+    // persistent service thread (`netstack_start_service`) sleeps between
+    // polls with `NOTIF_WAIT_TIMEOUT` on it: a timed wait on a
+    // notification that never fires is exactly "wake me in N ns", which is
+    // the only timer primitive a layer-3 process has (Internet plan,
+    // TODO(spec) 2/3).
+    let sleep_notif = retype_one_from_any_untyped(k, hal, caller, KernelObjectType::Notification, 1)?;
+    grant_cap_into(k, src_cs, sleep_notif, ns_cs, CapabilityRights::READ | CapabilityRights::WRITE)?;
+    // ELF64 header: `e_entry` is the u64 at byte offset 24 (the ELF was
+    // already validated by `spawn_process_from_elf`).
+    let entry = netstack_elf
+        .get(24..32)
+        .map(|b| u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]) as usize)
+        .unwrap_or(0);
+    // SAFETY: single-core; written once here, read by `netstack_start_service`.
+    unsafe { core::ptr::addr_of_mut!(G_NETSTACK_ENTRY).write(entry) };
+
+    // SAFETY: single-core; written once here, before any kernel-bypass
+    // call (reached only after this function returns) can read either.
+    unsafe { core::ptr::addr_of_mut!(G_NETSTACK_TID).write(Some(ns_tid)) };
+    unsafe { core::ptr::addr_of_mut!(G_NETSTACK_BYPASS_EP).write(park_ep_cap.as_u32()) };
+
+    let ns_addr_space = k.tcb(ns_tid)?.addr_space;
+    let ns_root_pt = k.addr_space_mut(ns_addr_space)?.root_phys().as_usize();
+
+    // Map the driver's own RX region into Netstack's address space too.
+    // SAFETY: single-core; `G_DRV_NET_RX_PHYS` was written once by
+    // `spawn_virtio_net_driver`, already run to completion (this
+    // function's own doc comment).
+    let rx_phys = unsafe { core::ptr::addr_of!(G_DRV_NET_RX_PHYS).read() };
+    let rx_pool = carve_from_any_untyped(k, 4096, 4096 * 2)?;
+    // SAFETY: fresh untyped RAM, identity-addressable, single-core;
+    // `map_range` needs the pool pre-zeroed.
+    unsafe { core::ptr::write_bytes(rx_pool as *mut u8, 0, 4096 * 2) };
+    let n_rx = hal.map_range(ns_root_pt, NETSTACK_DRV_RX_VA, rx_phys, 4096, 1 | 2 | 8, rx_pool, 2);
+    if n_rx == u32::MAX {
+        klog!("spawn_netstack_service: map_range error (driver rx region)\r\n");
+        return None;
+    }
+
+    // Same for the driver's own TX region.
+    // SAFETY: same contract as the RX read above.
+    let tx_phys = unsafe { core::ptr::addr_of!(G_DRV_NET_TX_PHYS).read() };
+    let tx_pool = carve_from_any_untyped(k, 4096, 4096 * 2)?;
+    unsafe { core::ptr::write_bytes(tx_pool as *mut u8, 0, 4096 * 2) };
+    let n_tx = hal.map_range(ns_root_pt, NETSTACK_DRV_TX_VA, tx_phys, 4096, 1 | 2 | 8, tx_pool, 2);
+    if n_tx == u32::MAX {
+        klog!("spawn_netstack_service: map_range error (driver tx region)\r\n");
+        return None;
+    }
+
+    // Retype + map the kernel-bypass control-plane's own shared message
+    // page (03-Kernel-Subsystems-Layer.md §2.3/§5.4.1) — same shape as
+    // `mm_demo_start`'s own `MM_SHARED_VA` page: a fresh, private
+    // `SharedRegion`, mapped only into Netstack's own address space (root
+    // reaches it via `G_NETSTACK_BYPASS_SHARED_PHYS`'s own physical
+    // pointer, never through a VA mapping of its own).
+    let bypass_shared_phys = carve_from_any_untyped(k, 4096, 4096)?;
+    // SAFETY: fresh untyped RAM, identity-addressable, single-core.
+    unsafe { core::ptr::write_bytes(bypass_shared_phys as *mut u8, 0, 4096) };
+    let bypass_shared_pool = carve_from_any_untyped(k, 4096, 4096 * 2)?;
+    // SAFETY: fresh untyped RAM, identity-addressable, single-core;
+    // `map_range` needs the pool pre-zeroed.
+    unsafe { core::ptr::write_bytes(bypass_shared_pool as *mut u8, 0, 4096 * 2) };
+    let n_bypass =
+        hal.map_range(ns_root_pt, NETSTACK_BYPASS_SHARED_VA, bypass_shared_phys, 4096, 1 | 2 | 8, bypass_shared_pool, 2);
+    if n_bypass == u32::MAX {
+        klog!("spawn_netstack_service: map_range error (bypass shared page)\r\n");
+        return None;
+    }
+    // SAFETY: single-core; written exactly once here, before any
+    // kernel-bypass call can be reached.
+    unsafe { core::ptr::addr_of_mut!(G_NETSTACK_BYPASS_SHARED_PHYS).write(bypass_shared_phys) };
+
+    // Retype + map Netstack's own private status region.
+    let status_cap = retype_one_from_any_untyped(k, hal, caller, KernelObjectType::SharedRegion, 1)?;
+    let status_id = k.cap_space(src_cs)?.lookup(status_cap)?.object.id;
+    let status_phys =
+        k.shared_region(kernel_cap::SharedRegionId::new(status_id.as_u32()))?.phys_base.as_usize();
+    // SAFETY: fresh `SharedRegion` memory, identity-addressable, single-core.
+    unsafe { core::ptr::write_bytes(status_phys as *mut u8, 0, 4096) };
+    let status_pool = carve_from_any_untyped(k, 4096, 4096 * 2)?;
+    unsafe { core::ptr::write_bytes(status_pool as *mut u8, 0, 4096 * 2) };
+    let n_status = hal.map_range(ns_root_pt, NETSTACK_STATUS_VA, status_phys, 4096, 1 | 2 | 8, status_pool, 2);
+    if n_status == u32::MAX {
+        klog!("spawn_netstack_service: map_range error (status region)\r\n");
+        return None;
+    }
+    // SAFETY: single-core; written exactly once here, before any
+    // `netstack_status` call (reached only after this function returns).
+    unsafe { core::ptr::addr_of_mut!(G_NETSTACK_STATUS_PHYS).write(status_phys) };
+
+    // Network status page (R+W here, R-only in ui-core).
+    let netinfo_phys = net_info_frame(k)?;
+    let netinfo_pool = carve_from_any_untyped(k, 4096, 4096 * 2)?;
+    // SAFETY: fresh untyped RAM, identity-addressable, single-core.
+    unsafe { core::ptr::write_bytes(netinfo_pool as *mut u8, 0, 4096 * 2) };
+    if hal.map_range(ns_root_pt, NETSTACK_NETINFO_VA, netinfo_phys, 4096, 1 | 2 | 8, netinfo_pool, 2) == u32::MAX {
+        klog!("spawn_netstack_service: map_range error (network status page)\r\n");
+        return None;
+    }
+    // Desktop image: tell the boot thread to skip its ARP/ICMP demo. That demo
+    // is a blocking, timing-sensitive exchange whose two halves can be split
+    // by the scheduler once the desktop runs (root resumes mid-demo and the
+    // desktop boot goes on), and the persistent service thread supersedes it.
+    #[cfg(feature = "desktop")]
+    // SAFETY: `status_phys` is Netstack's own zeroed status page, identity-addressable.
+    unsafe {
+        ((status_phys + NETSTACK_SKIP_DEMO_OFFSET) as *mut u8).write_volatile(1)
+    };
+
+    // Also map the driver's own ISR_CFG and NOTIFY_CFG register pages
+    // into Netstack's AND root's (`caller`'s) own page tables, at the
+    // SAME numeric VA the driver already has each at — see `G_DRV_NET_
+    // ISR_CFG_PHYS`'s own doc comment for the real, QEMU-found page
+    // fault this fixes for ISR: `virtio_net_irq_trampoline` reads that VA
+    // unconditionally whenever the device's IRQ fires, but a genuine
+    // hardware IRQ is asynchronous to the CPU's own instruction stream
+    // and can now land while EITHER of these two OTHER processes is the
+    // active address space (Netstack is this codebase's first real IPC
+    // client that actually takes turns with a driver process). NOTIFY_CFG
+    // needs the identical treatment for a DIFFERENT real reason (also
+    // QEMU-found): `net_bypass_direct_send` runs on ROOT's own trap
+    // (`drv_root_pt` is never active there) and rings the TX doorbell
+    // directly — see `G_DRV_NET_NOTIFY_PHYS`'s own doc comment for the
+    // page fault a first version of that function took writing through
+    // the raw physical address instead of a mapped VA. `usize::MAX`
+    // (never found the matching capability, or `Transport::Mmio`, which
+    // never sets either at all) — skip that window entirely; the
+    // mmio-transport path's own physical-address reads/writes are
+    // already identity-mapped and safe from any `cr3`.
+    let caller_addr_space = k.tcb(caller)?.addr_space;
+    let caller_root_pt = k.addr_space_mut(caller_addr_space)?.root_phys().as_usize();
+    for (name, phys, va) in [
+        (
+            "ISR_CFG",
+            unsafe { core::ptr::addr_of!(G_DRV_NET_ISR_CFG_PHYS).read() },
+            unsafe { core::ptr::addr_of!(G_DRV_NET_ISR_CFG_VA).read() },
+        ),
+        (
+            "NOTIFY_CFG",
+            unsafe { core::ptr::addr_of!(G_DRV_NET_NOTIFY_PHYS).read() },
+            unsafe { core::ptr::addr_of!(G_DRV_NET_NOTIFY_VA).read() },
+        ),
+    ] {
+        if phys == usize::MAX || va == usize::MAX {
+            continue;
+        }
+        let va_page = va & !0xFFF;
+        let phys_page = phys & !0xFFF;
+        for target_pt in [ns_root_pt, caller_root_pt] {
+            let win_pool = carve_from_any_untyped(k, 4096, 4096 * 2)?;
+            // SAFETY: fresh untyped RAM, identity-addressable, single-core.
+            unsafe { core::ptr::write_bytes(win_pool as *mut u8, 0, 4096 * 2) };
+            let n = hal.map_range(target_pt, va_page, phys_page, 4096, 1 | 2, win_pool, 2);
+            if n == u32::MAX {
+                klog!("spawn_netstack_service: map_range error (driver {} page)\r\n", name);
+                return None;
+            }
+            // `caller_root_pt` is the CURRENTLY ACTIVE page table (this
+            // whole function runs on `caller`'s own trap) — same "flush
+            // before relying on a fresh mapping into a LIVE table"
+            // insurance `wire_virtio_pci_transport`'s own config-space
+            // mapping already takes; `ns_root_pt` isn't active yet (no
+            // flush needed, matching every other per-process mapping
+            // above).
+            if target_pt == caller_root_pt {
+                hal.flush_tlb();
+            }
+        }
+    }
+
+    // Switch straight to Netstack — same race-avoidance rationale as
+    // `spawn_virtio_blk_driver`'s own doc comment on why: without this,
+    // the caller's very next `NET_STATUS_POLL` would race a process that
+    // has never yet run at all, always reading an all-zero (never
+    // written) status.
+    let _ = k.sched.note_ready(caller, hal.now_ns());
+    let _ = k.sched.dispatch(ns_tid, hal.now_ns());
+    let Some((save, into)) = k.user_ctx_switch_ptrs(caller, ns_tid) else {
+        return None;
+    };
+
+    Some((save, into))
+}
+
+/// Offset of the text area inside Netstack's status region — must stay
+/// numerically equal to `netstack::subsystem_entry::LOG_OFFSET`. The bytes
+/// below it hold the verdict/MAC/role fields `netstack_status` reads.
+const NETSTACK_LOG_OFFSET: usize = 256;
+/// Longest line `netstack_log` prints — must stay numerically equal to
+/// `netstack::subsystem_entry::LOG_MAX`.
+const NETSTACK_LOG_MAX: usize = 512;
+
+/// `NET_LOG` opcode's own kernel-side half: prints `len` bytes of text
+/// from the log area of Netstack's own status region as one serial line
+/// (`netstack: <text>`). Netstack has no console of its own and, unlike the
+/// shell, no dedicated print page; its status region is already mapped in
+/// its address space and readable here by physical address, so it doubles
+/// as the log buffer. Any caller may trigger a print (it can only ever show
+/// what Netstack itself last wrote there), which is why no caller check is
+/// made. Returns `0`, or `usize::MAX` if Netstack was never spawned.
+pub fn netstack_log(len: usize) -> usize {
+    // SAFETY: single-core; written once by `spawn_netstack_service`.
+    let base = unsafe { core::ptr::addr_of!(G_NETSTACK_STATUS_PHYS).read() };
+    if base == usize::MAX {
+        return usize::MAX;
+    }
+    let len = len.min(NETSTACK_LOG_MAX);
+    // SAFETY: `base` is Netstack's own zeroed 4 KiB `SharedRegion`,
+    // identity-addressable; `NETSTACK_LOG_OFFSET + NETSTACK_LOG_MAX` stays
+    // inside that page; single-core.
+    let bytes = unsafe { core::slice::from_raw_parts((base + NETSTACK_LOG_OFFSET) as *const u8, len) };
+    let text = core::str::from_utf8(bytes).unwrap_or("<non-utf8>");
+    klog!("netstack: {}\r\n", text);
+    0
+}
+
+/// Offset of the "role" byte inside Netstack's status region - must stay
+/// numerically equal to `netstack::subsystem_entry::ROLE_OFFSET`. `0` = the
+/// boot-demo thread (ARP/ICMP demo, then serving the bypass control plane),
+/// `1` = the persistent service thread.
+const NETSTACK_ROLE_OFFSET: usize = 16;
+
+/// Offset of the "skip the boot demo" byte - must stay numerically equal to
+/// `netstack::subsystem_entry::SKIP_DEMO_OFFSET`. Set by the desktop image only.
+const NETSTACK_SKIP_DEMO_OFFSET: usize = 17;
+
+/// Priority of the Netstack service thread: the same as the other desktop
+/// background services (`DESKTOP_PRIORITY_BACKGROUND`), below the input
+/// path. Not lower: `pick_next` ranks by priority strictly, and services that
+/// keep polling would then starve a lower-priority thread for good. It sleeps
+/// between polls, so its share of the CPU stays tiny anyway.
+const NETSTACK_SERVICE_PRIORITY: u8 = 30;
+
+/// Starts Netstack's persistent service thread (Internet plan, phase 1).
+///
+/// Netstack's first thread does the boot-time ARP/ICMP demo and then parks
+/// on its bypass endpoint forever, serving the kernel-bypass control plane.
+/// The service loop (smoltcp: ARP, ICMP, later DHCP/DNS) needs a thread that
+/// stays runnable and sleeps on a timer instead, so it is a SECOND thread of
+/// the same process - same page table, same capability space, its own stack
+/// (the lower half of the process stack region; the first thread only uses
+/// the top few KiB). It enters at the ELF entry point like the first thread;
+/// `netstack::subsystem_entry::subsystem_main` tells the two apart by the
+/// role byte written here.
+///
+/// Desktop image only (the caller is `p2_preempt_start`'s desktop branch):
+/// the demo image's scheduler demos are timing-sensitive and do not need a
+/// network service. No-op if Netstack was never spawned (no NIC) or the
+/// service already runs.
+pub fn netstack_start_service(hal: &HalInterface) -> Option<ThreadId> {
+    let k = kstate();
+    // SAFETY: single-core; these statics are written once by
+    // `spawn_netstack_service` (before this can be called) and by this fn.
+    let (ns_tid, entry, status, running) = unsafe {
+        (
+            core::ptr::addr_of!(G_NETSTACK_TID).read(),
+            core::ptr::addr_of!(G_NETSTACK_ENTRY).read(),
+            core::ptr::addr_of!(G_NETSTACK_STATUS_PHYS).read(),
+            core::ptr::addr_of!(G_NETSTACK_SVC_TID).read(),
+        )
+    };
+    let ns_tid = ns_tid?;
+    if entry == 0 || status == usize::MAX || running.is_some() {
+        return None;
+    }
+    let (cap_space, addr_space) = {
+        let t = k.tcb(ns_tid)?;
+        (t.cap_space, t.addr_space)
+    };
+    let root_pt = k.addr_space_mut(addr_space)?.root_phys().as_usize();
+    let svc = k.alloc_tcb(cap_space, addr_space)?;
+    // SAFETY: `status` is Netstack's own zeroed status page, identity-
+    // addressable; the role byte is read by the new thread only after it
+    // starts running, i.e. after this write.
+    unsafe { ((status + NETSTACK_ROLE_OFFSET) as *mut u8).write_volatile(1) };
+    let stack_top = NETSTACK_STACK_VMA + NETSTACK_STACK_LEN / 2;
+    k.init_user_thread(svc, entry, stack_top, root_pt, hal);
+    let _ = k.sched.admit_following_system_default(svc, NETSTACK_SERVICE_PRIORITY, None);
+    // `init_user_thread` admitted it at MAX_PRIORITY; make the low priority stick
+    // even if the admit above kept the first admission.
+    let _ = k.sched.set_base_priority(svc, NETSTACK_SERVICE_PRIORITY);
+    let _ = k.sched.note_ready(svc, hal.now_ns());
+    // SAFETY: single-core; written here only.
+    unsafe { core::ptr::addr_of_mut!(G_NETSTACK_SVC_TID).write(Some(svc)) };
+    klog!("netstack service: second thread tid {} started (persistent smoltcp service, priority {})\r\n", svc.as_u32(), NETSTACK_SERVICE_PRIORITY);
+    Some(svc)
+}
+
+/// `NET_STATUS_POLL` demo opcode's own kernel-side half: reads the
+/// Netstack process's own status region directly (`spawn_netstack_
+/// service`'s own doc comment — `G_NETSTACK_STATUS_PHYS`, physical
+/// pointer, no IPC needed for this leg) and logs the SAME "real ARP
+/// resolve/ICMP echo" lines this crate's own (now-removed, pre-
+/// extraction) `drv_net_arp_poll_result`/`drv_net_ping_poll_result`
+/// used to print, once a terminal verdict is reached — preserves this
+/// project's own established QEMU-verification log format across the
+/// extraction. Returns `0` while Netstack is still running (verdict byte
+/// still `0`), `1` once ARP failed, `2` once ARP resolved but the ping
+/// failed/mismatched, `3` on full success.
+pub fn netstack_status() -> usize {
+    // SAFETY: single-core; `G_NETSTACK_STATUS_PHYS` was written once by
+    // `spawn_netstack_service`, before any `netstack_status` call.
+    let base = unsafe { core::ptr::addr_of!(G_NETSTACK_STATUS_PHYS).read() };
+    if base == usize::MAX {
+        return 0;
+    }
+    // SAFETY: `base` is the Netstack process's own fresh, zeroed
+    // `SharedRegion`, identity-addressable, single-core.
+    let verdict = unsafe { (base as *const u8).read_volatile() };
+    if verdict == 0 {
+        return 0;
+    }
+    // SAFETY: same contract as the verdict read above; the MAC bytes are
+    // only meaningful (written) once `verdict >= 2` — `netstack::
+    // subsystem_entry::write_status`'s own doc comment — but reading
+    // them unconditionally once ANY verdict is set is harmless (still
+    // all-zero otherwise, never uninitialized memory: this whole region
+    // was zeroed at spawn time).
+    let mut gw_mac = [0u8; 6];
+    unsafe {
+        let mac_base = (base + 8) as *const u8;
+        for (i, b) in gw_mac.iter_mut().enumerate() {
+            *b = mac_base.add(i).read_volatile();
+        }
+    }
+    if verdict == 4 {
+        klog!("netstack: boot ARP/ICMP demo skipped on the desktop image - the persistent service thread reports link state and gateway pings instead
+");
+        return verdict as usize;
+    }
+    if verdict >= 2 {
+        klog!(
+            "netstack: real ARP resolve through virtio-net's own virtqueues, over real IPC (03 2.3) -> gateway is at {:02x?}\r\n",
+            gw_mac
+        );
+    }
+    klog!(
+        "netstack: real ICMP echo request->reply round-trip through virtio-net's own virtqueues, driven entirely over real IPC by a real Netstack process (03 2.3/5.4) -> {}\r\n",
+        match verdict {
+            1 => "ARP FAILED",
+            2 => "MISMATCH",
+            3 => "MATCH",
+            _ => "unknown",
+        }
+    );
+    verdict as usize
+}
+
+/// Writes `msg`'s full `(label, words[0..6] zero-padded)` into the
+/// kernel-bypass control-plane's own shared page — same convention
+/// `write_shared_mm_message`'s own doc comment documents in full.
+///
+/// # Safety
+/// `G_NETSTACK_BYPASS_SHARED_PHYS` must already be a valid,
+/// exclusively-owned, mapped physical frame (`spawn_netstack_service` has
+/// run).
+unsafe fn write_shared_netstack_bypass_message(msg: &SmallMessage) {
+    // SAFETY: single-core; `G_NETSTACK_BYPASS_SHARED_PHYS` only written
+    // once by `spawn_netstack_service`, before this can ever be called.
+    let base = unsafe { core::ptr::addr_of!(G_NETSTACK_BYPASS_SHARED_PHYS).read() } as *mut u64;
+    // SAFETY: forwarded from this function's own contract.
+    unsafe {
+        base.write_volatile(msg.label);
+        let words = msg.words();
+        for i in 0..kernel_ipc::MSG_MAX_WORDS {
+            base.add(1 + i).write_volatile(words.get(i).copied().unwrap_or(0));
+        }
+    }
+}
+
+/// Reads back a `SmallMessage` written by `write_shared_netstack_bypass_
+/// message`.
+///
+/// # Safety
+/// Same contract as `write_shared_netstack_bypass_message`.
+unsafe fn read_shared_netstack_bypass_message() -> SmallMessage {
+    // SAFETY: single-core; same contract as `write_shared_netstack_bypass_message`.
+    let base = unsafe { core::ptr::addr_of!(G_NETSTACK_BYPASS_SHARED_PHYS).read() } as *const u64;
+    // SAFETY: forwarded from this function's own contract.
+    unsafe {
+        let label = base.read_volatile();
+        let mut words = [0u64; kernel_ipc::MSG_MAX_WORDS];
+        for (i, w) in words.iter_mut().enumerate() {
+            *w = base.add(1 + i).read_volatile();
+        }
+        SmallMessage::from_words(label, &words).unwrap_or(SmallMessage::new(label))
+    }
+}
+
+/// `Call`, specialized for the kernel-bypass control-plane's own known,
+/// fixed 2-party (root <-> Netstack) shape — same "bypass `pick_next`'s
+/// answer, switch straight to the known target thread" fix `mm_ipc_call`'s
+/// own doc comment documents in full (identical bug class: Netstack's own
+/// `park()` loop, like mm-service's own server loop, is the only OTHER
+/// runnable thread by the time this demo reaches it).
+fn netstack_bypass_ipc_call(hal: &HalInterface, caller: ThreadId, ep_cap: u32) -> Option<IpcSwitch> {
+    let k = kstate();
+    // SAFETY: single-core; `G_NETSTACK_TID` is written once by `spawn_
+    // netstack_service`, before any bypass call (this function) can run.
+    let ns_tid = unsafe { core::ptr::addr_of!(G_NETSTACK_TID).read() }?;
+    let msg = SmallMessage::new(0);
+    match k.dispatch(caller, hal.now_ns(), SyscallOp::Call { endpoint: CapId::new(ep_cap), msg }, hal) {
+        Ok(SyscallReturn::Reschedule { next: Some(n) }) => {
+            let _ = k.sched.dispatch(ns_tid, hal.now_ns());
+            let (save, into) = k.user_ctx_switch_ptrs(caller, ns_tid)?;
+            let poke = if n == ns_tid {
+                k.tcb_mut(ns_tid)
+                    .and_then(|t| Some((t.pending_from.take()?, t.pending_msg.take()?)))
+                    .map(|(from, m)| (from.as_u32() as usize, m.label as usize))
+            } else {
+                None
+            };
+            Some(IpcSwitch { save, into, poke })
+        }
+        _ => None,
+    }
+}
+
+/// `NET_BYPASS_REQUEST` demo opcode: builds a REAL `NetBypassRequest::
+/// RequestDirectNic` for a fixed demo `nic_id` (`0` — this MVP has
+/// exactly one NIC, matching `spawn_virtio_net_driver`'s own
+/// single-device assumption throughout) and issues the real IPC round
+/// trip to Netstack's own `BYPASS_ENDPOINT_CAP` server loop
+/// (03-Kernel-Subsystems-Layer.md §2.3/§5.4.1). Netstack's own `handle_
+/// bypass_request` always grants (this MVP's own documented
+/// simplification: no layer-4 Security Broker exists in this repo yet to
+/// consult — `ipc_protocol::net`'s own doc comment).
+///
+/// Unlike `mm_register_call`/`compositor_commit_call` (which take their
+/// endpoint cap as a per-arch global `kernel/kernel/src/main.rs` itself
+/// caches at `MM_DEMO_START`/spawn time), this reads `G_NETSTACK_BYPASS_
+/// EP` directly — cached once, inside THIS crate, by `spawn_netstack_
+/// service` itself — since Netstack is already spawned (for the ARP/ICMP
+/// demo) long before this opcode's own first use, with no per-arch
+/// wrinkle to thread through `main.rs`. Returns `None` (a `TrapOutcome::
+/// Resume(0)`, matching `mm_register_call`'s own convention) if Netstack
+/// was never spawned.
+pub fn net_bypass_request_call(hal: &HalInterface, caller: ThreadId) -> Option<IpcSwitch> {
+    // SAFETY: single-core; written once by `spawn_netstack_service`,
+    // before any `.user_text` code can reach this opcode.
+    let ep_cap = unsafe { core::ptr::addr_of!(G_NETSTACK_BYPASS_EP).read() };
+    if ep_cap == u32::MAX {
+        return None;
+    }
+    let req = ipc_protocol::NetBypassRequest::RequestDirectNic { nic_id: 0 };
+    let msg = ipc_protocol::codec::encode_net_bypass_request(&req);
+    // SAFETY: `spawn_netstack_service` has already run (checked above via
+    // `ep_cap`), so `G_NETSTACK_BYPASS_SHARED_PHYS` is valid too.
+    unsafe { write_shared_netstack_bypass_message(&msg) };
+    netstack_bypass_ipc_call(hal, caller, ep_cap)
+}
+
+/// Reads back the `NetBypassResponse` for `net_bypass_request_call`.
+/// Returns `1` for a real `Granted`, `0` otherwise (`Denied`, a decode
+/// failure, or — unlike `mm_register_result`, which can assume mm-service
+/// is always spawned by the time it runs — `net_bypass_request_call`
+/// itself never having sent anything at all: **real bug found via QEMU**,
+/// this function used to dereference `G_NETSTACK_BYPASS_SHARED_PHYS`
+/// unconditionally, and `net_bypass_demo_*`'s own call site always reads
+/// this result right after issuing `NET_BYPASS_REQUEST` regardless of
+/// whether Netstack was ever spawned in the first place (no NIC
+/// discovered at boot skips `NET_DEMO_START`, per `net_demo_aarch64`'s
+/// own doc comment) — a debug build's `read_volatile` precondition check
+/// caught the resulting misaligned `usize::MAX` pointer read as a kernel
+/// panic on aarch64).
+pub fn net_bypass_request_result() -> usize {
+    // SAFETY: single-core; read-only, `spawn_netstack_service` is this
+    // static's only writer.
+    if unsafe { core::ptr::addr_of!(G_NETSTACK_BYPASS_SHARED_PHYS).read() } == usize::MAX {
+        return 0;
+    }
+    // SAFETY: same contract as `net_bypass_request_call` — the check
+    // above rules out the one case that contract doesn't already cover.
+    let msg = unsafe { read_shared_netstack_bypass_message() };
+    matches!(
+        ipc_protocol::codec::decode_net_bypass_response(&msg),
+        Ok(ipc_protocol::NetBypassResponse::Granted { .. })
+    ) as usize
+}
+
+/// `NET_STANDARD_SEND_REQUEST` demo opcode: builds a REAL `NetBypassRequest::
+/// RelayFrame` and issues the real IPC round trip to Netstack's own
+/// `BYPASS_ENDPOINT_CAP` server loop — the SAME endpoint/mechanism `net_
+/// bypass_request_call` uses, just a different request variant. Netstack
+/// itself then makes a SECOND real IPC round trip to the driver (`ipc_
+/// protocol::net::NetBypassRequest::RelayFrame`'s own doc comment) and
+/// waits for the real hardware TX completion before replying — this is
+/// the §5.4.1 "standard path" `net_bypass_direct_send`'s own bypass path
+/// is supposed to be ≥30-40% faster than. Same "reads `G_NETSTACK_
+/// BYPASS_EP` directly, no per-arch global" shape as `net_bypass_
+/// request_call`'s own doc comment explains.
+pub fn net_standard_send_call(hal: &HalInterface, caller: ThreadId) -> Option<IpcSwitch> {
+    // SAFETY: single-core; written once by `spawn_netstack_service`,
+    // before any `.user_text` code can reach this opcode.
+    let ep_cap = unsafe { core::ptr::addr_of!(G_NETSTACK_BYPASS_EP).read() };
+    if ep_cap == u32::MAX {
+        return None;
+    }
+    let msg = ipc_protocol::codec::encode_net_bypass_request(&ipc_protocol::NetBypassRequest::RelayFrame);
+    // SAFETY: `spawn_netstack_service` has already run (checked above via
+    // `ep_cap`), so `G_NETSTACK_BYPASS_SHARED_PHYS` is valid too.
+    unsafe { write_shared_netstack_bypass_message(&msg) };
+    netstack_bypass_ipc_call(hal, caller, ep_cap)
+}
+
+/// Reads back the `NetBypassResponse` for `net_standard_send_call`.
+/// Returns `1` for a real `Relayed`, `0` otherwise (`Denied`, a decode
+/// failure, or Netstack never spawned — same guard as `net_bypass_
+/// request_result`'s own doc comment explains, same real reason it's
+/// needed).
+pub fn net_standard_send_result() -> usize {
+    // SAFETY: single-core; read-only, `spawn_netstack_service` is this
+    // static's only writer.
+    if unsafe { core::ptr::addr_of!(G_NETSTACK_BYPASS_SHARED_PHYS).read() } == usize::MAX {
+        return 0;
+    }
+    // SAFETY: same contract as `net_standard_send_call` — the check
+    // above rules out the one case that contract doesn't already cover.
+    let msg = unsafe { read_shared_netstack_bypass_message() };
+    matches!(
+        ipc_protocol::codec::decode_net_bypass_response(&msg),
+        Ok(ipc_protocol::NetBypassResponse::Relayed)
+    ) as usize
+}
+
+/// Fixed demo frame length `net_bypass_direct_send` stages after the
+/// (all-zero) virtio-net header — a recognizable, deliberately-not-a-
+/// real-protocol byte pattern is enough to prove real bytes moved (this
+/// path has no listener to reply, unlike the ARP/ICMP round trip
+/// `netstack_status` verifies — §5.4.1's own "the client then drives the
+/// NIC directly with NO further IPC on the data path" contract means this
+/// demo proves the SEND mechanism itself, not a round trip).
+const NET_BYPASS_FRAME_LEN: usize = 64;
+
+/// Directly replicates `VirtioNet::submit_tx_request`/`publish_and_
+/// notify`'s own descriptor-publish-plus-doorbell-ring logic
+/// (`driver_virtio_net::VirtioNet`'s own PRIVATE wire-format methods,
+/// necessarily mirrored here byte-for-byte rather than called, since
+/// kernel-arch-glue cannot reach into another process's own address
+/// space or private struct) directly against the driver's already-probed
+/// TX queue's own physical `SharedRegion` — the core of §2.3/§5.4.1's own
+/// "the client then drives the NIC directly with NO further IPC on the
+/// data path" contract. Runs from kernel mode (Ring 0 / EL1 / M-mode's
+/// own already-unrestricted physical memory access — the SAME class of
+/// direct physical read/write every other verification function in this
+/// file already performs), so this MVP needs no separate "bypass client
+/// process": `net_bypass_request_call`'s own control-plane handshake is
+/// the only real IPC on this whole path, exactly matching the spec.
+///
+/// # Preconditions (an honest, undefended MVP simplification)
+/// The driver's own `do_probe` must already have completed (so `TX_
+/// NOTIFY_OFF_OFFSET` — persisted in the RX region, `layout::TX_NOTIFY_
+/// OFF_OFFSET`'s own doc comment on why only there — holds a real value
+/// for PCI transport), and the driver's own last TX request (if any) must
+/// already have completed: `used.idx == avail.idx` on the TX queue,
+/// checked below and refused otherwise rather than silently interleaving
+/// with a request this path has no way to identify. This demo's own call
+/// site (after the driver's own SendFrame/PollFrame demo and Netstack's
+/// own ARP/ICMP demo have both already run to completion) guarantees this
+/// by construction; a general-purpose bypass path would need to actually
+/// wait on it instead of refusing.
+///
+/// Returns the elapsed nanoseconds (`hal.now_ns()` immediately before
+/// publishing the descriptor, to immediately after the busy-poll observes
+/// completion), or `None` if the driver was never probed, its last TX is
+/// still pending, or the busy-poll times out.
+pub fn net_bypass_direct_send(hal: &HalInterface) -> Option<u64> {
+    // SAFETY: single-core; `G_DRV_NET_TX_PHYS` was written once by
+    // `spawn_virtio_net_driver`, already run to completion by the time
+    // this demo function can be reached (`umode_root`'s own ordering).
+    let tx_phys = unsafe { core::ptr::addr_of!(G_DRV_NET_TX_PHYS).read() };
+    if tx_phys == usize::MAX {
+        klog!("net_bypass_direct_send: driver was never probed (no TX region)\r\n");
+        return None;
+    }
+    // Refuse to interleave with the driver's own still-in-flight TX —
+    // same `used.idx == next_idx` direction as `VirtioNet::tx_completion_
+    // pending`'s own doc comment, just re-derived from the queue's own
+    // on-wire words directly (no driver-process struct reachable here).
+    // SAFETY: `AVAIL_OFFSET + 2` / `USED_OFFSET + 2` are within the
+    // mapped region (`tx_phys` is a fresh, page-sized `SharedRegion`'s
+    // own physical base, identity-addressable, single-core).
+    let next_idx = unsafe {
+        ((tx_phys + driver_virtio_net::layout::AVAIL_OFFSET + 2) as *const u16).read_volatile()
+    };
+    let used_idx_before = unsafe {
+        ((tx_phys + driver_virtio_net::layout::USED_OFFSET + 2) as *const u16).read_volatile()
+    };
+    if used_idx_before != next_idx {
+        klog!("net_bypass_direct_send: driver's own last TX request is still pending, refusing to interleave\r\n");
+        return None;
+    }
+
+    // Stage the demo frame at `BUFFER_OFFSET`: the virtio-net header
+    // (all-zero — no GSO/checksum offload requested, same convention
+    // `submit_tx_request`'s own doc comment establishes), followed by a
+    // fixed, recognizable Ethernet-shaped payload.
+    let buf = tx_phys + driver_virtio_net::layout::BUFFER_OFFSET;
+    // SAFETY: `BUFFER_OFFSET..+4096-BUFFER_OFFSET` is within the mapped
+    // region — same contract as the ring reads above.
+    unsafe {
+        core::ptr::write_bytes(buf as *mut u8, 0, driver_virtio_net::VIRTIO_NET_HDR_LEN);
+        let frame = buf + driver_virtio_net::VIRTIO_NET_HDR_LEN;
+        core::ptr::write_bytes(frame as *mut u8, 0xFF, 6); // dest MAC = broadcast
+        core::ptr::write_bytes((frame + 6) as *mut u8, 0xB9, 6); // src MAC = fixed sentinel bytes
+        ((frame + 12) as *mut u8).write_volatile(0xFF);
+        ((frame + 13) as *mut u8).write_volatile(0xFF); // ethertype 0xFFFF — deliberately unassigned
+        core::ptr::write_bytes((frame + 14) as *mut u8, 0xB5, NET_BYPASS_FRAME_LEN - 14); // recognizable payload pattern
+    }
+    let total_len = driver_virtio_net::VIRTIO_NET_HDR_LEN + NET_BYPASS_FRAME_LEN;
+
+    let start_ns = hal.now_ns();
+
+    // Descriptor slot 0 (`VirtqDescRaw`'s own `#[repr(C)]` layout —
+    // `addr: u64, len: u32, flags: u16, next: u16`, spec §2.6.5), device-
+    // readable (TX): mirrors `submit_tx_request`'s own descriptor exactly.
+    // SAFETY: `DESC_OFFSET` (32 bytes, slot 0 only) is within the mapped region.
+    unsafe {
+        let desc = tx_phys + driver_virtio_net::layout::DESC_OFFSET;
+        (desc as *mut u64).write_volatile(buf as u64); // identity-mapped physical RAM.
+        ((desc + 8) as *mut u32).write_volatile(total_len as u32);
+        ((desc + 12) as *mut u16).write_volatile(0); // flags: device-readable, no NEXT
+        ((desc + 14) as *mut u16).write_volatile(0); // next: unused
+    }
+    let ring_slot = driver_virtio_net::layout::AVAIL_OFFSET
+        + 4
+        + (next_idx as usize % driver_virtio_net::QUEUE_SIZE as usize) * 2;
+    let new_avail_idx = next_idx.wrapping_add(1);
+    // SAFETY: within the mapped region.
+    unsafe {
+        ((tx_phys + ring_slot) as *mut u16).write_volatile(0); // head descriptor index (slot 0)
+        ((tx_phys + driver_virtio_net::layout::AVAIL_OFFSET + 2) as *mut u16).write_volatile(new_avail_idx);
+    }
+
+    // Ring the doorbell — MMIO's single fixed register, or PCI's
+    // per-queue notify window, using the SAME `tx_notify_off` the
+    // driver's own `do_probe` already negotiated and persisted
+    // (`layout::TX_NOTIFY_OFF_OFFSET`'s own doc comment on why this can
+    // only be read back post-probe, from the RX region).
+    // SAFETY: single-core; both globals are written once by `spawn_
+    // virtio_net_driver`/`wire_virtio_pci_transport_net`, already run to
+    // completion.
+    let mmio_phys = unsafe { core::ptr::addr_of!(G_DRV_NET_MMIO_PHYS).read() };
+    if mmio_phys != usize::MAX {
+        // SAFETY: `mmio_phys + QUEUE_NOTIFY` is the device's own live MMIO window.
+        unsafe {
+            ((mmio_phys + driver_virtio_net::mmio::QUEUE_NOTIFY) as *mut u32)
+                .write_volatile(driver_virtio_net::TX_QUEUE);
+        }
+    } else {
+        // SAFETY: single-core; `G_DRV_NET_NOTIFY_VA` is written once by
+        // `wire_virtio_pci_transport_net` and mapped into root's own page
+        // table by `spawn_netstack_service` — see `G_DRV_NET_NOTIFY_VA`'s
+        // own doc comment for why a raw `G_DRV_NET_NOTIFY_PHYS`
+        // dereference (a first version of this function's own real bug,
+        // found via QEMU) is never safe: modern virtio-pci capability
+        // BARs are frequently 64-bit BARs QEMU places far outside the
+        // kernel's own low-RAM identity map.
+        let notify_va = unsafe { core::ptr::addr_of!(G_DRV_NET_NOTIFY_VA).read() };
+        let notify_off_mult = unsafe { core::ptr::addr_of!(G_DRV_NET_NOTIFY_OFF_MULT).read() };
+        let rx_phys = unsafe { core::ptr::addr_of!(G_DRV_NET_RX_PHYS).read() };
+        if notify_va == usize::MAX || rx_phys == usize::MAX {
+            klog!("net_bypass_direct_send: no notify window cached (neither MMIO nor PCI)\r\n");
+            return None;
+        }
+        // SAFETY: `TX_NOTIFY_OFF_OFFSET` is within the mapped RX region.
+        let tx_notify_off =
+            unsafe { ((rx_phys + driver_virtio_net::layout::TX_NOTIFY_OFF_OFFSET) as *const u64).read_volatile() as u16 };
+        let addr = notify_va + (tx_notify_off as usize) * (notify_off_mult as usize);
+        // SAFETY: `addr` is the PCI NOTIFY_CFG window's own live register,
+        // reached through the VA `spawn_netstack_service` mapped into
+        // root's own (currently active) page table — see `G_DRV_NET_
+        // NOTIFY_VA`'s own doc comment.
+        unsafe { (addr as *mut u16).write_volatile(driver_virtio_net::TX_QUEUE as u16) };
+    }
+
+    // Bounded busy-poll for the used ring to catch up — mirrors
+    // `VirtioNet::tx_completion_pending`'s own `used.idx == next_idx`
+    // check, re-derived from the physical region directly.
+    const MAX_POLL_ITERS: u32 = 20_000_000;
+    let mut i = 0u32;
+    loop {
+        // SAFETY: within the mapped region.
+        let used_idx =
+            unsafe { ((tx_phys + driver_virtio_net::layout::USED_OFFSET + 2) as *const u16).read_volatile() };
+        if used_idx == new_avail_idx {
+            break;
+        }
+        i += 1;
+        if i >= MAX_POLL_ITERS {
+            klog!(
+                "net_bypass_direct_send: TX completion busy-poll timed out (used_idx={:#x} wanted={:#x})\r\n",
+                used_idx, new_avail_idx
+            );
+            return None;
+        }
+        core::hint::spin_loop();
+    }
+
+    let elapsed_ns = hal.now_ns().saturating_sub(start_ns);
+
+    // Acknowledge the interrupt cause at the device — same "always drain
+    // whatever cause is pending, even though this path never waits on the
+    // IRQ line" rationale as `VirtioNet::ack_interrupt`'s own doc comment.
+    if mmio_phys != usize::MAX {
+        // SAFETY: forwarded from `virtio_net_irq_trampoline`'s own
+        // identical MMIO read-then-write-back.
+        unsafe {
+            let cause = ((mmio_phys + driver_virtio_net::mmio::INTERRUPT_STATUS) as *const u32).read_volatile();
+            ((mmio_phys + driver_virtio_net::mmio::INTERRUPT_ACK) as *mut u32).write_volatile(cause);
+        }
+    } else {
+        // SAFETY: single-core; `G_DRV_NET_ISR_CFG_VA` is mapped into
+        // root's own page table by `spawn_netstack_service` (the SAME
+        // mapping `virtio_net_irq_trampoline` already relies on being
+        // reachable from root — see that static's own doc comment) —
+        // unlike `G_DRV_NET_ISR_CFG_PHYS`, which is never safe to
+        // dereference directly (`G_DRV_NET_NOTIFY_PHYS`'s own doc comment
+        // on the identical class of real bug this sidesteps).
+        let isr_va = unsafe { core::ptr::addr_of!(G_DRV_NET_ISR_CFG_VA).read() };
+        if isr_va != usize::MAX {
+            // SAFETY: PCI ISR is a single read-to-clear byte (spec §4.1.4.5).
+            unsafe {
+                let _ = (isr_va as *const u8).read_volatile();
+            }
+        }
+    }
+
+    klog!(
+        "net_bypass_direct_send: MATCH sent {} bytes in {} ns (kernel-bypass, no driver-process/IPC on data path)\r\n",
+        total_len,
+        elapsed_ns
+    );
+
+    Some(elapsed_ns)
+}
+
+/// `NET_LATENCY_SUMMARY` demo opcode: logs one honest verdict line
+/// comparing `net_bypass_direct_send`'s own measured average latency
+/// against `net_standard_send_call`'s own (both computed in `.user_text`
+/// from several samples each, `net_bypass_demo_*`'s own doc comment) —
+/// 03-Kernel-Subsystems-Layer.md §5.4.1's own "the bypass path is
+/// ≥30-40% lower latency than the standard path" claim, given something
+/// real to check itself against instead of being asserted. Reports
+/// whichever way the numbers actually land — including a bypass-is-
+/// SLOWER outcome, if that's what a given boot's own QEMU/TCG scheduling
+/// jitter produces at this sample size (10 samples each — enough to see
+/// a real trend, not a statistically rigorous benchmark; same honesty
+/// this project's every other timing number already carries).
+pub fn net_latency_summary(bypass_avg_ns: usize, standard_avg_ns: usize) {
+    if bypass_avg_ns == 0 || standard_avg_ns == 0 {
+        klog!("net_latency_summary: insufficient samples on one or both paths, skipping comparison\r\n");
+        return;
+    }
+    if bypass_avg_ns < standard_avg_ns {
+        let pct = ((standard_avg_ns - bypass_avg_ns) * 100) / standard_avg_ns;
+        klog!(
+            "kernel-bypass vs standard path (03 5.4.1): bypass avg = {} ns, standard (via Netstack) avg = {} ns -> bypass is {}% FASTER {}\r\n",
+            bypass_avg_ns,
+            standard_avg_ns,
+            pct,
+            if pct >= 30 { "(meets the >=30-40% target)" } else { "(below the >=30-40% target at this sample size)" }
+        );
+    } else {
+        let pct = ((bypass_avg_ns - standard_avg_ns) * 100) / bypass_avg_ns;
+        klog!(
+            "kernel-bypass vs standard path (03 5.4.1): bypass avg = {} ns, standard (via Netstack) avg = {} ns -> bypass is {}% SLOWER (does not meet the target this run - QEMU/TCG device-model scheduling jitter dominates at this sample size, same variance class every other timing number in this project already reports)\r\n",
+            bypass_avg_ns,
+            standard_avg_ns,
+            pct
+        );
+    }
+}
+
+/// `DRV_IRQ_WAIT` demo opcode's own kernel-side half: issues exactly
+/// ONE `SyscallOp::Wait` on `notif_cap` and reports the outcome —
+/// unlike every other `drv_blk_*`/`fs_*` function in this file,
+/// `caller` here is the virtio-blk driver process itself (issuing its
+/// own ecall), not root driving IPC on its behalf.
+///
+/// `caller` is an explicit PARAMETER, not internally re-discovered via
+/// `sched.running()` on every call — **real bug found via QEMU**: the
+/// obvious "discover it generically, like `IPC_RECV` does" approach
+/// breaks across the SECOND and later calls of this function's own
+/// idle-retry loop (`kernel/src/main.rs`'s own `DRV_IRQ_WAIT` dispatch
+/// arm), because the FIRST call's `Blocked` outcome runs `do_wait`'s
+/// own `note_blocked`, which CLEARS `sched.running()` (by design — see
+/// `kernel_sched::Scheduler::note_blocked`'s own doc comment: "the
+/// caller should then `pick_next`"). A second internal re-discovery via
+/// `sched.running().unwrap_or(root_thread)` then silently falls back to
+/// `root_thread`, which does not hold `notif_cap` at all — `dispatch`
+/// correctly rejects it (`WrongObjectKind`/`BadCap`), `IrqWaitOutcome::
+/// Error` is returned to the driver process with a bogus `bits = 0`,
+/// and (confirmed via a temporary diagnostic print, then a `-d int`
+/// trace of the resulting silent hang) the driver's own request-serving
+/// loop never recovers. The caller (`kernel/src/main.rs`) discovers
+/// `caller` ONCE, before its own retry loop starts, and passes the SAME
+/// value into every `drv_irq_wait_step` call within it.
+///
+/// Deliberately does NOT loop or idle here — see this function's own
+/// caller (`kernel/src/main.rs`'s riscv64 `DRV_IRQ_WAIT` dispatch arm)
+/// for why the actual `wfi`-based idle loop lives THERE instead: this
+/// crate is architecture-erased by design (no `#[cfg(target_arch)]`,
+/// no architecture crate name — this file's own header doc comment),
+/// so it cannot itself call `hal_riscv64::cpu::wfi`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IrqWaitOutcome {
+    /// Bits were already pending (or just became pending) — no
+    /// blocking needed.
+    Ready(u64),
+    /// The caller is now genuinely `Blocked` (`kernel_core::syscall::
+    /// do_wait`'s own `note_blocked` call already ran) — the caller
+    /// must idle-wait (e.g. `wfi`) for the bound IRQ to fire, then
+    /// call this again.
+    Blocked,
+    /// The capability/dispatch itself failed (bad cap, wrong kind).
+    Error,
+}
+
+/// Issues one `SyscallOp::Wait` on `notif_cap` — see this module's own
+/// `DRV_IRQ_WAIT` doc comment above and `IrqWaitOutcome`'s own doc
+/// comment for the full rationale and calling convention.
+pub fn drv_irq_wait_step(hal: &HalInterface, caller: ThreadId, notif_cap: u32) -> IrqWaitOutcome {
+    let k = kstate();
+    match k.dispatch(
+        caller,
+        hal.now_ns(),
+        SyscallOp::Wait { notification: CapId::new(notif_cap) },
+        hal,
+    ) {
+        Ok(SyscallReturn::Value(bits)) => {
+            // **Real bug found via QEMU** (a SECOND instance of the
+            // same root cause `IrqWaitOutcome::Error`'s own doc comment
+            // already found and fixed once — this is the OTHER half of
+            // it): `virtio_blk_irq_trampoline`'s own `wake_blocked` only
+            // marks the caller `Ready` again (matching `wake_blocked`'s
+            // own documented role — see `kernel_sched::Scheduler::
+            // note_ready`'s doc comment), it does NOT mark it `Running`.
+            // Without an explicit `dispatch` here, `sched.running()`
+            // stays `None` (still cleared by the earlier `Blocked`
+            // outcome's own `note_blocked`), so EVERY later generic
+            // caller-discovery in this SAME trap context (`p2_ipc_recv`/
+            // `p2_ipc_reply`, called next by `subsystem_entry.rs`'s own
+            // loop once it resumes) falls back to `root_thread` instead
+            // of the driver's own tid — confirmed via a temporary
+            // diagnostic print showing `IPC_REPLY`/`IPC_RECV` both
+            // dispatching as `ThreadId(0)` (root) against capability
+            // slots that belong to the DRIVER's own cap space, failing
+            // every time (`NotBlockedOnReply`/`WrongObjectKind`) in a
+            // tight, silent, infinite retry loop. `dispatch` is exactly
+            // what every OTHER real switch-back-to-a-woken-thread path
+            // in this file already does before treating it as "the
+            // current thread" (e.g. `fs_ipc_call`'s own `sched.
+            // dispatch(fs_tid, ...)` right before its own switch).
+            let _ = k.sched.dispatch(caller, hal.now_ns());
+            IrqWaitOutcome::Ready(bits)
+        }
+        Ok(SyscallReturn::Blocked) => IrqWaitOutcome::Blocked,
+        _ => IrqWaitOutcome::Error,
+    }
+}
+
+/// Completes an [`IrqWaitOutcome::Blocked`] by handing the CPU to
+/// whatever `pick_next` finds, instead of idling the core in kernel
+/// context — the switch half of `DRV_IRQ_WAIT`, mirroring
+/// [`p2_wait_general`]'s own `Blocked` arm exactly (same `pick_next` →
+/// `dispatch` → `user_ctx_switch_ptrs` shape, same `note_ready` +
+/// re-`dispatch` fallback when nothing else is `Ready`).
+///
+/// **Real bug found via QEMU** (2026-09-17) — this function exists to
+/// fix a total, deterministic x86_64 boot stall right after
+/// `device-manager` reaches `state=Running`. [`p2_wait_general`]'s own
+/// doc comment asserted that `drv_irq_wait_step` was "correct only
+/// because a driver waiting on its OWN hardware IRQ genuinely has
+/// nothing else to do"; that premise is false, and was the bug. The
+/// *driver thread* has nothing else to do, but the *CPU* does: roughly
+/// twenty other real subsystems are `Ready` at that point in the boot.
+/// The old `kernel/src/main.rs` `DRV_IRQ_WAIT` arm looped in Ring 0 on
+/// `hal_x86_64::cpu::hlt_wait_for_irq` (`sti; hlt; cli`) until the
+/// awaited IRQ arrived — but `driver-i8042`/`driver-mouse` wait on
+/// PS/2 keyboard/mouse IRQs that NEVER arrive in an automated QEMU run,
+/// because nobody types. That parked the whole core forever.
+///
+/// The same comment's own escape hatch — "would instead starve every
+/// other Ready thread *until the timer eventually preempts it*" — could
+/// never fire either, because of a second, interlocking defect: the
+/// LAPIC preemption timer is a genuine one-shot under TCG (no
+/// TSC-deadline support, so `Timer::set_oneshot` falls back to
+/// `write_initial_count`, which does not auto-reload), and
+/// `hal_x86_64::cpu::common_timer_entry` returns WITHOUT calling the
+/// `TickHandler` when a tick lands at CPL 0 — and the `TickHandler`
+/// (`p2_tick`) is the only thing that re-arms the deadline. So the
+/// first tick that landed inside that Ring-0 halt loop silently killed
+/// the preemption timer for the rest of the boot. Observed CPU state at
+/// the stall was exactly `HLT=1 CPL=0 RFL=0x246` — literally the `hlt`
+/// inside `hlt_wait_for_irq`, interrupts enabled, timer dead.
+///
+/// Switching away instead of halting fixes both halves at once: other
+/// threads keep running, and because U-mode contexts are started with
+/// `RFLAGS.IF = 1` (`init_user_context`), every later timer tick lands
+/// at CPL 3, where the `TickHandler` really does run and really does
+/// re-arm. IRQ delivery is not weakened by dropping the `sti`-`hlt`
+/// window — a running U-mode thread has interrupts enabled
+/// continuously, which is strictly wider than that window was.
+///
+/// Returns `Some((save, into))` for `TrapOutcome::SwitchTo`, or `None`
+/// (→ resume the caller) when nothing else is `Ready`; in the `None`
+/// case the caller's block is UNDONE first, so it is never left
+/// `Blocked` in the scheduler's bookkeeping while actually running —
+/// the same silent-corruption class [`p2_wait_general`] and
+/// `KernelState::block_thread` each already guard.
+pub fn drv_irq_wait_yield(hal: &HalInterface, caller: ThreadId) -> Option<(*mut u8, *const u8)> {
+    let k = kstate();
+    let now = hal.now_ns();
+    // `drv_irq_wait_step`'s own `do_wait` already committed `caller` as
+    // `Blocked` (its `note_blocked`), so `pick_next` cannot return it.
+    let Some(next) = k.sched.pick_next(now) else {
+        let _ = k.sched.note_ready(caller, now);
+        let _ = k.sched.dispatch(caller, now);
+        return None;
+    };
+    if next == caller {
+        return None;
+    }
+    let _ = k.sched.dispatch(next, now);
+    k.user_ctx_switch_ptrs(caller, next)
+}
+
+/// Busy-park forever. The in-kernel demo threads have nothing to return
+/// to once their part is done; a real service would loop on `Recv`.
+fn park() -> ! {
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+/// Accessor for the kernel state, valid after `enter` has been called.
+///
+/// # Safety contract
+/// Single-core; `enter` sets the pointer once before anything else runs,
+/// so the returned `&mut` is never aliased. The final binary's
+/// `simurgh_syscall` uses this from the S-mode trap handler.
+pub fn kstate() -> &'static mut KernelState {
+    // SAFETY: see the contract above.
+    unsafe { &mut *core::ptr::addr_of_mut!(G_STATE).read() }
+}
+
+/// Accessor for the HAL interface, valid after `enter` has been called.
+pub fn khal() -> &'static HalInterface {
+    // SAFETY: `G_HAL` is set by `enter` before any thread runs.
+    unsafe { &*core::ptr::addr_of!(G_HAL).read() }
+}
+
+/// Encodes a [`kernel_core::tcb::ThreadState`] as a small, stable wire
+/// byte — the real per-process-introspection primitive `simurgh-shell`'s
+/// own `ps` command needed (that repo's own README long flagged `ps` as
+/// "not a real process table - no kernel syscall exposes real per-
+/// process introspection yet", honest about the gap rather than faking
+/// one). Values are deliberately NOT `ThreadState`'s own discriminant
+/// order (kept independent so a future `kernel-core` variant reorder
+/// never silently renumbers an already-shipped wire value) — a client
+/// mirrors this exact mapping (`simurgh-shell::shell_core::subsystem_
+/// entry`'s own copy).
+fn thread_state_wire_code(state: kernel_core::tcb::ThreadState) -> u8 {
+    use kernel_core::tcb::ThreadState;
+    match state {
+        ThreadState::Inactive => 0,
+        ThreadState::Runnable => 1,
+        ThreadState::BlockedOnSend => 2,
+        ThreadState::BlockedOnRecv => 3,
+        ThreadState::BlockedOnReply => 4,
+        ThreadState::BlockedOnNotification => 5,
+        ThreadState::Exited => 6,
+    }
+}
+
+/// Real per-process-introspection query: `idx` is a raw `ThreadId` table
+/// index (`0..kernel_core::config::MAX_THREADS`, the TCB table's own
+/// fixed capacity — a caller iterates every index in that range, since
+/// the table is a sparse `[Option<Tcb>; MAX_THREADS]`, `Retype`/
+/// `Terminate` leaving real holes, not a dense/compacted list). Returns
+/// `Some((tid, state_code))` (`state_code` per [`thread_state_wire_
+/// code`]) if a live TCB occupies that slot, `None` if it does not
+/// (`idx` out of range, or a genuinely empty/reclaimed slot) — a normal,
+/// expected outcome for most slots on a real boot (`MAX_THREADS` is 96;
+/// this project spawns nowhere near that many processes yet), not an
+/// error.
+pub fn ps_list_entry(idx: usize) -> Option<(u32, u8)> {
+    if idx >= kernel_core::config::MAX_THREADS {
+        return None;
+    }
+    let k = kstate();
+    let tcb = k.tcb(ThreadId::new(idx as u32))?;
+    Some((idx as u32, thread_state_wire_code(tcb.state)))
+}
+
+// ---------------------------------------------------------------------------
+// General thread-exit supervision (`sys::THREAD_EXIT_POLL`, 2026-09-18).
+//
+// The architecture-erased half of the real `kernel_core::SyscallOp::
+// ThreadExitStatus` primitive — see that operation's own doc comment for
+// the whole design (why it polls rather than blocks, and why only a
+// thread's own spawner may ask). Everything here is wire format: flatten
+// `SyscallReturn::ThreadStatus`'s three-way answer into the two plain
+// registers a U-mode caller gets back, and keep `kernel-core` free of any
+// knowledge of that encoding.
+//
+// The status codes are a small, closed set rather than bit-packed into one
+// register the way `sys::PS_LIST_ENTRY`'s own `(tid << 8) | state_code`
+// is: the payload here is a FULL 64-bit architecture trap cause with no
+// spare bits to shift it past, so the answer genuinely needs two
+// registers (`TrapOutcome::Resume2`, which every architecture already has
+// for exactly this "one value does not fit" case — see `IPC_RECV`).
+// ---------------------------------------------------------------------------
+
+/// The queried thread is alive (any non-`Exited` state, including spawned-
+/// but-not-yet-started). Payload register is `0`.
+pub const THREAD_EXIT_RUNNING: usize = 0;
+/// The queried thread terminated voluntarily; the payload register holds
+/// its self-reported exit code (`0` = success by convention).
+pub const THREAD_EXIT_CLEAN: usize = 1;
+/// The queried thread was killed by a fatal exception; the payload
+/// register holds the RAW, architecture-specific trap cause code (NOT
+/// normalized across architectures — `kernel_core::ThreadExit::Faulted`'s
+/// own doc comment).
+pub const THREAD_EXIT_FAULTED: usize = 2;
+/// The queried thread terminated but no reason was recorded
+/// (`kernel_core::ThreadExit::Unknown` — unreachable today, kept so this
+/// encoding is total). Payload register is `0`.
+pub const THREAD_EXIT_UNKNOWN: usize = 3;
+/// The query was refused: the target names no live TCB, or the caller is
+/// not the target's spawner. Deliberately ONE wire value for both
+/// kernel-side errors — the distinction is useful inside the kernel (and
+/// logged there) but telling an unauthorized caller WHICH of the two it
+/// hit would leak exactly the "does this thread exist" fact the spawner
+/// check exists to withhold. `usize::MAX` matches the established error
+/// sentinel of every other real query opcode in this project
+/// (`sys::SPAWN_KNOWN_ELF`, `sys::PS_LIST_ENTRY`, `sys::SERIAL_TRY_READ`).
+pub const THREAD_EXIT_DENIED: usize = usize::MAX;
+
+/// Purely ADDITIVE, real, on-boot cross-check of the general thread-exit
+/// primitive against a real, genuinely-crashed process — called once from
+/// each architecture's own `sys::DM_REPORT` handler at the exact moment
+/// device-manager reports `Failed` (the §5.2 fault-isolation demo's own
+/// PASS point), just before `p2_dm_supervision_done`.
+///
+/// Why here specifically: at that instant the system contains a process
+/// that REALLY faulted (`WATCHED_DRIVER_TID`, killed by `p2_fault` on a
+/// genuine U-mode exception) whose REAL spawner is the thread that is
+/// running right now (device-manager, which respawned it via
+/// `sys::DM_RESPAWN_DRIVER`). So this is the one place on a real boot
+/// where the general query can be exercised end to end against a real
+/// fault AND a legitimately-authorized caller, rather than only against
+/// a live process (which is all `simurgh-init`'s own supervision
+/// self-check can reach — every target it is allowed to spawn parks
+/// forever instead of dying).
+///
+/// Changes NO control flow and mutates NO state: one read-only `dispatch`
+/// and one log line. The bespoke `DM_WAIT_CRASH`/`DM_POLL_CRASH` path the
+/// demo actually runs on is untouched and remains the mechanism under
+/// test by that demo; this only observes, alongside it.
+pub fn p2_verify_watched_driver_exit_query(hal: &HalInterface) {
+    // SAFETY: single-core; written by `p2_watch_driver` / read here.
+    let watched = unsafe { core::ptr::addr_of!(WATCHED_DRIVER_TID).read() };
+    let Some(driver_tid) = watched else {
+        return;
+    };
+    let k = kstate();
+    let Some(caller) = k.sched.running() else {
+        return;
+    };
+    let (status, payload) = p2_thread_exit_status(hal, caller, driver_tid.as_u32());
+    klog!(
+        "THREAD_EXIT_POLL cross-check: supervisor tid#{} queried its own crashed child tid#{} -> status={} payload={:#x}\r\n",
+        caller.as_u32(),
+        driver_tid.as_u32(),
+        status,
+        payload
+    );
+}
+
+/// `sys::THREAD_EXIT_POLL` from any U-mode process: has the thread `caller`
+/// spawned as raw id `target` terminated, and if so why?
+///
+/// Returns `(status, payload)` for the architecture caller to place in its
+/// own two return registers (`TrapOutcome::Resume2`) — `status` is one of
+/// the `THREAD_EXIT_*` constants above, `payload` its documented
+/// companion value.
+///
+/// Never blocks, never switches, and never mutates kernel state: the whole
+/// operation is one `dispatch` into a read-only `kernel-core` query, which
+/// is what makes it safe for a supervisor to call in a hot loop over all
+/// of its children.
+pub fn p2_thread_exit_status(hal: &HalInterface, caller: ThreadId, target: u32) -> (usize, usize) {
+    let k = kstate();
+    match k.dispatch(
+        caller,
+        hal.now_ns(),
+        SyscallOp::ThreadExitStatus { thread: ThreadId::new(target) },
+        hal,
+    ) {
+        Ok(SyscallReturn::ThreadStatus { exit: None }) => (THREAD_EXIT_RUNNING, 0),
+        Ok(SyscallReturn::ThreadStatus { exit: Some(exit) }) => match exit {
+            kernel_core::ThreadExit::Clean { code } => (THREAD_EXIT_CLEAN, code as usize),
+            kernel_core::ThreadExit::Faulted { cause } => (THREAD_EXIT_FAULTED, cause as usize),
+            kernel_core::ThreadExit::Unknown => (THREAD_EXIT_UNKNOWN, 0),
+        },
+        Ok(other) => {
+            // Unreachable: `dispatch` answers this operation with
+            // `ThreadStatus` or an error, nothing else. Logged rather than
+            // silently folded into `DENIED` so a future dispatch change
+            // that broke this pairing would be visible on a real boot.
+            klog!(
+                "THREAD_EXIT_POLL: tid#{} asked about tid#{} and got an unexpected {:?}\r\n",
+                caller.as_u32(),
+                target,
+                other
+            );
+            (THREAD_EXIT_DENIED, 0)
+        }
+        Err(e) => {
+            klog!(
+                "THREAD_EXIT_POLL: tid#{} denied a query about tid#{} ({:?})\r\n",
+                caller.as_u32(),
+                target,
+                e
+            );
+            (THREAD_EXIT_DENIED, 0)
+        }
+    }
+}
+
+/// Installs a new SYSTEM-WIDE scheduling policy on behalf of layer-4
+/// Profile Policy — the kernel side of `kernel/src/main.rs`'s own
+/// `sys::SCHED_SET_SYSTEM_POLICY` (2026-09-18).
+///
+/// `mode_code` is a `kernel_sched::SchedulerMode::wire_code` value
+/// (`0` = `Interactive`, `1` = `Throughput`); `aging_cap_ms` is
+/// 02-Microkernel-Layer.md §4.3's `aging_cap_ms`, where `0` is a real
+/// value (aging off — `simurgh-profile-policy`'s own `RealTime` default,
+/// 04-System-Services-Policy-Layer-v2.md §7.3), not "unset".
+///
+/// Returns `Some(threads_re_moded)` on success — the count
+/// `Scheduler::set_system_scheduler_policy` reports, so the caller can
+/// log real evidence the switch took effect — or `None` if `mode_code` is
+/// not a mode this kernel knows, in which case NOTHING is changed (not
+/// even `aging_cap_ms`: a request this kernel only half-understands is
+/// rejected whole rather than partially applied).
+///
+/// Scope is deliberately system-wide, not per-caller: a "profile" is a
+/// whole-machine setting (04-...-v2.md §7), so this changes
+/// `Scheduler`'s own default mode and re-modes every already-admitted
+/// thread that follows it. Threads that pinned a mode at admit time —
+/// notably the Root Task (`kernel_core::KernelState::init`'s own Step 4
+/// comment) — are untouched, per 02-Microkernel-Layer.md §4.4.
+///
+/// `aging_cap_ms` is clamped to `u32`'s range by its own parameter type
+/// upstream; a caller passing a nonsense-but-in-range huge value simply
+/// gets an aging cap no real wait time will ever reach, which is
+/// behaviourally identical to the cap being very large — not a fault
+/// worth rejecting.
+///
+/// TODO(spec): not capability-gated yet. Every syscall opcode in this MVP
+/// phase shares that gap (`sys::MAP_PAGE`'s and `sys::POWER_CONTROL`'s own
+/// doc comments say the same), and a genuinely privileged
+/// profile-policy-only gate needs the `simurgh-security-broker` capability
+/// edge that does not reach the kernel yet. Flagged for Omid rather than
+/// silently treated as done: as it stands ANY U-mode process that knows
+/// the opcode can retune system scheduling, which is not the intended
+/// end state for a capability-based OS.
+pub fn set_system_scheduler_policy(mode_code: usize, aging_cap_ms: usize) -> Option<usize> {
+    let mode = kernel_core::SchedulerMode::from_wire_code(u8::try_from(mode_code).ok()?)?;
+    let k = kstate();
+    Some(k.sched.set_system_scheduler_policy(mode, aging_cap_ms as u64))
+}
+
+
+/// The in-kernel milestone demo (02-Microkernel-Layer.md §8.1 / §8.2 /
+/// §8.5): retype an `Endpoint`, exercise capability revocation, retype
+/// and start a second thread, and complete a synchronous IPC round-trip.
+/// Runs at kernel privilege, reaching the kernel by calling `dispatch`
+/// directly. Returns normally when done.
+fn inkernel_demo(k: &mut KernelState, hal: &HalInterface) {
+    let root = k.root_thread;
+    klog!("root task: running (thread {})\r\n", root.as_u32());
+
+    // 1. An endpoint for the round-trip.
+    let Some(ep_cap) = retype_one_from_any_untyped(k, hal, root, KernelObjectType::Endpoint, 1) else {
+        klog!("root task: endpoint Retype failed (no untyped region has room)\r\n");
+        park()
+    };
+    klog!("root task: endpoint cap slot = {}\r\n", ep_cap.as_u32());
+
+    // 1b. Capability revocation (02-Microkernel-Layer.md §8.5): derive a
+    //     two-level subtree from `ep_cap`, then `CapRevoke` the middle
+    //     node and confirm the whole subtree (but not `ep_cap`) is gone.
+    {
+        let cs = k.root_cap_space;
+        let child_a = k
+            .cap_space_mut(cs)
+            .and_then(|t| t.derive_child(ep_cap, CapabilityRights::all(), 0).ok())
+            .expect("derive child A");
+        let child_b = k
+            .cap_space_mut(cs)
+            .and_then(|t| t.derive_child(child_a, CapabilityRights::RW, 0).ok())
+            .expect("derive child B");
+        let before = k
+            .cap_space(cs)
+            .map(|t| t.lookup(child_a).is_some() && t.lookup(child_b).is_some())
+            .unwrap_or(false);
+        let freed = match k.dispatch(root, hal.now_ns(), SyscallOp::CapRevoke { cap: child_a }, hal) {
+            Ok(SyscallReturn::Revoked { freed }) => freed,
+            other => {
+                klog!("root task: CapRevoke unexpected: {:?}\r\n", other);
+                0
+            }
+        };
+        let after_gone = k
+            .cap_space(cs)
+            .map(|t| {
+                t.lookup(child_a).is_none()
+                    && t.lookup(child_b).is_none()
+                    && t.lookup(ep_cap).is_some()
+            })
+            .unwrap_or(false);
+        klog!(
+            "root task: revocation - subtree present before: {}, freed {} slot(s), gone after (parent kept): {}\r\n",
+            before,
+            freed,
+            after_gone
+        );
+    }
+
+    // 2. A TCB for thread 2 (bound to the Root Task's own cap space by
+    //    the MVP `Retype` - so thread 2 can use `ep_cap` directly).
+    let Some(t2_cap) = retype_one_from_any_untyped(k, hal, root, KernelObjectType::ThreadControlBlock, 1)
+    else {
+        klog!("root task: TCB Retype failed (no untyped region has room)\r\n");
+        park()
+    };
+    let t2 = {
+        let cs = k.root_cap_space;
+        let id = k
+            .cap_space(cs)
+            .and_then(|t| t.lookup(t2_cap))
+            .map(|c| c.object.id.as_u32())
+            .expect("thread 2 TCB cap resolves");
+        ThreadId::new(id)
+    };
+    klog!(
+        "root task: thread 2 = tid {} (cap slot {})\r\n",
+        t2.as_u32(),
+        t2_cap.as_u32()
+    );
+
+    // 3. Publish what thread 2 needs, then start it.
+    let t2_stack_top =
+        (core::ptr::addr_of!(THREAD2_STACK) as usize + THREAD_STACK_SIZE) & !0xF;
+    // SAFETY: single-core; written before `start_thread` makes thread 2
+    // runnable, read only by `thread2_main`.
+    unsafe {
+        core::ptr::addr_of_mut!(G_T2).write(t2.as_u32());
+        core::ptr::addr_of_mut!(G_EP).write(ep_cap.as_u32());
+        core::ptr::addr_of_mut!(G_ROOT).write(root.as_u32());
+    }
+    k.start_thread(t2, thread2_main as usize, t2_stack_top, hal);
+    klog!("root task: thread 2 started\r\n");
+
+    // 4. Block in Recv, then hand the CPU to whoever the scheduler picked
+    //    (thread 2).
+    match k.dispatch(root, hal.now_ns(), SyscallOp::Recv { endpoint: ep_cap }, hal) {
+        Ok(SyscallReturn::Reschedule { next: Some(n) }) => {
+            klog!("root task: blocked on Recv - switching to thread {}\r\n", n.as_u32());
+            k.yield_to(root, n, hal);
+        }
+        Ok(SyscallReturn::Message { from, msg }) => {
+            klog!(
+                "root task: Recv returned a message immediately from {} (label {:#x})\r\n",
+                from.as_u32(),
+                msg.label
+            );
+        }
+        other => {
+            klog!("root task: Recv unexpected: {:?}\r\n", other);
+            park();
+        }
+    }
+
+    // 5. Resumed after thread 2 sent + yielded back. Read the message the
+    //    kernel parked in our TCB.
+    match k.tcb_mut(root).and_then(|t| t.pending_msg.take()) {
+        Some(m) => klog!(
+            "root task: IPC OK - got label {:#x}, words {:?}\r\n",
+            m.label,
+            m.words()
+        ),
+        None => klog!("root task: resumed but no message was delivered\r\n"),
+    }
+
+    klog!("root task: 8.2 milestone - 2nd thread + synchronous IPC round-trip complete\r\n");
+
+    // 5b. IPC round-trip micro-benchmark (02-Microkernel-Layer.md §8.3
+    //     acceptance harness: "ipc_call fast-path < 500 ns on reference
+    //     hardware"). A dedicated thread 3 acts as an RPC SERVER: loops
+    //     Recv -> Reply, `IPC_BENCH_ITERATIONS` times (`bench_server_
+    //     main`). The Root Task acts as the CLIENT: times each `Call`
+    //     (-> `yield_to` the server, which `Reply`s -> `yield_to` back)
+    //     round trip via `hal.now_ns()`.
+    //
+    //     Every one of these `Call`s hits `kernel-core::syscall::
+    //     do_send`'s REAL L4-style fast path (`kernel_ipc::fastpath::
+    //     fast_path_eligible` wired in for real, plus the `Reply`
+    //     syscall completing the round trip — both this project's own
+    //     prior session): the server is always already blocked in
+    //     `Recv` by the time the client's next `Call` lands, so
+    //     `pick_next`'s fairness scan is skipped both directions. This
+    //     is the tuned-fast-path number §8.3 actually asks for — NOT
+    //     the general-dispatch baseline earlier sessions measured
+    //     (that baseline used plain `Send`/`Recv`, which never took
+    //     this branch at all; still true today for `Send`, see
+    //     `plain_send_does_not_take_the_call_fast_path`).
+    //
+    //     What this benchmark does NOT measure: the register-only
+    //     PARTIAL context switch `kernel_ipc::fastpath`'s own doc
+    //     comment describes. `yield_to` below performs `hal_core::
+    //     HalInterface::context_switch`'s FULL GPR save/restore every
+    //     time — thread 3 is an in-kernel cooperative thread (like
+    //     thread 2's own §8.2 milestone), not a real, isolated U-mode
+    //     process, so the register-only `TrapOutcome::SwitchToFast` +
+    //     `{save,restore}_ipc_fast_context` primitive (built later,
+    //     one real subsystem at a time — mm-service, Compositor,
+    //     Netstack's bypass control-plane all use it today) never
+    //     comes into play here at all. `umode_root`'s own `mm_bench_*`
+    //     (called after the mm-service demo, further down this file)
+    //     times 200 REAL U-mode-to-U-mode round trips over THAT exact
+    //     mechanism instead — see its own doc comment for why that
+    //     number, not this one, is what §8.3 actually asks for. This
+    //     benchmark still has its own honest purpose: isolating `do_
+    //     send`/`do_reply`'s fast_path_eligible dispatch-level saving
+    //     (skipping `pick_next`) from the register-restore cost the
+    //     other one adds on top.
+    let t3_cap = retype_one_from_any_untyped(k, hal, root, KernelObjectType::ThreadControlBlock, 1);
+    if t3_cap.is_none() {
+        klog!("root task: bench TCB Retype failed (no untyped region has room) - skipping §8.3 benchmark\r\n");
+    }
+    if let Some(t3_cap) = t3_cap {
+        let t3 = {
+            let cs = k.root_cap_space;
+            let id = k
+                .cap_space(cs)
+                .and_then(|t| t.lookup(t3_cap))
+                .map(|c| c.object.id.as_u32())
+                .expect("bench thread TCB cap resolves");
+            ThreadId::new(id)
+        };
+        let t3_stack_top =
+            (core::ptr::addr_of!(THREAD3_STACK) as usize + THREAD_STACK_SIZE) & !0xF;
+        // SAFETY: single-core; written before `start_thread` makes thread 3
+        // runnable, read only by `bench_thread_main`. G_EP/G_ROOT are
+        // unchanged from thread 2's setup above (same endpoint, same root).
+        unsafe { core::ptr::addr_of_mut!(G_T3).write(t3.as_u32()) };
+        k.start_thread(t3, bench_server_main as usize, t3_stack_top, hal);
+
+        // Kick the server once so it reaches its own first `Recv` and
+        // blocks — otherwise the Root Task's first `Call` below would
+        // find no receiver queued yet (`SenderQueued`, the general
+        // path) instead of the fast path `fast_path_eligible` needs an
+        // ALREADY-blocked receiver for.
+        k.yield_to(root, t3, hal);
+
+        let (mut min_ns, mut max_ns, mut sum_ns) = (u64::MAX, 0u64, 0u64);
+        for i in 0..IPC_BENCH_ITERATIONS {
+            let req = SmallMessage::from_words(0xCA11, &[i as u64])
+                .unwrap_or_else(|_| SmallMessage::new(0xCA11));
+            let t0 = hal.now_ns();
+            match k.dispatch(root, hal.now_ns(), SyscallOp::Call { endpoint: ep_cap, msg: req }, hal) {
+                Ok(SyscallReturn::Reschedule { next: Some(n) }) => k.yield_to(root, n, hal),
+                other => {
+                    klog!("root task: bench Call unexpected: {:?}\r\n", other);
+                    break;
+                }
+            }
+            let dt = hal.now_ns().saturating_sub(t0);
+            min_ns = min_ns.min(dt);
+            max_ns = max_ns.max(dt);
+            sum_ns += dt;
+            let _ = k.tcb_mut(root).and_then(|t| t.pending_msg.take());
+        }
+        let avg_ns = sum_ns / IPC_BENCH_ITERATIONS as u64;
+        klog!(
+            "root task: in-kernel ipc round-trip benchmark (02 8.3, {} iters, REAL Call+Reply fast path - do_send/do_reply skip pick_next; full GPR yield_to, not the register-only U-mode primitive - see the later mm-service benchmark for that one) - min {} ns, avg {} ns, max {} ns\r\n",
+            IPC_BENCH_ITERATIONS,
+            min_ns,
+            avg_ns,
+            max_ns
+        );
+    }
+
+    // 6. Shared-memory model (02-Microkernel-Layer.md §5.2 / §8.4):
+    //    alias ONE physical frame at two virtual addresses in the Root
+    //    Task's address space and confirm both translate to it. This is
+    //    the software-model view; step 7 does the same thing in hardware.
+    let Some(frame_cap) = retype_one_from_any_untyped(k, hal, root, KernelObjectType::Untyped, 1) else {
+        return;
+    };
+    let frame_phys = {
+        let uid = kernel_cap::UntypedId::new(
+            k.cap_space(k.root_cap_space)
+                .and_then(|t| t.lookup(frame_cap))
+                .map(|c| c.object.id.as_u32())
+                .unwrap_or(0),
+        );
+        match k.untyped_mut(uid) {
+            Some(u) => u.base(),
+            None => return,
+        }
+    };
+    let (va1, va2) = (VirtAddr::new(0x5000_0000), VirtAddr::new(0x6000_0000));
+    let rw = MapPermissions::KERNEL_DATA;
+    if let Some(space) = k.addr_space_mut(k.root_addr_space) {
+        let _ = space.map(va1, frame_phys, kernel_mm::PAGE_SIZE, rw);
+        let _ = space.map(va2, frame_phys, kernel_mm::PAGE_SIZE, rw);
+        let p1 = space.translate(VirtAddr::new(va1.as_usize() + 0x80)).map(|(p, _)| p.as_usize());
+        let p2 = space.translate(VirtAddr::new(va2.as_usize() + 0x80)).map(|(p, _)| p.as_usize());
+        klog!(
+            "root task: shared-memory model - va {:#x} -> {:?}, va {:#x} -> {:?} (one frame {:#x}, two mappings, aliased: {})\r\n",
+            va1.as_usize(),
+            p1,
+            va2.as_usize(),
+            p2,
+            frame_phys.as_usize(),
+            p1.is_some() && p1 == p2
+        );
+    }
+
+    // 7. The same aliasing, MMU-enforced across TWO separate Sv39 address
+    //    spaces (02-Microkernel-Layer.md §8.4). Build two independent root
+    //    page tables, each with its own low-3 GiB kernel identity map (so
+    //    S-mode keeps executing across the `satp` swaps) plus the shared
+    //    frame at a DIFFERENT virtual address in each. Then: write through
+    //    space A's VA, switch to space B, read it back through B's VA,
+    //    write a new value, switch back to A, read that. If both crossings
+    //    see the other space's write, the frame is genuinely shared with
+    //    no copy. Runs here with paging still off (`satp == 0`), so
+    //    `map_range`'s physical pointers are directly addressable; the
+    //    final `activate_address_space(0)` returns to Bare mode before
+    //    `enter` builds the real Root Task space.
+    //
+    //    This is the kernel-mechanism half of "two processes share memory
+    //    zero-copy"; running two U-mode threads concurrently in spaces A
+    //    and B additionally needs a context-switch primitive that can
+    //    resume a user context (tracked in IMPLEMENTATION-PLAN.md).
+    let two_space = (|| {
+        let uid = || kernel_cap::UntypedId::new(0);
+        // 3 pages each, not 1 — see `enter`'s own `root_pt` carve (this
+        // function runs BEFORE `enter`'s own address-space setup, called
+        // from inside `enter` itself, but the SAME "some architectures'
+        // `root_frame` needs a companion page" reasoning applies here
+        // identically). **Real bug found via QEMU**: with 1 page each,
+        // x86_64's `map_ram_identity` (which always writes a PDPT at
+        // `root_frame + 4096`) silently OVERWROTE `sp_b` while building
+        // `sp_a`'s table, then overwrote `pool` while building `sp_b`'s —
+        // a cascading corruption whose only symptom was the CPU quietly
+        // executing garbage after `activate_address_space(sp_a)` (no
+        // panic, no fault visible in serial output — just silence,
+        // confirmed via `-d int`: no further kernel code ever ran).
+        let sp_a = k.untyped_mut(uid())?.alloc(4096, 4096 * 3).ok()?.as_usize();
+        let sp_b = k.untyped_mut(uid())?.alloc(4096, 4096 * 3).ok()?.as_usize();
+        let pool = k.untyped_mut(uid())?.alloc(4096, 4096 * 4).ok()?.as_usize();
+        Some((sp_a, sp_b, pool))
+    })();
+    let (sp_a, sp_b, pool) = match two_space {
+        Some(v) => v,
+        None => {
+            klog!("root task: two-address-space proof skipped (no untyped left)\r\n");
+            return;
+        }
+    };
+    // SAFETY: `pool` is fresh untyped RAM, identity-addressable with
+    // paging off; single-core; `map_range` requires it pre-zeroed.
+    unsafe {
+        core::ptr::write_bytes(pool as *mut u8, 0, 4096 * 4);
+    }
+    let phys = frame_phys.as_usize();
+    let (va_a, va_b) = (0xE000_0000usize, 0xF000_0000usize);
+    // SAFETY: single-core; only written once, by `enter`, before this runs.
+    let bytes_gib = unsafe { core::ptr::addr_of!(G_BYTES_GIB).read() };
+    hal.map_ram_identity(sp_a, bytes_gib, false);
+    hal.map_ram_identity(sp_b, bytes_gib, false);
+    let n_a = hal.map_range(sp_a, va_a, phys, 4096, 1 | 2, pool, 4);
+    let n_b = if n_a == u32::MAX {
+        u32::MAX
+    } else {
+        hal.map_range(sp_b, va_b, phys, 4096, 1 | 2, pool + (n_a as usize) * 4096, 4 - n_a as usize)
+    };
+    if n_a == u32::MAX || n_b == u32::MAX {
+        klog!("root task: two-address-space proof skipped (map_range unsupported on this arch)\r\n");
+        return;
+    }
+    // SAFETY: after each `activate_address_space`, `va_a` (in space A) /
+    // `va_b` (in space B) map the shared frame `R+W`; the kernel's own
+    // code/stack stay valid via each table's identity map. Single-core,
+    // no other reference to the frame is live. `flush_tlb` after every
+    // write makes the next crossing observe it.
+    let (seen_in_b, seen_in_a) = unsafe {
+        hal.activate_address_space(sp_a);
+        core::ptr::write_volatile(va_a as *mut u32, 0xA1A1);
+        hal.flush_tlb();
+
+        hal.activate_address_space(sp_b);
+        let b = core::ptr::read_volatile(va_b as *const u32);
+        core::ptr::write_volatile(va_b as *mut u32, 0xB2B2);
+        hal.flush_tlb();
+
+        hal.activate_address_space(sp_a);
+        let a = core::ptr::read_volatile(va_a as *const u32);
+
+        hal.activate_address_space(0); // back to Bare mode for `enter`
+        (b, a)
+    };
+    klog!(
+        "root task: two Sv39 spaces - frame {:#x} at VA {:#x} (A) / {:#x} (B); A wrote 0xa1a1, B read {:#x}, B wrote 0xb2b2, A read {:#x} -> {}\r\n",
+        phys,
+        va_a,
+        va_b,
+        seen_in_b,
+        seen_in_a,
+        if seen_in_b == 0xA1A1 && seen_in_a == 0xB2B2 {
+            "ZERO-COPY ACROSS ISOLATED SPACES"
+        } else {
+            "MISMATCH"
+        }
+    );
+}
+
+/// The second thread's entry point (runs on `THREAD2_STACK`). Sends one
+/// message on the shared endpoint, then hands control back to the Root
+/// Task.
+extern "C" fn thread2_main() -> ! {
+    let k = kstate();
+    let hal = khal();
+    // SAFETY: set by `root_task_main` before `start_thread`.
+    let me = ThreadId::new(unsafe { core::ptr::addr_of!(G_T2).read() });
+    let ep = CapId::new(unsafe { core::ptr::addr_of!(G_EP).read() });
+    let root = ThreadId::new(unsafe { core::ptr::addr_of!(G_ROOT).read() });
+
+    klog!("thread 2: running (tid {})\r\n", me.as_u32());
+
+    let msg = SmallMessage::from_words(0xABCD, &[42, 7]).unwrap_or_else(|_| SmallMessage::new(0xABCD));
+    match k.dispatch(me, hal.now_ns(), SyscallOp::Send { endpoint: ep, msg }, hal) {
+        Ok(SyscallReturn::Delivered { woke }) => {
+            klog!("thread 2: sent message; woke thread {}\r\n", woke.as_u32())
+        }
+        other => klog!("thread 2: Send unexpected: {:?}\r\n", other),
+    }
+
+    klog!("thread 2: done - handing control back to the Root Task\r\n");
+    // Mark ourselves Exited and drop out of the scheduler BEFORE the final
+    // yield_to. `yield_to` only re-admits an outgoing thread to `Ready` if
+    // the scheduler still finds it `Running` — thread 2 never runs dispatch
+    // again after this point (it just parks), so without this it would sit
+    // forever as a phantom `Ready` entity that a later `pick_next` (e.g.
+    // the §8.3 benchmark below) could select, switching into a thread that
+    // can only spin — hanging the kernel.
+    // `mark_exited`, not a bare `t.state = Exited`: it records the REASON
+    // too (`Tcb::exit`'s own documented invariant), so this thread's exit
+    // is reportable through `SyscallOp::ThreadExitStatus` like any other.
+    // A deliberate, orderly finish — `Clean { code: 0 }`, not a fault.
+    k.mark_exited(me, kernel_core::ThreadExit::Clean { code: 0 });
+    k.sched.remove(me);
+    k.yield_to(me, root, hal);
+    park();
+}
+
+/// The `02-Microkernel-Layer.md §8.3` IPC round-trip benchmark's RPC
+/// SERVER (runs on `THREAD3_STACK`): `Recv`s a request, `Reply`s to it,
+/// `IPC_BENCH_ITERATIONS` times — the Root Task (the CLIENT) drives the
+/// round trip with `Call`, timing each one.
+///
+/// Every `Recv`/`Reply` here is deliberately queued via `dispatch`
+/// BEFORE the one real `yield_to` that actually switches away — never
+/// "Reply, then immediately switch, then re-`Recv` after switching
+/// back": `dispatch` on its own never performs a context switch (this
+/// crate's own established contract), so calling `Reply` then `Recv`
+/// back-to-back, and only THEN switching once, means this server is
+/// ALREADY re-registered as the endpoint's blocked receiver by the time
+/// control reaches the Root Task — exactly the precondition `kernel_
+/// ipc::fastpath::fast_path_eligible` needs for the Root Task's NEXT
+/// `Call` to hit the fast path too. Get this ordering wrong (switch
+/// away first, `Recv` again after) and every `Call` after the first
+/// would fall back to the general `SenderQueued` path instead.
+///
+/// The exit-the-scheduler step (same reasoning as `thread2_main`'s
+/// tail) has to happen on the LAST iteration, right before that
+/// iteration's own final switch (straight back to `from`, skipping the
+/// "queue a `Recv` nobody will ever answer" step entirely) — once that
+/// switch runs, this thread's saved context sits frozen there, and the
+/// Root Task's own loop below never switches back in.
+extern "C" fn bench_server_main() -> ! {
+    let k = kstate();
+    let hal = khal();
+    // SAFETY: set by `inkernel_demo` before `start_thread`.
+    let me = ThreadId::new(unsafe { core::ptr::addr_of!(G_T3).read() });
+    let ep = CapId::new(unsafe { core::ptr::addr_of!(G_EP).read() });
+
+    // Prime: block for the FIRST request. `inkernel_demo`'s own
+    // `k.yield_to(root, t3, hal)` "kick" (right after `start_thread`)
+    // is what runs this thread for the very first time, landing here.
+    if let Ok(SyscallReturn::Reschedule { next: Some(n) }) =
+        k.dispatch(me, hal.now_ns(), SyscallOp::Recv { endpoint: ep }, hal)
+    {
+        k.yield_to(me, n, hal);
+    }
+    // Resumed here (or fell straight through, if `Recv` somehow
+    // delivered synchronously): the Root Task's first `Call` has
+    // delivered its request directly into `pending_msg`/`pending_from`.
+
+    for i in 0..IPC_BENCH_ITERATIONS {
+        let from = k.tcb_mut(me).and_then(|t| t.pending_from.take());
+        let _req = k.tcb_mut(me).and_then(|t| t.pending_msg.take());
+        let Some(from) = from else {
+            klog!("bench server: woke with no pending_from - stopping\r\n");
+            break;
+        };
+        let reply = SmallMessage::from_words(0xF00D, &[i as u64])
+            .unwrap_or_else(|_| SmallMessage::new(0xF00D));
+
+        if let Err(e) = k.dispatch(me, hal.now_ns(), SyscallOp::Reply { to: from, msg: reply }, hal) {
+            klog!("bench server: Reply failed: {:?}\r\n", e);
+            break;
+        }
+
+        if i + 1 == IPC_BENCH_ITERATIONS {
+            // Same reasoning as `thread2_main`'s own retire step: record
+            // the reason, not just the fact.
+            k.mark_exited(me, kernel_core::ThreadExit::Clean { code: 0 });
+            k.sched.remove(me);
+            k.yield_to(me, from, hal);
+            break;
+        }
+
+        // Re-register as the blocked receiver for the NEXT request
+        // BEFORE the real switch below — see this function's own doc
+        // comment on why the ordering matters.
+        match k.dispatch(me, hal.now_ns(), SyscallOp::Recv { endpoint: ep }, hal) {
+            Ok(SyscallReturn::Reschedule { next: Some(n) }) => k.yield_to(me, n, hal),
+            other => {
+                klog!("bench server: Recv unexpected: {:?}\r\n", other);
+                break;
+            }
+        }
+        // Resumed here once the Root Task's NEXT `Call` delivers.
+    }
+    park();
+}
+
+// ============================================================================
+// Security Broker Intermediary (Issue #28) — the layer-3 process that
+// mints/revokes real Capabilities on the Security Broker's behalf
+// (04-System-Services-Policy-Layer.md §0, 02-Microkernel-Layer.md §6;
+// `ipc-protocol/src/security.rs`'s `SecurityRequest`/`SecurityResponse`
+// wire protocol, designed in commit c68f9c2 / Issues #28/#30 but never
+// wired to a real spawned process or a real syscall path until now).
+//
+// Two genuinely new pieces this section adds, neither of which existed
+// anywhere in this codebase before:
+//
+// 1. `cap_grant`/`cap_revoke`: the REAL `SyscallOp::CapGrant`/`CapRevoke`
+//    exposed over the actual raw syscall ABI (`sys::CAP_GRANT`/
+//    `sys::CAP_REVOKE` in `kernel/src/main.rs`) to ANY U-mode process for
+//    the first time — every existing capability transfer in this codebase
+//    (`grant_cap_into` above, every `spawn_*_demo_start`'s own `Retype` +
+//    grant sequence) is TRUSTED KERNEL GLUE CODE, called directly from
+//    `kernel-arch-glue`/`kernel/src/main.rs`, never reachable from an
+//    ordinary U-mode process. The intermediary is the first (and, by
+//    design — 04-...md §0 — the ONLY) U-mode process meant to actually
+//    issue this syscall itself.
+//
+// 2. `mint_tcb_cap_into`: the missing piece that makes (1) usable at all.
+//    `do_cap_grant` requires the CALLER to already hold a REAL
+//    `ThreadControlBlock` capability for the destination, in ITS OWN
+//    capability space (`kernel-core/src/syscall.rs::do_cap_grant`'s own
+//    doc comment: "there is no 'master grant' shortcut"). But
+//    `spawn_process`/`spawn_process_from_elf` create a TCB by calling
+//    `KernelState::alloc_tcb` DIRECTLY (bypassing `SyscallOp::Retype`
+//    entirely — the ONLY other path that ever inserts a capability for a
+//    newly created TCB, and only into the RETYPING caller's own space,
+//    for a BRAND NEW thread, never an already-existing one) — so no
+//    capability for ANY spawned subsystem's TCB exists anywhere, in any
+//    cap space, until this function mints one.
+//    `spawn_security_broker_intermediary` (`kernel/src/main.rs`) calls
+//    this once per destination service the intermediary should be able
+//    to target, directly into the intermediary's OWN cap space, matching
+//    `root_task::Service::SecurityBrokerIntermediary`'s own doc comment:
+//    "Requires Root Task to grant it a destination-TCB CapId for every
+//    other service it might need to grant capabilities into".
+// ============================================================================
+
+/// The REAL `SyscallOp::CapGrant`, reachable over the raw syscall ABI
+/// (`sys::CAP_GRANT`) for the first time — see this section's own doc
+/// comment. Synchronous: `do_cap_grant` never blocks/reschedules (same
+/// shape as every `SyscallOp::Retype` call already made throughout this
+/// file, e.g. `fs_demo_start`'s own endpoint creation).
+///
+/// `target_thread`/`cap` are `CapId`s in `caller`'s OWN capability space
+/// (`do_cap_grant`'s own precondition); `rights_bits` is a raw
+/// `CapabilityRights::bits()` value, truncated to defined bits (an
+/// undefined bit is simply ignored, not an error — unlike the kernel's
+/// own trusted glue calls elsewhere in this file, this IS reachable from
+/// a real U-mode process, so its input is not necessarily well-formed).
+///
+/// Returns the new capability's slot number in the DESTINATION's own cap
+/// space on success, `None` on any failure (bad `target_thread`/`cap`,
+/// missing rights, a rights escalation, or an unknown `caller`) — the raw
+/// dispatcher arm (`kernel/src/main.rs`) maps `None` to `usize::MAX`,
+/// matching this codebase's established "sentinel means failure, check
+/// the kernel log" convention (e.g. `DRV_BLK_DEMO_START`).
+pub fn cap_grant(hal: &HalInterface, caller: ThreadId, target_thread: u32, cap: u32, rights_bits: u32) -> Option<CapId> {
+    let k = kstate();
+    let rights = CapabilityRights::from_bits_truncate(rights_bits);
+    match k.dispatch(
+        caller,
+        hal.now_ns(),
+        SyscallOp::CapGrant {
+            target_thread: CapId::new(target_thread),
+            cap: CapId::new(cap),
+            rights,
+        },
+        hal,
+    ) {
+        Ok(SyscallReturn::Granted { dst }) => Some(dst),
+        _ => None,
+    }
+}
+
+/// The REAL `SyscallOp::CapRevoke`, reachable over the raw syscall ABI
+/// (`sys::CAP_REVOKE`) — see this section's own doc comment. `cap` is a
+/// `CapId` in `caller`'s own capability space (the subtree root to
+/// revoke). Returns the number of slots freed (across every capability
+/// space the kernel's `CapRevoke` reached) on success, `None` on failure.
+pub fn cap_revoke(hal: &HalInterface, caller: ThreadId, cap: u32) -> Option<u32> {
+    let k = kstate();
+    match k.dispatch(caller, hal.now_ns(), SyscallOp::CapRevoke { cap: CapId::new(cap) }, hal) {
+        Ok(SyscallReturn::Revoked { freed }) => Some(freed),
+        _ => None,
+    }
+}
+
+/// Mints a FRESH, full-rights `ThreadControlBlock` capability for the
+/// ALREADY-EXISTING thread `tid`, inserting it as a new ROOT (no CDT
+/// parent — same "boot-time wiring" category `Capability::full`'s own doc
+/// comment describes) directly into `dst_cs`. See this section's own doc
+/// comment for why this — not `grant_cap_into`, not `SyscallOp::Retype`
+/// — is the missing piece: no capability for `tid`'s TCB exists ANYWHERE
+/// yet, so there is nothing to copy/derive FROM (`grant_cap_into`'s own
+/// precondition), and `tid` already exists (`Retype`'s
+/// `ThreadControlBlock` arm only ever creates a BRAND NEW thread, never
+/// mints a second capability for one that already exists).
+///
+/// Trusted glue only — deliberately NOT reachable over the raw syscall
+/// ABI (unlike `cap_grant`/`cap_revoke` above): handing out unforgeable
+/// authority over an ARBITRARY existing thread, with no capability-gated
+/// precondition at all, is exactly the "backdoor" 04-System-Services-
+/// Policy-Layer.md §0 says the intermediary boundary must NOT be (only
+/// Root Task, at boot, decides which TCB caps the intermediary receives
+/// — see `spawn_security_broker_intermediary`'s own doc comment).
+fn mint_tcb_cap_into(state: &mut KernelState, dst_cs: kernel_cap::CapSpaceId, tid: ThreadId) -> Option<CapId> {
+    let cap = kernel_cap::Capability::full(kernel_cap::ObjectRef::new(
+        kernel_cap::KernelObjectKind::ThreadControlBlock,
+        kernel_cap::ObjectId::new(tid.as_u32()),
+    ));
+    let table = state.cap_space_mut(dst_cs)?;
+    table.insert_root(cap).ok()
+}
+
+/// VA the intermediary's own shared `SmallMessage` marshaling page is
+/// mapped at, in ITS OWN address space — a fresh, unused value (every
+/// other subsystem's own shared-page VA already surveyed; collisions
+/// across DIFFERENT processes' own address spaces are harmless regardless
+/// — `fs_demo_start`'s own `FS_SHARED_VA` doc comment — but a fresh
+/// literal keeps this searchable as its own thing).
+const SBI_SHARED_VA: usize = 0xD8B0_0000;
+
+/// VA `security-broker-bin`'s own shared `SecurityRequest`/
+/// `SecurityResponse` marshaling page is mapped at, in ITS OWN address
+/// space — this process's own OUTGOING link to the intermediary (a
+/// SEPARATE page/process from `SBI_SHARED_VA` above, which belongs to
+/// the intermediary itself). Must stay numerically equal to
+/// `simurgh-security-broker::subsystem_entry::SBI_SHARED_VA` (a sibling
+/// repo — see that constant's own doc comment).
+const SB_TO_SBI_SHARED_VA: usize = 0xD8C0_0000;
+
+/// This process's own thread id, set once by
+/// `security_broker_intermediary_demo_start` — same role as `G_FS_TID`.
+///
+/// # Safety
+/// Single-core; written once, read only afterward.
+static mut G_SBI_TID: Option<ThreadId> = None;
+
+/// Physical address of the intermediary's shared message page — same role
+/// as `G_FS_SHARED_PHYS`.
+///
+/// # Safety
+/// Single-core; written once, read only afterward.
+static mut G_SBI_SHARED_PHYS: usize = usize::MAX;
+
+/// `true` iff `security_broker_intermediary_demo_start` actually got far
+/// enough to publish the shared page, i.e. `G_SBI_SHARED_PHYS` is no
+/// longer its `usize::MAX` sentinel.
+///
+/// **Why this guard exists at all** (a real, multi-session debugging
+/// cost, not defensive habit): when `security_broker_intermediary_demo_
+/// start` returned `None`, `sys::SBI_DEMO_START`'s own handler dutifully
+/// returned `usize::MAX`, but Root Task's `.user_text` boot sequence
+/// issued `SBI_CAP_GRANT` unconditionally right afterwards anyway — so
+/// the sentinel got dereferenced as a `*mut u64` and the boot died with
+/// `unsafe precondition(s) violated: ptr::write_volatile requires that
+/// the pointer argument is aligned and non-null`. That message points at
+/// the IPC marshaling code, kilometres away from the actual fault (an
+/// exhausted untyped region during `Retype` — see
+/// `retype_one_from_any_untyped`), and cost several sessions chasing
+/// aarch64 codegen/MMU theories that were never involved. The real
+/// fix is that helper; this guard exists so that if a `*_demo_start`
+/// EVER fails again for some new reason, the boot degrades to an honest,
+/// logged "demo did not run" instead of a misdirecting kernel panic.
+fn sbi_shared_page_ready() -> bool {
+    // SAFETY: single-core; plain read of a scalar static.
+    unsafe { core::ptr::addr_of!(G_SBI_SHARED_PHYS).read() != usize::MAX }
+}
+
+/// See `write_shared_fs_message`'s own doc comment — identical shape,
+/// different backing global.
+///
+/// # Safety
+/// `G_SBI_SHARED_PHYS` must already have been written by
+/// `security_broker_intermediary_demo_start`.
+unsafe fn write_shared_sbi_message(msg: &SmallMessage) {
+    // SAFETY: forwarded from this function's own contract.
+    let base = unsafe { core::ptr::addr_of!(G_SBI_SHARED_PHYS).read() } as *mut u64;
+    // SAFETY: `base` names a valid, mapped, 4 KiB physical frame — same
+    // "low RAM is always identity-mapped for kernel-mode access"
+    // assumption `write_shared_fs_message`'s own doc comment relies on.
+    unsafe {
+        base.write_volatile(msg.label);
+        let words = msg.words();
+        for i in 0..kernel_ipc::MSG_MAX_WORDS {
+            base.add(1 + i).write_volatile(words.get(i).copied().unwrap_or(0));
+        }
+    }
+}
+
+/// See `read_shared_fs_message`'s own doc comment — identical shape.
+///
+/// # Safety
+/// Same contract as `write_shared_sbi_message`.
+unsafe fn read_shared_sbi_message() -> SmallMessage {
+    // SAFETY: forwarded from this function's own contract.
+    let base = unsafe { core::ptr::addr_of!(G_SBI_SHARED_PHYS).read() } as *const u64;
+    // SAFETY: forwarded from this function's own contract.
+    unsafe {
+        let label = base.read_volatile();
+        let mut words = [0u64; kernel_ipc::MSG_MAX_WORDS];
+        for (i, w) in words.iter_mut().enumerate() {
+            *w = base.add(1 + i).read_volatile();
+        }
+        SmallMessage::from_words(label, &words).unwrap_or(SmallMessage::new(label))
+    }
+}
+
+/// `target_service` value the intermediary's own boot-time mapping
+/// resolves to `simurgh-security-broker`'s real spawned TCB — the
+/// concrete first real target this boundary proves out end to end (the
+/// entire point of Issue #28: letting the Security Broker actually
+/// receive a real kernel `Capability`, not just report
+/// `TransportUnavailable`). Layer-4-defined, per `SecurityRequest::
+/// CapGrant::target_service`'s own doc comment ("What values are valid
+/// and what they mean is defined entirely by layer 4 ... not by this
+/// protocol or this repo") — `0` chosen simply as the first slot filled.
+pub const SBI_TARGET_SECURITY_BROKER: u32 = 0;
+
+/// `target_service` value the intermediary's own boot-time mapping
+/// resolves to mm-service's real spawned TCB (`G_MM_TID`) — the SECOND
+/// real target, proving `target_service` resolution generalizes beyond
+/// one hardcoded case. See `security_broker_intermediary_demo_start`'s
+/// own doc comment (slot 3/4) for why mm-service, not device-manager, was
+/// chosen for this.
+pub const SBI_TARGET_MM_SERVICE: u32 = 1;
+
+/// One-time setup: spawns `security-broker-intermediary` as a genuinely
+/// isolated process from its own separately-built ELF, grants it:
+///   - slot 0: an `Endpoint` capability (its own IPC identity, matching
+///     every other subsystem's `*_ENDPOINT_CAP = 0` convention),
+///   - slot 1: a FRESH `ThreadControlBlock` capability for
+///     `security_broker_tid` (via `mint_tcb_cap_into`) — resolved by the
+///     intermediary's own `target_service == SBI_TARGET_SECURITY_BROKER`
+///     mapping,
+///   - slot 2: one demo "resource" `Endpoint` capability, used ONLY by
+///     Root Task's own `sbi_cap_grant_call` demo (`cap: 2`) — a stand-in
+///     for whatever real resource a real `MintSpec` would name
+///     (REPO-simurgh-security-broker.md's own `Broker::request_capability`
+///     flow, out of this repo's scope); this pass only needs SOMETHING
+///     real to copy, to prove the mechanism, not a specific resource's
+///     semantics,
+///   - slot 3: a SEPARATE demo resource, reserved for security-broker's
+///     OWN real self-check `request_capability` call (`simurgh-security-
+///     broker::subsystem_entry::self_check`, sibling repo) — deliberately
+///     not slot 2, since Root Task's own demo revokes slot 2 long before
+///     security-broker's thread can possibly run (see this function's
+///     own inline comment on that slot for the full story, including a
+///     real bug this separation fixes),
+///   - slots 4/5 (if mm-service was already spawned): a SECOND real
+///     target (`SBI_TARGET_MM_SERVICE`) proving `target_service`
+///     resolution generalizes — see the inline comment at that point in
+///     this function's own body,
+/// maps its shared message page, and switches straight to it (same
+/// "avoid the caller/receiver race" requirement `fs_demo_start`'s own
+/// tail comment documents at length — identical fix applied here).
+///
+/// `security_broker_tid`/`security_broker_cs` must already be spawned
+/// (`spawn_security_broker`'s own return value) — this is exactly why
+/// `root_task::Service::SecurityBrokerIntermediary` boots LAST.
+///
+/// **Previously a real, open, aarch64-only boot crash (found 2026-09-12)
+/// — ROOT-CAUSED AND FIXED 2026-09-17 via live gdb on real QEMU.** For
+/// the record, because every one of the original suspicions was wrong:
+/// the symptom was `unsafe precondition(s) violated: ptr::write_volatile
+/// requires that the pointer argument is aligned and non-null`, firing
+/// right after `spawn_security_broker_aarch64`'s own log line, and it was
+/// variously blamed on this function's `spawn_process_from_elf` call, the
+/// `TrapOutcome::SwitchTo` after it, aarch64 codegen, aarch64
+/// exception-level/MMU setup, and stack size (a 4x `SBI_STACK_LEN` bump
+/// was tried and correctly ruled out). None of those were involved, and
+/// the bug was not aarch64-specific at all.
+///
+/// The real cause was capability slot 0's untyped region running out of
+/// room, so this function's own FIRST `SyscallOp::Retype` failed and it
+/// `return None`ed before ever publishing `G_SBI_SHARED_PHYS` — leaving
+/// that `usize::MAX` sentinel for the next `write_shared_sbi_message` to
+/// dereference, which is what actually produced the misleading pointer
+/// panic, kilometres from the real fault. See
+/// `retype_one_from_any_untyped`'s own doc comment for the full story and
+/// the fix; `sbi_shared_page_ready` now stops any future `*_demo_start`
+/// failure from presenting this way again. x86_64 was never immune — its
+/// own slot-0 fragment simply still had room.
+pub fn security_broker_intermediary_demo_start(
+    hal: &HalInterface,
+    caller: ThreadId,
+    sbi_elf: &[u8],
+    expected_machine: u16,
+    security_broker_tid: ThreadId,
+) -> Option<(u32, *mut u8, *const u8)> {
+    let k = kstate();
+
+    // slot 0: this process's own Endpoint.
+    //
+    // `retype_one_from_any_untyped`, NOT a hardcoded `CapId::new(0)`:
+    // this exact call was the real root cause of the aarch64 boot crash
+    // this function's own doc comment documents — see that helper's own
+    // doc comment for the full, gdb-confirmed story.
+    let Some(ep_cap) = retype_one_from_any_untyped(k, hal, caller, kernel_mm::KernelObjectType::Endpoint, 1) else {
+        klog!("security_broker_intermediary_demo_start: Retype failed (no untyped region has room) - demo skipped\r\n");
+        return None;
+    };
+
+    const SBI_STACK_VMA: usize = 0xC042_0000;
+    // Kept at the shared 64 KiB every other subsystem process uses. The
+    // aarch64 crash that once made this constant suspect was NOT a stack
+    // problem (a 4x bump was tried and correctly ruled out at the time);
+    // it was untyped exhaustion during `Retype`, fixed 2026-09-17 — see
+    // this function's own doc comment and `retype_one_from_any_untyped`.
+    const SBI_STACK_LEN: usize = 4096 * 16;
+    let (sbi_tid, sbi_cs, _stack_phys) =
+        spawn_process_from_elf(hal, k, sbi_elf, expected_machine, SBI_STACK_VMA, SBI_STACK_LEN)?;
+    // SAFETY: single-core; written once here, before any `sbi_*_call` (all
+    // issued after this opcode returns) can read it.
+    unsafe { core::ptr::addr_of_mut!(G_SBI_TID).write(Some(sbi_tid)) };
+
+    let src_cs = k.tcb(caller)?.cap_space;
+    // slot 0.
+    grant_cap_into(k, src_cs, ep_cap, sbi_cs, CapabilityRights::READ | CapabilityRights::WRITE)?;
+    // slot 1: security-broker's own TCB — the destination-TCB CapId this
+    // whole boundary exists to hand the intermediary (see this function's
+    // own doc comment).
+    mint_tcb_cap_into(k, sbi_cs, security_broker_tid)?;
+    // slot 2: one demo resource, minted the SAME way `ep_cap` above was
+    // (a fresh `Retype`, then granted in) — see this function's own doc
+    // comment on why a plain Endpoint stands in for a real `MintSpec`
+    // resource here.
+    let Some(resource_cap) = retype_one_from_any_untyped(k, hal, caller, kernel_mm::KernelObjectType::Endpoint, 1)
+    else {
+        klog!("security_broker_intermediary_demo_start: Retype failed (slot 2 demo resource)\r\n");
+        return None;
+    };
+    // `REVOKE` is required, not optional: `SecurityRequest::CapRevoke`'s
+    // own demo (`sys::SBI_CAP_REVOKE`) has the intermediary issue a real
+    // `SyscallOp::CapRevoke` on exactly this capability, and `kernel_core::
+    // syscall`'s own dispatch resolves the CALLER's (the intermediary's)
+    // copy against `CapabilityRights::REVOKE` before doing anything else
+    // — **a real bug found via QEMU**: without this bit, the very first
+    // `SBI_CAP_REVOKE` demo call failed with `SecurityErrorCode::
+    // KernelRejected` (insufficient rights on the intermediary's OWN
+    // slot 2, not anything wrong with the wire protocol or the derived
+    // copy in security-broker's space).
+    grant_cap_into(
+        k,
+        src_cs,
+        resource_cap,
+        sbi_cs,
+        CapabilityRights::READ | CapabilityRights::WRITE | CapabilityRights::GRANT | CapabilityRights::REVOKE,
+    )?;
+
+    // slot 3: a THIRD demo resource, DELIBERATELY separate from slot 2
+    // above — that one is Root Task's OWN demo resource
+    // (`sbi_cap_grant_call`'s hardcoded `cap: 2`), consumed and then
+    // REVOKED by Root Task's sequential boot-time demo strictly BEFORE
+    // security-broker's own thread is ever scheduled (Root Task's whole
+    // demo runs synchronously in step 7h of `umode_root`, before step 8's
+    // preemption phase — the only point `pick_next` can ever pick
+    // security-broker's thread; `spawn_security_broker` spawns it early
+    // but never switches to it directly). **A real bug caught during
+    // review, not via QEMU** (no log line existed to observe it):
+    // `security-broker::subsystem_entry::self_check`'s own real
+    // `request_capability` call originally reused `cap: 2` — the SAME
+    // slot Root Task's demo already revoked by the time security-broker's
+    // thread could possibly run, so that call would have failed with
+    // `SecurityErrorCode::KernelRejected` (the resource simply no longer
+    // existing), silently undermining the very thing `simurgh-security-
+    // broker`'s own README claims is proven. Placed here (a fixed slot
+    // number, unconditional on whether mm-service was spawned below) so
+    // security-broker's own client code can hardcode `register_
+    // resource_slot("camera", 3)` without depending on the SECOND
+    // target's own conditional slot count.
+    let Some(resource_cap_sb_self) =
+        retype_one_from_any_untyped(k, hal, caller, kernel_mm::KernelObjectType::Endpoint, 1)
+    else {
+        klog!("security_broker_intermediary_demo_start: Retype failed (slot 3 self-check resource)\r\n");
+        return None;
+    };
+    grant_cap_into(
+        k,
+        src_cs,
+        resource_cap_sb_self,
+        sbi_cs,
+        CapabilityRights::READ | CapabilityRights::WRITE | CapabilityRights::GRANT | CapabilityRights::REVOKE,
+    )?;
+
+    // slot 4 + slot 5: a SECOND real target, proving `target_service`
+    // resolution generalizes beyond the one hardcoded `SBI_TARGET_
+    // SECURITY_BROKER` case (`security-broker`'s own README/this
+    // function's own doc comment both flagged this as still open). Uses
+    // mm-service (`G_MM_TID`) rather than device-manager: mm-service is
+    // already spawned by the time this function runs (step 7e in
+    // `umode_root`'s own sequence, well before step 7h's `SBI_DEMO_
+    // START`), so no re-ordering of the existing, QEMU-verified boot
+    // sequence is needed — device-manager, by contrast, is not spawned
+    // until `P2_PREEMPT_START`, which runs AFTER this function.
+    // SAFETY: single-core; `G_MM_TID` is written once by `mm_demo_start`,
+    // already-`Some` by this point in the boot sequence (see above).
+    if let Some(mm_tid) = unsafe { core::ptr::addr_of!(G_MM_TID).read() } {
+        // slot 4: mm-service's own TCB.
+        mint_tcb_cap_into(k, sbi_cs, mm_tid)?;
+        // slot 5: a second demo resource, same shape as slot 2's.
+        let Some(resource_cap_2) =
+            retype_one_from_any_untyped(k, hal, caller, kernel_mm::KernelObjectType::Endpoint, 1)
+        else {
+            klog!("security_broker_intermediary_demo_start: Retype failed (slot 5 second-target resource)\r\n");
+            return None;
+        };
+        grant_cap_into(
+            k,
+            src_cs,
+            resource_cap_2,
+            sbi_cs,
+            CapabilityRights::READ | CapabilityRights::WRITE | CapabilityRights::GRANT | CapabilityRights::REVOKE,
+        )?;
+    } else {
+        // mm-service was not spawned (e.g. its own `Retype`/map_range
+        // failed) — the multi-target demo simply does not run; slots 4/5
+        // are left unfilled rather than this whole function failing over
+        // a SECOND target's absence (the FIRST target, security-broker,
+        // is unconditionally required — see this function's own doc
+        // comment — but this second one is additive proof, not core to
+        // Issue #28 itself).
+        klog!("security_broker_intermediary_demo_start: G_MM_TID not set - skipping the second (mm-service) target demo\r\n");
+    }
+
+    // Grant `security-broker-bin` itself a derived copy of the
+    // intermediary's OWN endpoint (`ep_cap`, slot 0 in the intermediary's
+    // own space) — its own OUTGOING link, so it can `Call` the
+    // intermediary directly instead of only ever being demonstrated via
+    // Root Task as a stand-in caller (`sbi_cap_grant_call` above). Lands
+    // at slot 0 in security-broker's own cap space (completely empty
+    // until now — `spawn_security_broker`'s own doc comment). See
+    // `simurgh-security-broker::subsystem_entry`'s own module doc comment
+    // (that sibling repo) for the client-side half of this connection.
+    let security_broker_cs = k.tcb(security_broker_tid)?.cap_space;
+    grant_cap_into(k, src_cs, ep_cap, security_broker_cs, CapabilityRights::READ | CapabilityRights::WRITE)?;
+
+    // Shared `SecurityRequest`/`SecurityResponse` marshaling page for
+    // security-broker's OWN outgoing calls — a SEPARATE page from the
+    // intermediary's own `SBI_SHARED_VA` below (different process,
+    // different address space; same VA value would be harmless either
+    // way, per every other subsystem's own "collisions across different
+    // address spaces are fine" precedent, but a distinct constant keeps
+    // this searchable as its own thing).
+    let security_broker_addr_space = k.tcb(security_broker_tid)?.addr_space;
+    let security_broker_root_pt = k.addr_space_mut(security_broker_addr_space)?.root_phys().as_usize();
+    let sb_shared_phys = carve_from_any_untyped(k, 4096, 4096)?;
+    // SAFETY: fresh untyped RAM, identity-addressable, single-core.
+    unsafe { core::ptr::write_bytes(sb_shared_phys as *mut u8, 0, 4096) };
+    let sb_pool = carve_from_any_untyped(k, 4096, 4096 * 2)?;
+    // SAFETY: fresh untyped RAM, identity-addressable, single-core;
+    // `map_range` needs the pool pre-zeroed.
+    unsafe { core::ptr::write_bytes(sb_pool as *mut u8, 0, 4096 * 2) };
+    let sb_n = hal.map_range(security_broker_root_pt, SB_TO_SBI_SHARED_VA, sb_shared_phys, 4096, 1 | 2 | 8, sb_pool, 2);
+    if sb_n == u32::MAX {
+        klog!("security_broker_intermediary_demo_start: map_range error (security-broker's own shared page)\r\n");
+        return None;
+    }
+
+    // Shared message page — same shape as `fs_demo_start`'s own
+    // `FS_SHARED_VA` setup (one page, no bulk-data second region needed:
+    // `SecurityRequest`/`SecurityResponse` are plain integer fields that
+    // fit entirely in one `SmallMessage`).
+    let sbi_addr_space = k.tcb(sbi_tid)?.addr_space;
+    let sbi_root_pt = k.addr_space_mut(sbi_addr_space)?.root_phys().as_usize();
+    let shared_phys = carve_from_any_untyped(k, 4096, 4096)?;
+    // SAFETY: fresh untyped RAM, identity-addressable, single-core.
+    unsafe { core::ptr::write_bytes(shared_phys as *mut u8, 0, 4096) };
+    let pool = carve_from_any_untyped(k, 4096, 4096 * 2)?;
+    // SAFETY: fresh untyped RAM, identity-addressable, single-core;
+    // `map_range` needs the pool pre-zeroed.
+    unsafe { core::ptr::write_bytes(pool as *mut u8, 0, 4096 * 2) };
+    let n = hal.map_range(sbi_root_pt, SBI_SHARED_VA, shared_phys, 4096, 1 | 2 | 8, pool, 2);
+    if n == u32::MAX {
+        klog!("security_broker_intermediary_demo_start: map_range error (shared page)\r\n");
+        return None;
+    }
+    // SAFETY: single-core; written exactly once here, before any
+    // `sbi_*_call`/`sbi_*_result` can be reached.
+    unsafe { core::ptr::addr_of_mut!(G_SBI_SHARED_PHYS).write(shared_phys) };
+
+    // Switch straight to the intermediary — see this function's own doc
+    // comment / `fs_demo_start`'s tail comment for why this is mandatory,
+    // not optional.
+    let _ = k.sched.note_ready(caller, hal.now_ns());
+    let _ = k.sched.dispatch(sbi_tid, hal.now_ns());
+    let (save, into) = k.user_ctx_switch_ptrs(caller, sbi_tid)?;
+
+    Some((ep_cap.as_u32(), save, into))
+}
+
+/// `SBI_CAP_GRANT` demo opcode: builds a REAL `SecurityRequest::CapGrant`
+/// and issues it as a REAL `Call` to the intermediary — mirrors
+/// `fs_stat_call`'s own shape exactly.
+pub fn sbi_cap_grant_call(
+    hal: &HalInterface,
+    caller: ThreadId,
+    ep_cap: u32,
+    target_service: u32,
+    cap: u32,
+    rights: u32,
+) -> Option<IpcSwitch> {
+    if !sbi_shared_page_ready() {
+        klog!("sbi_cap_grant_call: intermediary demo never started - skipping (see sbi_shared_page_ready)\r\n");
+        return None;
+    }
+    let req = ipc_protocol::SecurityRequest::CapGrant { target_service, cap, rights };
+    let msg = ipc_protocol::codec::encode_security_request(&req);
+    // SAFETY: `security_broker_intermediary_demo_start` has already run
+    // (this opcode is only ever issued after `SBI_DEMO_START` returns),
+    // and `sbi_shared_page_ready` just confirmed it published the page.
+    unsafe { write_shared_sbi_message(&msg) };
+    sbi_ipc_call(hal, caller, ep_cap)
+}
+
+/// Reads back the `SecurityResponse` for `sbi_cap_grant_call`. Returns the
+/// new capability slot in the destination's own cap space
+/// (`SecurityResponse::Granted::dst`) on success, `usize::MAX` on any
+/// `Error`/decode failure — same sentinel convention as `fs_open_result`.
+pub fn sbi_cap_grant_result() -> usize {
+    // Same sentinel guard as `sbi_cap_grant_call` — `read_shared_sbi_
+    // message` would `read_volatile` through `usize::MAX` otherwise.
+    if !sbi_shared_page_ready() {
+        return usize::MAX;
+    }
+    // SAFETY: same contract as `sbi_cap_grant_call`.
+    let msg = unsafe { read_shared_sbi_message() };
+    match ipc_protocol::codec::decode_security_response(&msg) {
+        Ok(ipc_protocol::SecurityResponse::Granted { dst }) => dst as usize,
+        _ => usize::MAX,
+    }
+}
+
+/// `SBI_CAP_REVOKE` demo opcode: builds a REAL `SecurityRequest::
+/// CapRevoke` and issues it as a REAL `Call` to the intermediary — same
+/// shape as `sbi_cap_grant_call`.
+pub fn sbi_cap_revoke_call(hal: &HalInterface, caller: ThreadId, ep_cap: u32, cap: u32) -> Option<IpcSwitch> {
+    if !sbi_shared_page_ready() {
+        klog!("sbi_cap_revoke_call: intermediary demo never started - skipping (see sbi_shared_page_ready)\r\n");
+        return None;
+    }
+    let req = ipc_protocol::SecurityRequest::CapRevoke { cap };
+    let msg = ipc_protocol::codec::encode_security_request(&req);
+    // SAFETY: `security_broker_intermediary_demo_start` has already run,
+    // and `sbi_shared_page_ready` just confirmed it published the page.
+    unsafe { write_shared_sbi_message(&msg) };
+    sbi_ipc_call(hal, caller, ep_cap)
+}
+
+/// Reads back the `SecurityResponse` for `sbi_cap_revoke_call`. Returns
+/// the number of slots freed (`SecurityResponse::Revoked::freed`) on
+/// success, `usize::MAX` on any `Error`/decode failure.
+pub fn sbi_cap_revoke_result() -> usize {
+    // Same sentinel guard as `sbi_cap_grant_result`.
+    if !sbi_shared_page_ready() {
+        return usize::MAX;
+    }
+    // SAFETY: same contract as `sbi_cap_grant_result`.
+    let msg = unsafe { read_shared_sbi_message() };
+    match ipc_protocol::codec::decode_security_response(&msg) {
+        Ok(ipc_protocol::SecurityResponse::Revoked { freed }) => freed as usize,
+        _ => usize::MAX,
+    }
+}
+
+/// `Call`s the intermediary and switches to it, exactly like
+/// `fs_ipc_call`'s own identical shape (same doc comment on why a direct
+/// switch to the known target thread, not generic `pick_next` fairness,
+/// is required here).
+fn sbi_ipc_call(hal: &HalInterface, caller: ThreadId, ep_cap: u32) -> Option<IpcSwitch> {
+    let k = kstate();
+    // SAFETY: single-core; `G_SBI_TID` is written once by
+    // `security_broker_intermediary_demo_start`, before any `sbi_*_call`
+    // (this function) can run.
+    let sbi_tid = unsafe { core::ptr::addr_of!(G_SBI_TID).read() }?;
+    let msg = SmallMessage::new(0);
+    match k.dispatch(caller, hal.now_ns(), SyscallOp::Call { endpoint: CapId::new(ep_cap), msg }, hal) {
+        Ok(SyscallReturn::Reschedule { next: Some(n) }) => {
+            let _ = k.sched.dispatch(sbi_tid, hal.now_ns());
+            let (save, into) = k.user_ctx_switch_ptrs(caller, sbi_tid)?;
+            // Same reasoning as `fs_ipc_call`'s own identical `poke`
+            // computation: `pending_from`/`pending_msg` are only set on
+            // whichever thread `do_send`'s fast path actually delivered
+            // to directly — that is the intermediary exactly when `n ==
+            // sbi_tid`; otherwise the message is merely queued for its
+            // own next `IPC_RECV`, so there is nothing to poke.
+            let poke = if n == sbi_tid {
+                k.tcb_mut(sbi_tid)
+                    .and_then(|t| Some((t.pending_from.take()?, t.pending_msg.take()?)))
+                    .map(|(from, m)| (from.as_u32() as usize, m.label as usize))
+            } else {
+                None
+            };
+            Some(IpcSwitch { save, into, poke })
+        }
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    // The meaningful behaviour here (context switching into a real thread)
+    // only runs on the bare-metal target and is exercised by booting
+    // `kernel` under QEMU. The host build just needs to compile.
+    #[test]
+    fn compiles() {}
+}

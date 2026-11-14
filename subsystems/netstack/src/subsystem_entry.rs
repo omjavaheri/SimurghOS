@@ -1,0 +1,1082 @@
+//! ============================================================================
+//! subsystem_entry.rs — riscv64 / x86_64 / aarch64
+//!
+//! Note on this file's ONE architecture-conditional piece: same narrow,
+//! documented exception `device-manager::subsystem_entry`'s and
+//! `driver-virtio-net::subsystem_entry`'s own file headers explain —
+//! `raw_syscall`'s job is issuing the raw syscall INSTRUCTION itself
+//! (`ecall`/`int 0x80`/`svc #0`), an unavoidable ISA detail. Every other
+//! line in this file is architecture-generic.
+//!
+//! Purpose: the FIRST subsystem process in this codebase that is an IPC
+//! CLIENT of another U-mode process, not a server — `kernel_arch_glue`
+//! previously drove `driver-virtio-net`'s own ARP-resolve/ICMP-echo demo
+//! directly (its own doc comment on that file called this out as a
+//! known MVP shortcut); this file is what replaces it: a real Netstack
+//! process that issues genuine `sys::IPC_CALL`s (`SyscallOp::Call`,
+//! `kernel_arch_glue::p2_ipc_call`'s own dispatch arm — already fully
+//! generic, "whichever process issued this ecall, calling whichever cap
+//! slot `a0` names": no new kernel-side opcode was needed for this).
+//!
+//! Architecture reference: 03-Kernel-Subsystems-Layer.md §2.3 (Netstack
+//! talks to the network device through a driver process + a capability
+//! scoped to it — this file is that leg becoming real), §5.4 (ICMP echo
+//! MVP acceptance demo).
+//!
+//! Position in the system: `kernel_arch_glue::spawn_netstack_service`
+//! spawns this process via `spawn_process_from_elf`, AFTER `spawn_
+//! virtio_net_driver` has already spawned + switched to the driver once
+//! (so the driver has already reached its own first `Recv` by the time
+//! this process's own first `IPC_CALL` needs the fast path — same
+//! ordering rationale `spawn_virtio_blk_driver`'s own doc comment gives
+//! for its own driver-vs-caller race). This process is granted a
+//! DERIVED COPY of the driver's own `Endpoint` capability (landing at
+//! slot 0), and has the driver's own RX and TX `SharedRegion`s pre-
+//! mapped directly into ITS OWN address space (trusted bootstrap, same
+//! "kernel-arch-glue builds the page table directly, no `Map` ceremony"
+//! pattern every other subsystem spawn in this codebase already uses) —
+//! see `driver_virtio_net::layout`'s own doc comment for the byte
+//! layout inside them; this file duplicates the handful of offsets it
+//! needs as local constants (`BUFFER_OFFSET`/`MESSAGE_OFFSET`/
+//! `MAC_OFFSET`/`VIRTIO_NET_HDR_LEN`, "must stay numerically equal to
+//! driver_virtio_net::layout::*") rather than taking on a cross-driver
+//! crate dependency, matching this project's established "small numeric
+//! constants duplicated with a sync comment" convention for VAs/offsets
+//! everywhere else in this file's own sibling `subsystem_entry.rs`
+//! files. A THIRD region — this process's own, freshly retyped, private
+//! `SharedRegion` — carries the ARP/ICMP verdict `kernel_arch_glue::
+//! netstack_status` reads back directly (physical pointer, kernel-side
+//! — same "peek the shared region directly, no protocol field needed"
+//! pattern `drv_net_probe_result`'s own MAC read already used before
+//! this session, now relocated here).
+//!
+//! **Second thread (Internet plan, phase 1)**: on the desktop image the kernel
+//! (`kernel_arch_glue::netstack_start_service`) starts a SECOND thread of this
+//! process at the same entry point, marked by a role byte in the status region.
+//! That thread runs `service_main`: the persistent smoltcp service (link up,
+//! gateway pings, later DHCP/DNS), sleeping on a private notification between
+//! polls. The first thread skips the racy ARP/ICMP boot demo there and only
+//! serves the bypass control plane. Logging goes through `sys::NET_LOG`.
+//!
+//! Safety/invariants: unlike `device-manager::subsystem_entry` (whose
+//! `#[link_section = ".user_text"]` code shares a binary with kernel
+//! `.text`), this file compiles into `netstack-bin`'s OWN fully separate
+//! ELF image — every byte of it is `U=1`, so ordinary function calls
+//! (including `alloc`-using ones — `crate::build_arp_request` et al.
+//! return `alloc::vec::Vec`) are completely safe here.
+//! ============================================================================
+
+use alloc::vec::Vec;
+use ipc_protocol::codec::{decode_driver_response, decode_net_bypass_request, encode_driver_request, encode_net_bypass_response};
+use ipc_protocol::driver::DriverErrorCode;
+use ipc_protocol::{DirectNicHandle, DriverRequest, DriverResponse, NetBypassRequest, NetBypassResponse};
+use kernel_ipc::SmallMessage;
+
+/// Must stay numerically equal to `kernel/src/main.rs`'s `sys::IPC_CALL`
+/// — see this file's own module doc comment for why this generic
+/// opcode, not a new one, is exactly what this process needs.
+const IPC_CALL: usize = 42;
+/// Must stay numerically equal to `kernel/src/main.rs`'s `sys::IPC_RECV`
+/// — `park`'s own doc comment on why this process issues one of these in
+/// a real loop, serving kernel-bypass requests, once its own ARP/ICMP
+/// demo is done.
+const IPC_RECV: usize = 43;
+/// Must stay numerically equal to `kernel/src/main.rs`'s `sys::IPC_REPLY`
+/// — `park`'s own real `Recv`/`Reply` server loop uses this to answer
+/// each `NetBypassRequest` it receives.
+const IPC_REPLY: usize = 44;
+
+/// This process's own capability slot for the (derived-copy) driver
+/// `Endpoint` — `kernel_arch_glue::spawn_netstack_service`'s own first
+/// (and only) grant into this process's fresh, otherwise-empty cap
+/// space, so it deterministically lands at slot 0 (same reasoning every
+/// other subsystem's own `*_ENDPOINT_CAP`/`DRV_ENDPOINT_CAP` constant
+/// doc comment already gives).
+const DRV_ENDPOINT_CAP: usize = 0;
+
+/// This process's own capability slot for the "bypass" `Endpoint` —
+/// `kernel_arch_glue::spawn_netstack_service`'s own SECOND grant, slot
+/// 1. Originally granted purely as a "park" target (an Endpoint nobody
+/// held a capability to `Call`, so a blocking `Recv` on it always hands
+/// control back to root — see `park`'s own doc comment on why that
+/// matters); now DOUBLES as the real kernel-bypass networking control
+/// plane's own server endpoint (03-Kernel-Subsystems-Layer.md §2.3/
+/// §5.4.1) — `kernel_arch_glue::net_bypass_request_call` is the one
+/// caller that DOES hold (a derived copy of) this capability, granted
+/// alongside the driver endpoint at the SAME spawn time. `park`'s own
+/// loop serves both roles identically: nothing pending yet -> blocks,
+/// falls back to root exactly as before; a real `NetBypassRequest`
+/// arrives later -> handled, replied to, loop continues.
+const BYPASS_ENDPOINT_CAP: usize = 1;
+
+/// VA the driver's own RX `SharedRegion` is pre-mapped at in THIS
+/// process's own address space — must stay numerically equal to
+/// `kernel_arch_glue::NETSTACK_DRV_RX_VA`. Carries the `DriverRequest`/
+/// `DriverResponse` `SmallMessage` marshaling area (`MESSAGE_OFFSET`
+/// below) and, once a frame is received, the frame bytes themselves
+/// (`BUFFER_OFFSET`) — same region the driver's own `subsystem_entry.rs`
+/// reads/writes on the other side.
+const DRV_RX_VA: usize = 0xD870_0000;
+/// VA the driver's own TX `SharedRegion` is pre-mapped at — must stay
+/// numerically equal to `kernel_arch_glue::NETSTACK_DRV_TX_VA`. This
+/// process writes the OUTBOUND frame bytes (ARP request, then ICMP echo
+/// request) here before each `SendFrame` call.
+const DRV_TX_VA: usize = 0xD880_0000;
+/// VA this process's own private status `SharedRegion` is mapped at —
+/// must stay numerically equal to `kernel_arch_glue::NETSTACK_STATUS_VA`.
+/// `kernel_arch_glue::netstack_status` reads it back directly (physical
+/// pointer, kernel-side) once this process has written a terminal
+/// verdict — see `write_status`'s own doc comment for the exact layout.
+const STATUS_VA: usize = 0xD890_0000;
+/// VA the kernel-bypass control-plane's own shared message page is
+/// mapped at in THIS process's own address space — must stay numerically
+/// equal to `kernel_arch_glue::NETSTACK_BYPASS_SHARED_VA`. A SEPARATE
+/// page from `DRV_RX_VA` (which only ever carries `DriverRequest`/
+/// `DriverResponse` messages, this process's own OUTGOING protocol as a
+/// client of the driver) — this one carries `NetBypassRequest`/
+/// `NetBypassResponse` messages, this process's own INCOMING protocol as
+/// a server for whichever process asks for direct NIC access (03-
+/// Kernel-Subsystems-Layer.md §2.3/§5.4.1).
+const BYPASS_SHARED_VA: usize = 0xD8A0_0000;
+/// Mirrors `driver_virtio_net::QUEUE_SIZE` — the real number of
+/// descriptors in each of the driver's two virtqueues, reported verbatim
+/// in `NetBypassResponse::Granted::ring_len` (a genuinely known, fixed
+/// MVP value, not a placeholder — unlike `rx_ring_cap`/`tx_ring_cap`
+/// below, which this process does not resolve — see `handle_bypass_
+/// request`'s own doc comment).
+const DRV_QUEUE_SIZE: u32 = 2;
+
+/// `driver_virtio_net::layout::MAC_OFFSET` — must stay numerically
+/// equal. The negotiated device MAC, written by the driver's own
+/// `do_probe` before this process is ever spawned (`kernel_arch_glue::
+/// spawn_netstack_service`'s own doc comment on why that ordering is
+/// guaranteed).
+const MAC_OFFSET: usize = 8;
+/// `driver_virtio_net::layout::BUFFER_OFFSET` — must stay numerically
+/// equal.
+const BUFFER_OFFSET: usize = 256;
+/// `driver_virtio_net::layout::MESSAGE_OFFSET` — must stay numerically
+/// equal.
+const MESSAGE_OFFSET: usize = 1024;
+/// `driver_virtio_net::VIRTIO_NET_HDR_LEN` — must stay numerically
+/// equal (the 12-byte `virtio_net_hdr_v1` every frame buffer is
+/// prefixed with — see that constant's own doc comment for the real
+/// off-by-2 bug this project already found and fixed once).
+const VIRTIO_NET_HDR_LEN: usize = 12;
+/// `driver_virtio_net::FRAME_MAX` — must stay numerically equal. Bounds
+/// this file's own local frame-copy buffer (`poll_frame`'s own stack
+/// array).
+const FRAME_MAX: usize = 700;
+
+/// This demo's own fixed guest IPv4 address — same value `kernel_arch_
+/// glue`'s own (now-removed) `NET_DEMO_OUR_IP` used, kept identical so
+/// this extraction changes WHERE the demo runs, not WHAT it does.
+/// QEMU's own `-netdev user` (SLIRP) NATs any packet whose source falls
+/// in its default `10.0.2.0/24` subnet regardless of DHCP.
+const OUR_IP: [u8; 4] = [10, 0, 2, 15];
+/// The gateway this demo resolves via ARP then pings — SLIRP's own
+/// fixed default gateway address.
+const GATEWAY_IP: [u8; 4] = [10, 0, 2, 2];
+/// Fixed ICMP identifier for this demo's own echo request/reply pair.
+const ICMP_IDENT: u16 = 0x5151;
+/// Fixed ICMP sequence number.
+const ICMP_SEQ: u16 = 1;
+/// Fixed ICMP payload — SLIRP echoes it back verbatim (plus Ethernet
+/// minimum-frame-size zero padding — `poll_frame`'s own prefix-match
+/// comparison accounts for this, same reasoning `kernel_arch_glue`'s own
+/// removed `drv_net_ping_poll_result` doc comment documented in full).
+const ICMP_PAYLOAD: &[u8] = b"simurgh-ping";
+
+/// Bounded retry count for each `PollFrame` loop (ARP, then separately
+/// ICMP) — same value and same "a network reply may never arrive, this
+/// bounds the wait by ATTEMPT COUNT, not wall-clock time" rationale
+/// `kernel_arch_glue`'s own (now-removed) `net_demo_riscv64` used for
+/// its own `MAX_NET_POLL_ATTEMPTS`. Living HERE now (inside the actual
+/// retry loop, in real Rust) rather than split across a `.user_text`
+/// retry loop driving two separate ecalls per attempt is the whole
+/// point of this extraction — same number of attempts, far fewer
+/// syscalls per attempt (one `IPC_CALL` here vs. `DRV_NET_ARP_POLL` +
+/// `DRV_NET_ARP_POLL_RESULT` there).
+const MAX_POLL_ATTEMPTS: u32 = 5_000;
+
+/// # Safety
+/// `ecall` from U-mode traps to the kernel's S-mode handler, which
+/// preserves every register except `a0`. `#[inline(never)]`: the same
+/// real, QEMU-found LLVM-codegen bug `fs-native::subsystem_entry::
+/// raw_syscall`'s own doc comment documents in full.
+#[cfg(target_arch = "riscv64")]
+#[inline(never)]
+unsafe fn raw_syscall(a7: usize, a0: usize, a1: usize) -> usize {
+    let ret;
+    // SAFETY: forwarded from this function's own contract.
+    unsafe {
+        core::arch::asm!(
+            "ecall",
+            in("a7") a7,
+            inlateout("a0") a0 => ret,
+            in("a1") a1,
+            options(nostack),
+        );
+    }
+    ret
+}
+
+/// See `fs_native::subsystem_entry::raw_syscall2`'s own doc comment —
+/// needed here (unlike this file's original client-only shape) now that
+/// `park` doubles as a real `Recv`/`Reply` server for kernel-bypass
+/// networking's own control plane (03-Kernel-Subsystems-Layer.md §2.3/
+/// §5.4.1).
+#[cfg(target_arch = "riscv64")]
+#[inline(never)]
+unsafe fn raw_syscall2(a7: usize, a0: usize, a1: usize) -> (usize, usize) {
+    let (r0, r1);
+    // SAFETY: forwarded from this function's own contract.
+    unsafe {
+        core::arch::asm!(
+            "ecall",
+            in("a7") a7,
+            inlateout("a0") a0 => r0,
+            inlateout("a1") a1 => r1,
+            options(nostack),
+        );
+    }
+    (r0, r1)
+}
+
+/// # Safety
+/// `int 0x80` from Ring 3 traps to `hal_x86_64::cpu`'s dedicated DPL-3
+/// gate, which preserves every register except `rax`/`rsi`.
+#[cfg(target_arch = "x86_64")]
+#[inline(never)]
+unsafe fn raw_syscall(a7: usize, a0: usize, a1: usize) -> usize {
+    let ret: usize;
+    // SAFETY: forwarded from this function's own contract.
+    unsafe {
+        core::arch::asm!(
+            "int 0x80",
+            inlateout("rax") a7 => ret,
+            in("rdi") a0,
+            in("rsi") a1,
+            options(nostack),
+        );
+    }
+    ret
+}
+
+/// See the riscv64 `raw_syscall2`'s own doc comment.
+#[cfg(target_arch = "x86_64")]
+#[inline(never)]
+unsafe fn raw_syscall2(a7: usize, a0: usize, a1: usize) -> (usize, usize) {
+    let (r0, r1): (usize, usize);
+    // SAFETY: forwarded from this function's own contract.
+    unsafe {
+        core::arch::asm!(
+            "int 0x80",
+            inlateout("rax") a7 => r0,
+            in("rdi") a0,
+            inlateout("rsi") a1 => r1,
+            options(nostack),
+        );
+    }
+    (r0, r1)
+}
+
+/// # Safety
+/// `svc #0` from EL0 traps to `hal_arm64::cpu`'s shared EL0-synchronous
+/// vector, which preserves every register except `x0`/`x1`.
+#[cfg(target_arch = "aarch64")]
+#[inline(never)]
+unsafe fn raw_syscall(a7: usize, a0: usize, a1: usize) -> usize {
+    let ret: usize;
+    // SAFETY: forwarded from this function's own contract.
+    unsafe {
+        core::arch::asm!(
+            "svc #0",
+            in("x8") a7,
+            inlateout("x0") a0 => ret,
+            in("x1") a1,
+        );
+    }
+    ret
+}
+
+/// See the riscv64 `raw_syscall2`'s own doc comment.
+#[cfg(target_arch = "aarch64")]
+#[inline(never)]
+unsafe fn raw_syscall2(a7: usize, a0: usize, a1: usize) -> (usize, usize) {
+    let (r0, r1): (usize, usize);
+    // SAFETY: forwarded from this function's own contract.
+    unsafe {
+        core::arch::asm!(
+            "svc #0",
+            in("x8") a7,
+            inlateout("x0") a0 => r0,
+            inlateout("x1") a1 => r1,
+        );
+    }
+    (r0, r1)
+}
+
+/// Host-build stand-in (none of the three `#[cfg(target_arch = ...)]`
+/// blocks above match a non-`{riscv64,x86_64,aarch64}` host, which is
+/// never the case for this project's own CI/dev hosts today, but kept
+/// for forward-compatibility, matching every other subsystem's own
+/// identical stand-in). `subsystem_main` is never called from a host
+/// test (there is no live kernel to `ecall` into), so this body is
+/// unreachable in practice.
+#[cfg(not(any(target_arch = "riscv64", target_arch = "x86_64", target_arch = "aarch64")))]
+#[inline(never)]
+unsafe fn raw_syscall(_a7: usize, _a0: usize, _a1: usize) -> usize {
+    unreachable!("netstack's subsystem_main never runs on a host build")
+}
+
+/// Host-build stand-in — see `raw_syscall`'s own identical stand-in doc
+/// comment.
+#[cfg(not(any(target_arch = "riscv64", target_arch = "x86_64", target_arch = "aarch64")))]
+#[inline(never)]
+unsafe fn raw_syscall2(_a7: usize, _a0: usize, _a1: usize) -> (usize, usize) {
+    unreachable!("netstack's subsystem_main never runs on a host build")
+}
+
+// Same stack-slot-reuse miscompilation `fs-native::subsystem_entry`'s own
+// `zero!()` macro documents in full — kept here too, at every `raw_
+// syscall` call site, as the same defense-in-depth every other
+// subsystem's own entry point already applies.
+macro_rules! zero {
+    () => {{
+        let mut v: usize = 0;
+        // SAFETY: a no-op asm block (`v` is read back unchanged) — its
+        // only purpose is defeating the stack-slot-reuse miscompilation
+        // above. Forwarded from the enclosing `unsafe` block at every
+        // call site.
+        core::arch::asm!("/* {0} */", inout(reg) v, options(nomem, nostack, preserves_flags));
+        v
+    }};
+}
+
+/// `sys::NET_LOG` — must stay numerically equal to `kernel/src/main.rs`'s
+/// constant of the same name.
+const NET_LOG: usize = 140;
+/// Offset of the log text area inside this process's status region — must
+/// stay numerically equal to `kernel_arch_glue::NETSTACK_LOG_OFFSET`.
+const LOG_OFFSET: usize = 256;
+/// Longest log line — must stay numerically equal to
+/// `kernel_arch_glue::NETSTACK_LOG_MAX`.
+const LOG_MAX: usize = 512;
+
+/// Formats into the status region's log area (no heap).
+struct LogBuf {
+    len: usize,
+}
+
+impl core::fmt::Write for LogBuf {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        for &b in s.as_bytes() {
+            if self.len >= LOG_MAX {
+                break;
+            }
+            // SAFETY: `STATUS_VA` is mapped `U=1 R+W` in this process's own
+            // address space before its first instruction (`spawn_netstack_
+            // service`); `LOG_OFFSET + LOG_MAX` stays inside that page.
+            unsafe { ((STATUS_VA + LOG_OFFSET + self.len) as *mut u8).write_volatile(b) };
+            self.len += 1;
+        }
+        Ok(())
+    }
+}
+
+/// Prints one line on the serial console through `sys::NET_LOG`. Netstack
+/// has no console of its own; the kernel reads the text from this process's
+/// status region (`LOG_OFFSET`). Only one thread of this process logs at a
+/// time (the boot demo thread finishes before the service thread starts).
+macro_rules! nlog {
+    ($($arg:tt)*) => {{
+        let mut buf = LogBuf { len: 0 };
+        let _ = core::fmt::Write::write_fmt(&mut buf, core::format_args!($($arg)*));
+        // SAFETY: `raw_syscall`'s own contract; never blocks.
+        unsafe { raw_syscall(NET_LOG, buf.len, 0) };
+    }};
+}
+
+/// Reads the driver's own negotiated MAC — written by its `do_probe`
+/// before this process was ever spawned (this file's own module doc
+/// comment on why that ordering is guaranteed).
+///
+/// # Safety
+/// `DRV_RX_VA` must already be mapped (true from process entry onward —
+/// `kernel_arch_glue::spawn_netstack_service`'s own pre-map).
+unsafe fn read_driver_mac() -> [u8; 6] {
+    let mut mac = [0u8; 6];
+    // SAFETY: forwarded from this function's own contract.
+    unsafe {
+        let base = (DRV_RX_VA + MAC_OFFSET) as *const u8;
+        for (i, b) in mac.iter_mut().enumerate() {
+            *b = base.add(i).read_volatile();
+        }
+    }
+    mac
+}
+
+/// Writes `msg` into the RX region's own message-marshaling area — the
+/// driver's own `subsystem_entry.rs::read_shared_message` reads from
+/// this exact offset on the other side.
+///
+/// # Safety
+/// Same contract as `read_driver_mac`.
+unsafe fn write_shared_message(msg: &SmallMessage) {
+    let base = (DRV_RX_VA + MESSAGE_OFFSET) as *mut u64;
+    // SAFETY: forwarded from this function's own contract.
+    unsafe {
+        base.write_volatile(msg.label);
+        let words = msg.words();
+        for i in 0..kernel_ipc::MSG_MAX_WORDS {
+            base.add(1 + i).write_volatile(words.get(i).copied().unwrap_or(0));
+        }
+    }
+}
+
+/// Reads back the driver's own `DriverResponse` — the driver's own
+/// `write_shared_message` (called from `IPC_REPLY`'s handler) writes to
+/// this exact offset before waking this process.
+///
+/// # Safety
+/// Same contract as `read_driver_mac`.
+unsafe fn read_shared_message() -> SmallMessage {
+    let base = (DRV_RX_VA + MESSAGE_OFFSET) as *const u64;
+    // SAFETY: forwarded from this function's own contract.
+    unsafe {
+        let label = base.read_volatile();
+        let mut words = [0u64; kernel_ipc::MSG_MAX_WORDS];
+        for (i, w) in words.iter_mut().enumerate() {
+            *w = base.add(1 + i).read_volatile();
+        }
+        SmallMessage::from_words(label, &words).unwrap_or(SmallMessage::new(label))
+    }
+}
+
+/// Reads the `SmallMessage` a bypass-requesting client wrote into the
+/// kernel-bypass control-plane's own shared page — same fixed layout as
+/// `read_shared_message`, just a SEPARATE page (`BYPASS_SHARED_VA`'s own
+/// doc comment on why).
+///
+/// # Safety
+/// `BYPASS_SHARED_VA` must already be mapped (true from process entry
+/// onward — `kernel_arch_glue::spawn_netstack_service`'s own pre-map).
+unsafe fn read_bypass_message() -> SmallMessage {
+    let base = BYPASS_SHARED_VA as *const u64;
+    // SAFETY: forwarded from this function's own contract.
+    unsafe {
+        let label = base.read_volatile();
+        let mut words = [0u64; kernel_ipc::MSG_MAX_WORDS];
+        for (i, w) in words.iter_mut().enumerate() {
+            *w = base.add(1 + i).read_volatile();
+        }
+        SmallMessage::from_words(label, &words).unwrap_or(SmallMessage::new(label))
+    }
+}
+
+/// Writes `msg` into the kernel-bypass control-plane's own shared page
+/// for the caller to read back after `IPC_REPLY` wakes it — same fixed
+/// layout as `read_bypass_message`.
+///
+/// # Safety
+/// Same contract as `read_bypass_message`.
+unsafe fn write_bypass_message(msg: &SmallMessage) {
+    let base = BYPASS_SHARED_VA as *mut u64;
+    // SAFETY: forwarded from this function's own contract.
+    unsafe {
+        base.write_volatile(msg.label);
+        let words = msg.words();
+        for i in 0..kernel_ipc::MSG_MAX_WORDS {
+            base.add(1 + i).write_volatile(words.get(i).copied().unwrap_or(0));
+        }
+    }
+}
+
+/// Handles one REAL `NetBypassRequest` — the kernel-bypass networking
+/// control plane's own server-side logic (03-Kernel-Subsystems-Layer.md
+/// §2.3/§5.4.1). This MVP never checks a real per-client "bypass
+/// capability" (§2.3's own text names the layer-4 Security Broker as the
+/// real issuer of that — out of this repo's own scope, `03-Kernel-
+/// Subsystems-Layer.md`'s own module doc comment) and always grants —
+/// same "one demo, one hardcoded scenario, no real per-connection
+/// resolution yet" simplification `compositor::subsystem_entry::handle_
+/// request`'s own doc comment already establishes for `buffer_cap`.
+/// `rx_ring_cap`/`tx_ring_cap` in the reply are informational
+/// placeholders (`0`) for the SAME reason `shared_cap`/`buffer_cap` are
+/// never resolved elsewhere in this codebase — the REAL capability grant
+/// and region mapping into the requesting client's own address space is
+/// performed by `kernel_arch_glue::net_bypass_request_call` itself (the
+/// TRUSTED glue driving this very round trip), not by this process,
+/// exactly mirroring how `spawn_netstack_service`'s own trusted-
+/// bootstrap mapping needs no `Map` ceremony from Netstack itself either.
+fn handle_bypass_request(req: NetBypassRequest) -> NetBypassResponse {
+    match req {
+        NetBypassRequest::RequestDirectNic { nic_id: _ } => NetBypassResponse::Granted {
+            handle: DirectNicHandle(1),
+            rx_ring_cap: 0,
+            tx_ring_cap: 0,
+            ring_len: DRV_QUEUE_SIZE,
+        },
+        NetBypassRequest::Release { handle: _ } => NetBypassResponse::Released,
+        NetBypassRequest::RelayFrame => {
+            // SAFETY: `stage_frame_for_tx`'s own contract (this
+            // process's own TX region is mapped from process entry
+            // onward, per `spawn_netstack_service`'s own doc comment);
+            // `call_driver`'s own contract (`DRV_ENDPOINT_CAP` likewise
+            // already granted). Stages a fixed, recognizable demo frame
+            // — the SAME shape `kernel_arch_glue::net_bypass_direct_
+            // send`'s own bypass frame uses, so the two paths' own
+            // measured latencies are comparing like-for-like work
+            // (03-Kernel-Subsystems-Layer.md §5.4.1's own "bypass is
+            // ≥30-40% faster than the standard path" claim).
+            unsafe {
+                let mut frame = [0u8; 64];
+                frame[0..6].fill(0xFF); // dest MAC = broadcast
+                frame[6..12].fill(0xB9); // src MAC = fixed sentinel bytes
+                frame[12] = 0xFF;
+                frame[13] = 0xFF; // ethertype 0xFFFF — deliberately unassigned
+                frame[14..].fill(0xB5); // recognizable payload pattern
+                stage_frame_for_tx(&frame);
+                match call_driver(&DriverRequest::SendFrame { len: frame.len() as u32 }) {
+                    Some(DriverResponse::FrameSent) => NetBypassResponse::Relayed,
+                    _ => NetBypassResponse::Denied,
+                }
+            }
+        }
+    }
+}
+
+/// One real `Call` to the driver's own `Endpoint` — sends `req`, blocks
+/// (a genuine `SyscallOp::Call`, transparent to this ecall's own return)
+/// until the driver `Reply`s, and returns the decoded `DriverResponse`.
+/// `None` only on a decode failure (a malformed reply, never expected in
+/// practice — the driver's own `encode_driver_response` output is
+/// always well-formed).
+///
+/// # Safety
+/// Same contract as `read_driver_mac`; `DRV_ENDPOINT_CAP` must already
+/// be granted (true from process entry onward).
+unsafe fn call_driver(req: &DriverRequest) -> Option<DriverResponse> {
+    let msg = encode_driver_request(req);
+    // SAFETY: forwarded from this function's own contract.
+    unsafe { write_shared_message(&msg) };
+    // SAFETY: `raw_syscall`'s own contract. `IPC_CALL` blocks this
+    // thread until the driver's own `IPC_REPLY` wakes it — see this
+    // file's own module doc comment.
+    unsafe { raw_syscall(IPC_CALL, DRV_ENDPOINT_CAP, zero!()) };
+    // SAFETY: forwarded from this function's own contract — the reply
+    // is already in place by the time `raw_syscall` above returns.
+    let reply_msg = unsafe { read_shared_message() };
+    decode_driver_response(&reply_msg).ok()
+}
+
+/// Copies `len` bytes starting at `DRV_RX_VA + BUFFER_OFFSET +
+/// VIRTIO_NET_HDR_LEN` into a fresh `Vec` — the frame `PollFrame`'s own
+/// `FrameReceived { len }` response reports as waiting. `len` is
+/// trusted (bounded by `FRAME_MAX`, the driver's own fixed buffer size,
+/// which `VirtioNet::poll_rx` never exceeds).
+///
+/// # Safety
+/// Same contract as `read_driver_mac`.
+unsafe fn copy_received_frame(len: usize) -> Vec<u8> {
+    let len = len.min(FRAME_MAX);
+    let mut buf = Vec::with_capacity(len);
+    // SAFETY: forwarded from this function's own contract.
+    unsafe {
+        let base = (DRV_RX_VA + BUFFER_OFFSET + VIRTIO_NET_HDR_LEN) as *const u8;
+        for i in 0..len {
+            buf.push(base.add(i).read_volatile());
+        }
+    }
+    buf
+}
+
+/// Writes `frame`'s own bytes at `DRV_TX_VA + BUFFER_OFFSET +
+/// VIRTIO_NET_HDR_LEN` — `driver_virtio_net::VirtioNet::submit_tx_
+/// request`'s own contract ("the caller already placed the data") on
+/// the other side of the `SendFrame` IPC call.
+///
+/// # Safety
+/// Same contract as `read_driver_mac`; `frame.len() <= FRAME_MAX`.
+unsafe fn stage_frame_for_tx(frame: &[u8]) {
+    // SAFETY: forwarded from this function's own contract.
+    unsafe {
+        let base = (DRV_TX_VA + BUFFER_OFFSET + VIRTIO_NET_HDR_LEN) as *mut u8;
+        core::ptr::copy_nonoverlapping(frame.as_ptr(), base, frame.len());
+    }
+}
+
+/// Sends `frame` (already built by the caller) via one `SendFrame` Call,
+/// then polls (bounded, `MAX_POLL_ATTEMPTS`) for a reply, running
+/// `parse` on each `FrameReceived` frame's own bytes until it returns
+/// `Some` or the attempts run out. This is the whole "extraction": what
+/// used to be a `.user_text` retry loop issuing TWO separate ecalls per
+/// attempt (`DRV_NET_*_POLL` + `_RESULT`) against `kernel_arch_glue`'s
+/// own physical-memory peeking is now one real `IPC_CALL` per attempt,
+/// with `parse` running as REAL Rust against a REAL `Vec` this process
+/// itself owns.
+///
+/// # Safety
+/// Same contract as `call_driver`; `frame.len() <= FRAME_MAX`.
+unsafe fn send_then_poll<T>(frame: &[u8], mut parse: impl FnMut(&[u8]) -> Option<T>) -> Option<T> {
+    // SAFETY: forwarded from this function's own contract.
+    unsafe { stage_frame_for_tx(frame) };
+    match unsafe { call_driver(&DriverRequest::SendFrame { len: frame.len() as u32 }) } {
+        Some(DriverResponse::FrameSent) => {}
+        _ => return None,
+    }
+    for _ in 0..MAX_POLL_ATTEMPTS {
+        match unsafe { call_driver(&DriverRequest::PollFrame) } {
+            Some(DriverResponse::FrameReceived { len }) => {
+                let bytes = unsafe { copy_received_frame(len as usize) };
+                if let Some(v) = parse(&bytes) {
+                    return Some(v);
+                }
+                // Not the reply we're waiting for (or unrelated
+                // background traffic) — keep polling, same "one
+                // interrupt/frame arrival is not proof it's THIS
+                // request's own answer" reasoning `driver_virtio_blk::
+                // VirtioBlk::completion_pending`'s own doc comment
+                // documents for the interrupt-driven case.
+            }
+            Some(DriverResponse::Failed { code: DriverErrorCode::NoData }) => {}
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// This process's own private status `SharedRegion` layout — see this
+/// file's own module doc comment. `+0`: a `u8` verdict (`0` = still
+/// running/not reached this point, `1` = ARP failed, `2` = ARP resolved
+/// but ping failed/mismatched, `3` = ARP resolved AND ping matched —
+/// full success). `+8..14`: the resolved gateway MAC (six bytes), valid
+/// once the verdict is `>= 2`.
+fn write_status(verdict: u8, gw_mac: Option<[u8; 6]>) {
+    // SAFETY: `STATUS_VA` is mapped `U=1 R+W` in this process's own
+    // address space by `kernel_arch_glue::spawn_netstack_service`,
+    // before this process is ever scheduled.
+    unsafe {
+        (STATUS_VA as *mut u8).write_volatile(verdict);
+        if let Some(mac) = gw_mac {
+            let base = (STATUS_VA + 8) as *mut u8;
+            for (i, b) in mac.iter().enumerate() {
+                base.add(i).write_volatile(*b);
+            }
+        }
+    }
+}
+
+/// Offset of the role byte in the status region — must stay numerically
+/// equal to `kernel_arch_glue::NETSTACK_ROLE_OFFSET`. `0` = boot-demo thread,
+/// `1` = persistent service thread (`kernel_arch_glue::netstack_start_
+/// service` writes it before that thread's first instruction).
+const ROLE_OFFSET: usize = 16;
+/// Offset of the "skip the boot demo" byte - must stay numerically equal to
+/// `kernel_arch_glue::NETSTACK_SKIP_DEMO_OFFSET`. Written by the kernel only on
+/// the desktop image, where the persistent service replaces the demo.
+const SKIP_DEMO_OFFSET: usize = 17;
+
+/// `sys::NOW_NS` — must stay numerically equal to `kernel/src/main.rs`'s
+/// constant of the same name. Returns the kernel's monotonic clock in
+/// nanoseconds; the only time source a layer-3 process has (Internet plan,
+/// TODO(spec) 2).
+const NOW_NS: usize = 86;
+/// `sys::NOTIF_WAIT_TIMEOUT` — must stay numerically equal to
+/// `kernel/src/main.rs`'s constant of the same name.
+const NOTIF_WAIT_TIMEOUT: usize = 139;
+/// Capability slot of the private, never-signalled sleep `Notification`
+/// (`kernel_arch_glue::spawn_netstack_service`'s slot 2). A timed wait on it
+/// is "wake me in N ns".
+const SLEEP_NOTIF_CAP: usize = 2;
+
+/// Longest sleep between two polls of the stack. RX is poll-only (the
+/// driver has no blocking receive, see its module doc), so this is also the
+/// worst-case receive latency; smoltcp's own timers (ARP retry, DHCP, DNS
+/// retransmit) shorten it when something is due sooner.
+const IDLE_POLL_NS: u64 = 10_000_000;
+
+/// Gateway pings: this many, one per second, once the link is up...
+const PING_BURST: u32 = 5;
+const PING_BURST_INTERVAL_NS: u64 = 1_000_000_000;
+/// ...then one heartbeat ping per interval, forever.
+const PING_HEARTBEAT_INTERVAL_NS: u64 = 30_000_000_000;
+
+
+/// VA of the network status page in THIS process (read/write): the kernel
+/// maps the same physical frame READ-ONLY into ui-core. Must stay numerically
+/// equal to `kernel_arch_glue::NETSTACK_NETINFO_VA`. Layout: `crate::status`.
+const NETINFO_VA: usize = 0xD8C0_0000;
+/// `driver_virtio_net::layout::LINK_VALID_OFFSET` / `LINK_UP_OFFSET` - must
+/// stay numerically equal.
+const LINK_VALID_OFFSET: usize = 14;
+const LINK_UP_OFFSET: usize = 15;
+
+/// Reads the driver's published link state: `None` until the driver has
+/// written a reading, then `Some(up)`.
+///
+/// # Safety
+/// `DRV_RX_VA` must be mapped (true from process entry onward).
+unsafe fn read_link() -> Option<bool> {
+    // SAFETY: forwarded.
+    unsafe {
+        if ((DRV_RX_VA + LINK_VALID_OFFSET) as *const u8).read_volatile() == 0 {
+            return None;
+        }
+        Some(((DRV_RX_VA + LINK_UP_OFFSET) as *const u8).read_volatile() != 0)
+    }
+}
+
+/// Publishes `s` on the status page under the seqlock protocol of
+/// `crate::status` and returns the new (even) sequence value.
+fn publish_status(s: &crate::status::NetStatus, prev_seq: u32) -> u32 {
+    let next = prev_seq.wrapping_add(2);
+    let mut buf = [0u8; crate::status::NET_STATUS_LEN];
+    crate::status::encode(s, next, &mut buf);
+    // SAFETY: `NETINFO_VA` is mapped `U=1 R+W` in this process's own address
+    // space by the kernel before this thread runs; all writes stay inside the
+    // first `NET_STATUS_LEN` bytes of that page.
+    unsafe {
+        let base = NETINFO_VA as *mut u8;
+        // Odd = writer inside.
+        (base.add(crate::status::off::SEQ) as *mut u32).write_volatile(prev_seq | 1);
+        for (i, b) in buf.iter().enumerate() {
+            if i < crate::status::off::SEQ || i >= crate::status::off::SEQ + 4 {
+                base.add(i).write_volatile(*b);
+            }
+        }
+        (base.add(crate::status::off::SEQ) as *mut u32).write_volatile(next);
+    }
+    next
+}
+
+/// Reads the kernel's monotonic clock.
+fn now_ns() -> u64 {
+    // SAFETY: `raw_syscall`'s own contract; never blocks.
+    unsafe { raw_syscall(NOW_NS, zero!(), zero!()) as u64 }
+}
+
+/// Sleeps for about `ns` nanoseconds (scheduler-tick granularity, 2 ms).
+fn sleep_ns(ns: u64) {
+    // SAFETY: `raw_syscall`'s own contract. Blocks this thread on a
+    // notification nobody signals until the deadline; the result (pending
+    // bits, always 0) is irrelevant.
+    unsafe { raw_syscall(NOTIF_WAIT_TIMEOUT, SLEEP_NOTIF_CAP, ns as usize) };
+}
+
+/// The smoltcp frame transport over the driver's IPC (`SendFrame`/
+/// `PollFrame`), reusing the RX/TX shared pages already mapped for the boot
+/// demo. Chosen over a new shared-ring protocol because it is the smallest
+/// thing that works and needs no driver change; one IPC round trip per RX
+/// poll is cheap next to the 10 ms poll interval. TODO(spec): a deeper RX
+/// queue or a notification on RX (Internet plan TODO(spec) 3) would remove
+/// the polling.
+struct DriverIo;
+
+impl crate::stack::FrameIo for DriverIo {
+    fn recv_frame(&mut self, buf: &mut [u8]) -> Option<usize> {
+        // SAFETY: `call_driver`'s own contract; the RX region is mapped from
+        // process entry onward.
+        match unsafe { call_driver(&DriverRequest::PollFrame) } {
+            Some(DriverResponse::FrameReceived { len }) => {
+                let n = (len as usize).min(FRAME_MAX).min(buf.len());
+                // SAFETY: same contract; `n <= FRAME_MAX` stays inside the
+                // frame buffer that follows the virtio-net header.
+                unsafe {
+                    let base = (DRV_RX_VA + BUFFER_OFFSET + VIRTIO_NET_HDR_LEN) as *const u8;
+                    for (i, b) in buf[..n].iter_mut().enumerate() {
+                        *b = base.add(i).read_volatile();
+                    }
+                }
+                Some(n)
+            }
+            _ => None,
+        }
+    }
+
+    fn send_frame(&mut self, frame: &[u8]) -> bool {
+        if frame.len() > FRAME_MAX {
+            return false;
+        }
+        // SAFETY: `stage_frame_for_tx`/`call_driver` contracts; length
+        // checked above.
+        unsafe {
+            stage_frame_for_tx(frame);
+            matches!(call_driver(&DriverRequest::SendFrame { len: frame.len() as u32 }), Some(DriverResponse::FrameSent))
+        }
+    }
+}
+
+/// All memory of the smoltcp stack; `.bss`, zero-initialised by the loader.
+static mut STACK_STORAGE: crate::stack::StackStorage = crate::stack::StackStorage::new();
+
+/// Dotted-quad display for log lines (no heap).
+struct Ip([u8; 4]);
+
+impl core::fmt::Display for Ip {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{}.{}.{}.{}", self.0[0], self.0[1], self.0[2], self.0[3])
+    }
+}
+
+/// `Ip` or "none".
+struct OptIp(Option<[u8; 4]>);
+
+impl core::fmt::Display for OptIp {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self.0 {
+            Some(ip) => Ip(ip).fmt(f),
+            None => f.write_str("none"),
+        }
+    }
+}
+
+/// The one name the service resolves to prove name resolution end to end
+/// (Internet plan phase 2 acceptance), and how often it is looked up again
+/// (the second lookup within the cache TTL is answered from the cache).
+const DNS_TEST_NAME: &str = "example.com";
+const DNS_LOOKUP_INTERVAL_NS: u64 = 60_000_000_000;
+/// Retry delay after a failed lookup.
+const DNS_RETRY_NS: u64 = 5_000_000_000;
+
+fn log_event(ev: crate::stack::NetEvent) {
+    use crate::stack::NetEvent;
+    match ev {
+        NetEvent::LinkConfigured { ip, prefix, gateway, dns, dhcp } => nlog!(
+            "link up ({}): address {}/{} gateway {} dns {}",
+            if dhcp { "DHCP lease" } else { "static" },
+            Ip(ip),
+            prefix,
+            OptIp(gateway),
+            OptIp(dns)
+        ),
+        NetEvent::LinkLost => nlog!("link down: DHCP lease lost, waiting for a new one"),
+        NetEvent::PingReply { from, seq, rtt_us } => {
+            nlog!("ping reply from {}: seq={} time={}.{:03} ms", Ip(from), seq, rtt_us / 1000, rtt_us % 1000)
+        }
+        NetEvent::PingTimeout { seq } => nlog!("ping seq={} timed out", seq),
+        NetEvent::DnsResolved { token: _, addr, cached } => {
+            nlog!("dns: {} resolved to {}{}", DNS_TEST_NAME, Ip(addr), if cached { " (from cache)" } else { "" })
+        }
+        NetEvent::DnsFailed { token: _ } => nlog!("dns: lookup of {} failed", DNS_TEST_NAME),
+    }
+}
+
+/// The persistent Netstack service (second thread of this process, started
+/// by `kernel_arch_glue::netstack_start_service` on the desktop image): owns
+/// the smoltcp stack and polls it with a sleep in between. It gets its
+/// address, gateway and DNS server from DHCP (nothing hard-coded), then
+/// pings the gateway repeatedly and resolves a real name, so a serial log
+/// shows the network is alive end to end.
+fn service_main() -> ! {
+    use crate::stack::NetEvent;
+    // SAFETY: `DRV_RX_VA` is mapped from process entry onward.
+    let mac = unsafe { read_driver_mac() };
+    // SAFETY: single-threaded use of the static: only this thread ever
+    // touches it, and it is taken exactly once.
+    let storage = unsafe { &mut *core::ptr::addr_of_mut!(STACK_STORAGE) };
+    let start = now_ns();
+    let mut stack = crate::stack::NetStack::new(storage, DriverIo, mac, crate::stack::AddrMode::Dhcp, start);
+    nlog!(
+        "service: smoltcp stack up, nic mac {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}, asking DHCP for an address",
+        mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+    );
+
+    let mut seq: u16 = 0;
+    let mut pings_sent: u32 = 0;
+    let mut next_ping_ns = start;
+    let mut next_dns_ns = start;
+    let mut dns_busy = false;
+    // Status page: published at start ("connecting": an adapter exists, no
+    // address yet) and again whenever the snapshot changes.
+    let mut info_seq: u32 = 0;
+    let mut published = stack.snapshot(mac, crate::status::AdapterKind::Ethernet);
+    info_seq = publish_status(&published, info_seq);
+    loop {
+        let now = now_ns();
+        // Link tracking. While the link is down the stack does not poll the
+        // driver, so poke it here: the driver refreshes its link byte on every
+        // PollFrame (a frame arriving while down is discarded).
+        if !stack.link_up() {
+            // SAFETY: `call_driver`'s own contract.
+            let _ = unsafe { call_driver(&DriverRequest::PollFrame) };
+        }
+        // SAFETY: `DRV_RX_VA` is mapped from process entry onward.
+        if let Some(up) = unsafe { read_link() } {
+            if up != stack.link_up() {
+                nlog!("link {}", if up { "up: restarting DHCP" } else { "down: cable/Wi-Fi lost, will keep retrying" });
+                stack.set_link(up, now);
+            }
+        }
+        // Only act while the interface has an address.
+        if let Some(NetEvent::LinkConfigured { gateway, .. }) = stack.config() {
+            if let Some(gw) = gateway {
+                if now >= next_ping_ns && !stack.ping_outstanding() {
+                    seq = seq.wrapping_add(1);
+                    if stack.ping(gw, seq, now).is_ok() {
+                        pings_sent += 1;
+                        next_ping_ns = now
+                            + if pings_sent < PING_BURST { PING_BURST_INTERVAL_NS } else { PING_HEARTBEAT_INTERVAL_NS };
+                    }
+                }
+            }
+            if now >= next_dns_ns && !dns_busy {
+                match stack.dns_resolve(DNS_TEST_NAME, now) {
+                    Ok(_) => {
+                        dns_busy = true;
+                        next_dns_ns = now + DNS_LOOKUP_INTERVAL_NS;
+                    }
+                    Err(_) => next_dns_ns = now + DNS_RETRY_NS,
+                }
+            }
+        }
+        stack.poll(now, &mut |ev| {
+            match ev {
+                NetEvent::DnsResolved { .. } => dns_busy = false,
+                NetEvent::DnsFailed { .. } => {
+                    dns_busy = false;
+                    next_dns_ns = now_ns() + DNS_RETRY_NS;
+                }
+                // A new lease restarts the ping burst and the lookup.
+                NetEvent::LinkConfigured { .. } => {
+                    pings_sent = 0;
+                    next_ping_ns = 0;
+                    next_dns_ns = 0;
+                }
+                NetEvent::LinkLost => dns_busy = false,
+                _ => {}
+            }
+            log_event(ev);
+        });
+        let snap = stack.snapshot(mac, crate::status::AdapterKind::Ethernet);
+        if snap != published {
+            info_seq = publish_status(&snap, info_seq);
+            published = snap;
+        }
+        let now = now_ns();
+        let wait = stack.poll_delay_ms(now).map(|ms| ms * 1_000_000).unwrap_or(IDLE_POLL_NS).clamp(1_000_000, IDLE_POLL_NS);
+        sleep_ns(wait);
+    }
+}
+
+/// The Netstack process's own entry point. Runs the ARP-resolve-then-
+/// ICMP-echo MVP demo (03-Kernel-Subsystems-Layer.md §5.4) exactly once,
+/// driving `driver-virtio-net` over real IPC throughout, then reports
+/// the verdict via `write_status` and calls `park` — which, despite its
+/// name, is where this process's SECOND real role begins: serving the
+/// kernel-bypass networking control plane (§2.3/§5.4.1) forever on
+/// `BYPASS_ENDPOINT_CAP`. A real Netstack would ALSO loop serving
+/// `FsRequest`-style application traffic on some THIRD endpoint — not
+/// yet built, still future scope.
+#[no_mangle]
+pub extern "C" fn subsystem_main() -> ! {
+    // SAFETY: `STATUS_VA` is mapped from process entry onward; the kernel wrote
+    // the role byte (if at all) before this thread's first instruction.
+    if unsafe { ((STATUS_VA + ROLE_OFFSET) as *const u8).read_volatile() } == 1 {
+        service_main();
+    }
+    // SAFETY: as above.
+    if unsafe { ((STATUS_VA + SKIP_DEMO_OFFSET) as *const u8).read_volatile() } == 1 {
+        nlog!("boot demo skipped (desktop image: the service thread pings the gateway instead)");
+        write_status(4, None);
+        park();
+    }
+    // SAFETY: `DRV_RX_VA` is mapped by the time this process's first
+    // instruction ever runs (this file's own module doc comment).
+    let our_mac = unsafe { read_driver_mac() };
+
+    nlog!("boot demo: started, nic mac {:02x?}", our_mac);
+    let arp_request = crate::build_arp_request(our_mac, OUR_IP, GATEWAY_IP);
+    // SAFETY: `call_driver`'s own contract; `arp_request.len() <=
+    // FRAME_MAX` (42 bytes, this crate's own fixed ARP frame size).
+    let gw_mac = unsafe {
+        send_then_poll(&arp_request, |frame| crate::parse_arp_reply(frame, GATEWAY_IP))
+    };
+
+    nlog!("boot demo: ARP {}", if gw_mac.is_some() { "answered" } else { "gave up" });
+    let Some(gw_mac) = gw_mac else {
+        write_status(1, None);
+        park();
+    };
+
+    let echo_request =
+        crate::build_echo_request(our_mac, gw_mac, OUR_IP, GATEWAY_IP, ICMP_IDENT, ICMP_SEQ, ICMP_PAYLOAD);
+    // SAFETY: `call_driver`'s own contract; `echo_request.len() <=
+    // FRAME_MAX`.
+    let matched = unsafe {
+        send_then_poll(&echo_request, |frame| {
+            let reply = crate::parse_echo_reply(frame)?;
+            // Prefix match, not exact-length: Ethernet's own 60-byte
+            // minimum frame size pads this demo's own short request with
+            // trailing zeros before SLIRP ever sees it, and SLIRP echoes
+            // the padding right back — same reasoning `kernel_arch_glue`'s
+            // own (removed) `drv_net_ping_poll_result` doc comment
+            // documented in full.
+            let payload_matches =
+                reply.payload.len() >= ICMP_PAYLOAD.len() && &reply.payload[..ICMP_PAYLOAD.len()] == ICMP_PAYLOAD;
+            (reply.ident == ICMP_IDENT && reply.seq == ICMP_SEQ && payload_matches).then_some(())
+        })
+    };
+
+    nlog!("boot demo: echo {}", if matched.is_some() { "matched" } else { "mismatch or timeout" });
+    write_status(if matched.is_some() { 3 } else { 2 }, Some(gw_mac));
+    park();
+}
+
+/// Blocks on `BYPASS_ENDPOINT_CAP`, then serves REAL `NetBypassRequest`s
+/// on it forever (03-Kernel-Subsystems-Layer.md §2.3/§5.4.1) — this
+/// MVP's demo has no OTHER work left for this process once the ARP/ICMP
+/// verdict is written (this function's own caller's doc comment), but
+/// the kernel-bypass control plane is real work, not idle parking. `!`
+/// return type: never actually returns, matching `subsystem_main`'s own
+/// signature.
+///
+/// **Real starvation bug found via QEMU, originally fixed here (the
+/// mechanism this function's own loop below still relies on)**: a plain
+/// busy spin left this process holding the CPU (and `cr3`) forever once
+/// done, with NO ecall ever issued again — but `kernel_arch_glue::
+/// kstate()`'s `caller` (root), suspended mid-`NET_DEMO_START` since the
+/// original spawn switch, can only ever resume via `p2_ipc_recv`'s own
+/// hardcoded "switch to root" fallback, which fires ONLY when some
+/// thread issues a REAL blocking `Recv` that finds nothing pending. A
+/// silent spin loop never does that, so root's own `NET_STATUS_POLL`
+/// retry loop never got scheduled again after the initial spawn switch.
+/// `BYPASS_ENDPOINT_CAP` (slot 1, granted by `spawn_netstack_service`)
+/// was originally granted PURELY as a park target for this reason —
+/// blocking `Recv` on it (this function's very first iteration, before
+/// any real client exists yet to `Call` it) hands control back to root
+/// via that SAME fallback, and since `write_status` (this function's
+/// every caller) already ran by then, root's very next poll attempt
+/// reads the real, final verdict instead of racing an unfinished one.
+/// Every iteration AFTER that first one serves a genuine, later `Call`
+/// from a real kernel-bypass client (`kernel_arch_glue::net_bypass_
+/// request_call`) — the SAME Endpoint, now also doing real work.
+///
+/// # Safety
+/// `BYPASS_ENDPOINT_CAP` and `BYPASS_SHARED_VA` are both granted/mapped
+/// into this process's cap space/address space before its first
+/// instruction ever runs (`spawn_netstack_service`'s own doc comment).
+fn park() -> ! {
+    loop {
+        // SAFETY: `raw_syscall2`'s own contract. Blocks until a real
+        // `Call` arrives — the FIRST time, nobody holds a capability to
+        // make one yet, so this hands control back to root via `p2_ipc_
+        // recv`'s own fallback (this function's own doc comment); every
+        // later iteration serves a genuine kernel-bypass request.
+        let (from, _label) = unsafe { raw_syscall2(IPC_RECV, BYPASS_ENDPOINT_CAP, zero!()) };
+        // SAFETY: `read_bypass_message`'s own contract.
+        let req_msg = unsafe { read_bypass_message() };
+        let resp = match decode_net_bypass_request(&req_msg) {
+            Ok(req) => handle_bypass_request(req),
+            Err(_) => NetBypassResponse::Denied,
+        };
+        // SAFETY: `write_bypass_message`'s own contract.
+        unsafe { write_bypass_message(&encode_net_bypass_response(&resp)) };
+        // SAFETY: `raw_syscall`'s own contract. `IPC_REPLY` always
+        // switches away on success (see its own doc comment) — the loop
+        // continues here only on the (unreachable in practice) error
+        // case, matching every other real IPC server in this codebase.
+        unsafe { raw_syscall(IPC_REPLY, from, zero!()) };
+    }
+}

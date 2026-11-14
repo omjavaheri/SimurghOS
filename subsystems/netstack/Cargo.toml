@@ -1,0 +1,49 @@
+# ============================================================================
+# netstack  (03-Kernel-Subsystems-Layer.md §2.3)
+#
+# User-space TCP/IP. MVP target (§5.4): receive/send one ICMP echo (ping)
+# over virtio-net on QEMU. A parallel DPDK-style kernel-bypass path exists
+# from the MVP too (§2.3, §5.4.1) — clients with a special capability drive
+# the NIC rings directly via a SharedRegion + hal-direct, skipping this
+# stack entirely.
+#
+# `#![no_std] + alloc`. `rlib`.
+# ============================================================================
+[package]
+name        = "netstack"
+description = "Simurgh user-space network stack (03-Kernel-Subsystems-Layer.md §2.3) — MVP ICMP echo"
+edition.workspace    = true
+version.workspace    = true
+authors.workspace    = true
+license.workspace    = true
+repository.workspace = true
+build = "build.rs"
+
+[lib]
+crate-type = ["rlib"]
+
+[[bin]]
+name = "netstack-bin"
+path = "src/bin/netstack-bin.rs"
+# Same reasoning as driver-virtio-net-bin's own `[[bin]]`: a host `cargo
+# test` harness would pull in `std` and collide on `panic_impl`.
+test = false
+
+[dependencies]
+ipc-protocol = { path = "../../ipc-protocol" }
+# `subsystem_entry`'s own shared-region marshalling needs `SmallMessage`
+# directly, same reasoning as every other subsystem process's own
+# dependency on it (driver-virtio-blk/driver-virtio-net's own
+# `subsystem_entry.rs`).
+kernel-ipc   = { path = "../../kernel/kernel-ipc" }
+
+# The TCP/IP protocol machinery: smoltcp (owner decision of 2026-09-25, see
+# docs/internet-plan.md TODO(spec) 1). `no_std`, heap-free (`alloc` feature
+# left OFF: every socket buffer is caller-supplied static storage), no
+# `log`/`defmt`. Only the protocols Netstack uses are compiled in; TCP is
+# added in Phase 3 (`socket-tcp`). smoltcp is architecture-neutral, so this
+# dependency adds nothing target-specific above the HAL.
+[dependencies.smoltcp]
+version = "0.12"
+default-features = false
+features = ["proto-ipv4", "proto-dhcpv4", "proto-dns", "medium-ethernet", "socket-icmp", "socket-udp", "socket-dhcpv4", "socket-dns"]

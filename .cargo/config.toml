@@ -1,0 +1,270 @@
+# ============================================================================
+# .cargo/config.toml
+#
+# Workspace-wide Cargo configuration. Applies to every crate built from
+# within os-project/ (and subdirectories), on top of rust-toolchain.toml.
+#
+# Responsibilities of this file:
+#   1. Provide per-target linker/runner configuration so building and
+#      running (via QEMU) the custom JSON targets (targets/*.json) works
+#      without extra flags typed by hand every time.
+#   2. Keep the *default* host build (no --target passed) completely
+#      unaffected, so `cargo test` on hal-core/hal-manifest/hal-direct
+#      keeps working normally on the developer's own machine (see
+#      WORKSPACE.md, "default-members").
+#
+# `-Z build-std` is DELIBERATELY NOT set here. `[unstable]` in a config
+# file applies to EVERY cargo invocation in this tree, host builds
+# included — and a global `build-std` makes a plain `cargo test`/`cargo
+# build` rebuild `core` from source while also linking the prebuilt
+# `core`, which fails with "duplicate lang item in crate `core`". The
+# custom no_std targets DO need `core`/`alloc` rebuilt from source (rustup
+# ships no prebuilt copy for them), so that flag lives on the `xbuild-*` /
+# `xbuild-kernel-* ` / `xrun-kernel-*` aliases below instead, scoping it
+# to exactly the cross-compiles that need it. A raw `cargo build --target
+# targets/<arch>.json` therefore also needs `-Z build-std=core,alloc
+# -Z build-std-features=compiler-builtins-mem` added by hand; prefer the
+# aliases.
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# Per-architecture bare-metal target configuration
+#
+# NOTE: these sections key on the *custom target name* (the file stem of
+# targets/x86_64-hal.json, i.e. "x86_64-hal"), NOT on a `cfg(target_arch
+# = "...")` predicate. This is deliberate: `cfg(target_arch = "x86_64")`
+# ALSO matches the developer's host triple (x86_64-pc-windows-msvc,
+# x86_64-unknown-linux-gnu, …), so putting the QEMU `runner` there makes
+# a plain `cargo test` at the workspace root try to launch the host test
+# binaries under `qemu-system-x86_64 -kernel` and fail. Cargo matches
+# custom JSON targets by their file stem when passed via
+# `--target targets/x86_64-hal.json`, so keying on the stem scopes both
+# the runner and the linker rustflags to exactly the cross-compiles that
+# want them, and leaves host builds untouched (see the "Host build
+# behavior" note at the bottom).
+# ----------------------------------------------------------------------------
+[target.x86_64-hal]
+runner = "qemu-system-x86_64 -serial stdio -display none -kernel"
+rustflags = [
+    "-C", "relocation-model=static",
+    # Disable red zone: interrupt/exception handlers run without a safe
+    # 128-byte scratch area below RSP: with red zone enabled, an
+    # interrupt firing mid-function could corrupt caller data below RSP.
+    "-C", "target-feature=-red-zone",
+    # NOTE: the linker script itself is NOT passed here anymore — each
+    # hal-<arch> crate's own build.rs emits
+    # `cargo:rustc-link-arg=-T<absolute-path-to-linker.ld>` using its
+    # own CARGO_MANIFEST_DIR, which is always correct regardless of
+    # which directory `cargo` was invoked from. A relative path here
+    # broke as soon as the project's own directory name/location
+    # changed (see git history around the "cannot find linker script"
+    # build failure).
+    #
+    # curve25519-dalek/sha2 (Issue #29's Ed25519 TokenVerifier,
+    # hal-direct's optional "ed25519" feature) auto-select a
+    # runtime-CPUID-detected SIMD backend by default. On this custom
+    # target that codegen path hits a real LLVM back-end crash
+    # ("rustc-LLVM ERROR: Do not know how to split the result of this
+    # operator!") — confirmed by building `cargo build -p hal-direct
+    # --features ed25519 --target targets/x86_64-hal.json` without
+    # these cfgs. Forcing both crates' portable, non-SIMD backends
+    # instead fixes that crash and is the right choice anyway for a
+    # `#[panic_handler]`-only, allocator-optional bare-metal image — no
+    # runtime CPU-feature detection surface, no dependence on this
+    # target spec ever gaining AVX2/SHA-NI support.
+    #
+    # `serial`, not `fiat`: curve25519-dalek 5.0.0's `fiat` backend
+    # (its formally-verified, fiat-crypto-generated field arithmetic)
+    # is itself unbuildable on this project's pinned nightly
+    # (nightly-2025-01-15) — `fiat_u64/field.rs` calls
+    # `slice::copy_from_slice` as a const fn, which was not yet stable
+    # on that toolchain (confirmed by direct build attempt: "error:
+    # `slice::<impl [T]>::copy_from_slice` is not yet stable as a const
+    # fn"). `serial` is curve25519-dalek's other portable, no-SIMD,
+    # no-CPU-feature-detection backend (predates `fiat`, hand-written
+    # rather than formally-verified-and-generated) and does not hit
+    # this const-fn requirement. Revisit this choice if the pinned
+    # nightly is ever bumped past whatever release stabilized
+    # `const_copy_from_slice` — `fiat` may become buildable again then.
+    #
+    # A no-op for any build that doesn't enable the "ed25519" feature
+    # (the cfgs are simply unused).
+    "--cfg", 'curve25519_dalek_backend="serial"',
+    "--cfg", 'sha2_backend="soft"',
+]
+
+[target.aarch64-hal]
+# `gic-version=3` is explicit, not left to QEMU's own default: this
+# project's `hal-arm64::interrupt` bootstrap (GICv3 system-register CPU
+# interface bring-up, ICC_SRE_EL1/ICC_PMR_EL1/ICC_IGRPEN1_EL1) hangs
+# silently — a synchronous exception with no EL2 handler, vectoring
+# through this crate's own EL1 halt-and-spin path — if the emulated GIC
+# isn't actually GICv3, since QEMU's `virt` machine does not reliably
+# default to it on every QEMU version (confirmed via QEMU 11.1.0, whose
+# unqualified default was NOT GICv3 for this machine/CPU combination).
+runner = "qemu-system-aarch64 -M virt,gic-version=3 -cpu cortex-a72 -serial stdio -display none -kernel"
+rustflags = [
+    "-C", "relocation-model=static",
+]
+
+[target.riscv64gc-hal]
+runner = "qemu-system-riscv64 -M virt -serial stdio -display none -kernel"
+rustflags = [
+    "-C", "relocation-model=static",
+]
+
+# ----------------------------------------------------------------------------
+# Convenience aliases
+#
+# These let contributors type `cargo xbuild-x86_64` instead of the full
+# `cargo build -p hal-x86_64 --target targets/x86_64-hal.json -Z build-std=…`
+# incantation. Each one carries the `-Z build-std` flags (see the header
+# comment on why they are not in `[unstable]`): `core,alloc` rebuilt from
+# source because the custom JSON targets have no prebuilt copy, and
+# `compiler-builtins-mem` so the bare-metal image needs no external libc
+# for `memcpy`/`memset`/…
+# ----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
+# Host `cargo test` stack size
+#
+# `kernel-core`'s own `KernelState` is a large, fixed-size struct (one
+# array slot per MAX_THREADS/MAX_ENDPOINTS/etc. kernel object) that
+# several host tests bind as a local. On a host debug build (no
+# guaranteed move elision) that genuinely overflows the Windows default
+# thread stack (~1 MiB) — a real, previously-latent margin issue: it
+# first surfaced as ONE test overflowing, and patching that one test's
+# own stack size just moved the same overflow onto the next test that
+# happened to sit closest to the edge, proving this is a systemic
+# per-test margin problem, not a one-off. `RUST_MIN_STACK` is what the
+# standard test harness reads for the stack size it gives every spawned
+# test thread — fixing it globally here, rather than patching individual
+# tests one at a time as `KernelState` continues to grow, is not a
+# kernel/correctness change: the real `no_std` target builds/boots fine
+# regardless (this is a host `cargo test` artifact only).
+# ----------------------------------------------------------------------------
+[env]
+RUST_MIN_STACK = "67108864"
+
+[alias]
+xbuild-x86_64  = "build -p hal-x86_64  --target targets/x86_64-hal.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
+xbuild-aarch64 = "build -p hal-arm64   --target targets/aarch64-hal.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
+xbuild-riscv64 = "build -p hal-riscv64 --target targets/riscv64gc-hal.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
+# ----------------------------------------------------------------------------
+# kernel-stub build/run aliases
+#
+# `xbuild-kernel-*` builds the FULL bootable image for each architecture:
+# kernel-stub links in the matching hal-<arch> crate (selected
+# automatically via kernel-stub/Cargo.toml's target_arch-keyed dependency
+# tables), which in turn links in the boot assembly + linker.ld for that
+# architecture. `xrun-kernel-*` does the same and then launches it under
+# QEMU via the per-target `runner` configured above.
+# ----------------------------------------------------------------------------
+xbuild-kernel-x86_64  = "build -p kernel-stub --target targets/x86_64-hal.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
+xbuild-kernel-aarch64 = "build -p kernel-stub --target targets/aarch64-hal.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
+xbuild-kernel-riscv64 = "build -p kernel-stub --target targets/riscv64gc-hal.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
+
+xrun-kernel-x86_64  = "run -p kernel-stub --target targets/x86_64-hal.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
+xrun-kernel-aarch64 = "run -p kernel-stub --target targets/aarch64-hal.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
+xrun-kernel-riscv64 = "run -p kernel-stub --target targets/riscv64gc-hal.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
+
+# ----------------------------------------------------------------------------
+# microkernel (`kernel` bin) build/run aliases — the Phase-2 successor to
+# kernel-stub. Same mechanics (target_arch-keyed hal-<arch> dep + build.rs
+# linker script), but this bin links the full kernel/* stack and runs
+# `kernel_arch_glue::run`. kernel-stub's aliases above are kept for the
+# pure 01-HAL-Layer.md §8 smoke test.
+# ----------------------------------------------------------------------------
+xbuild-microkernel-x86_64  = "build -p kernel --target targets/x86_64-hal.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
+xbuild-microkernel-aarch64 = "build -p kernel --target targets/aarch64-hal.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
+xbuild-microkernel-riscv64 = "build -p kernel --target targets/riscv64gc-hal.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
+
+xrun-microkernel-x86_64  = "run -p kernel --target targets/x86_64-hal.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
+xrun-microkernel-aarch64 = "run -p kernel --target targets/aarch64-hal.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
+xrun-microkernel-riscv64 = "run -p kernel --target targets/riscv64gc-hal.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
+
+# ----------------------------------------------------------------------------
+# Subsystem process-image build aliases ("subsystems as processes"
+# packaging, 03-Kernel-Subsystems-Layer.md). Builds a subsystem's OWN
+# `[[bin]]` as a genuinely separate, statically-linked ELF — NOT linked
+# into the `kernel`/`kernel-stub` image — which `kernel-arch-glue::
+# spawn_process_from_elf` loads at spawn time via an `include_bytes!`
+# embed (see `kernel/kernel/build.rs`).
+# ----------------------------------------------------------------------------
+xbuild-subsystem-device-manager-x86_64  = "build -p device-manager --bin device-manager-bin --target targets/x86_64-hal.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
+xbuild-subsystem-device-manager-aarch64 = "build -p device-manager --bin device-manager-bin --target targets/aarch64-hal.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
+xbuild-subsystem-device-manager-riscv64 = "build -p device-manager --bin device-manager-bin --target targets/riscv64gc-hal.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
+# Same shape, for fs-native's own separately-built ELF (03-Kernel-
+# Subsystems-Layer.md §2.2/§5.3) — the second real subsystem process,
+# after device-manager, and the first driven by the real FsRequest/
+# FsResponse wire protocol.
+xbuild-subsystem-fs-native-x86_64  = "build -p fs-native --bin fs-native-bin --target targets/x86_64-hal.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
+xbuild-subsystem-fs-native-aarch64 = "build -p fs-native --bin fs-native-bin --target targets/aarch64-hal.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
+xbuild-subsystem-fs-native-riscv64 = "build -p fs-native --bin fs-native-bin --target targets/riscv64gc-hal.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
+# Same shape, for driver-virtio-blk's own separately-built ELF (03-
+# Kernel-Subsystems-Layer.md §5.1) — the third real subsystem process.
+xbuild-subsystem-driver-virtio-blk-x86_64  = "build -p driver-virtio-blk --bin driver-virtio-blk-bin --target targets/x86_64-hal.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
+xbuild-subsystem-driver-virtio-blk-aarch64 = "build -p driver-virtio-blk --bin driver-virtio-blk-bin --target targets/aarch64-hal.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
+xbuild-subsystem-driver-virtio-blk-riscv64 = "build -p driver-virtio-blk --bin driver-virtio-blk-bin --target targets/riscv64gc-hal.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
+# Same shape, for driver-virtio-net's own separately-built ELF (03-
+# Kernel-Subsystems-Layer.md §2.3/§5.4) — all three architectures, over
+# virtio-pci "modern" on aarch64/x86_64 and virtio-mmio on riscv64
+# (`driver_virtio_net::Transport`'s own doc comment), matching driver-
+# virtio-blk's own multi-arch fan-out shape exactly.
+xbuild-subsystem-driver-virtio-net-x86_64  = "build -p driver-virtio-net --bin driver-virtio-net-bin --target targets/x86_64-hal.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
+xbuild-subsystem-driver-virtio-net-aarch64 = "build -p driver-virtio-net --bin driver-virtio-net-bin --target targets/aarch64-hal.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
+xbuild-subsystem-driver-virtio-net-riscv64 = "build -p driver-virtio-net --bin driver-virtio-net-bin --target targets/riscv64gc-hal.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
+# Same shape, for netstack's own separately-built ELF (03-Kernel-
+# Subsystems-Layer.md §2.3/§5.4) — the fifth real subsystem process, and
+# the first that is an IPC CLIENT of another subsystem process (driver-
+# virtio-net) rather than a server.
+xbuild-subsystem-netstack-x86_64  = "build -p netstack --bin netstack-bin --target targets/x86_64-hal.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
+xbuild-subsystem-netstack-aarch64 = "build -p netstack --bin netstack-bin --target targets/aarch64-hal.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
+xbuild-subsystem-netstack-riscv64 = "build -p netstack --bin netstack-bin --target targets/riscv64gc-hal.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
+# Same shape, for the Compositor Service's own separately-built ELF
+# (03-Kernel-Subsystems-Layer.md §2.4/§5.4.2) — a real IPC SERVER
+# process (like fs-native), not a client (unlike netstack).
+xbuild-subsystem-compositor-x86_64  = "build -p compositor --bin compositor-bin --target targets/x86_64-hal.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
+xbuild-subsystem-compositor-aarch64 = "build -p compositor --bin compositor-bin --target targets/aarch64-hal.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
+xbuild-subsystem-compositor-riscv64 = "build -p compositor --bin compositor-bin --target targets/riscv64gc-hal.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
+# Same shape, for the memory-policy service's own separately-built ELF
+# (03-Kernel-Subsystems-Layer.md §2.5) — another real IPC SERVER (like
+# fs-native/compositor).
+xbuild-subsystem-mm-service-x86_64  = "build -p mm-service --bin mm-service-bin --target targets/x86_64-hal.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
+xbuild-subsystem-mm-service-aarch64 = "build -p mm-service --bin mm-service-bin --target targets/aarch64-hal.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
+xbuild-subsystem-mm-service-riscv64 = "build -p mm-service --bin mm-service-bin --target targets/riscv64gc-hal.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
+# Same shape, for the real Log Collector service's own separately-built
+# ELF (04-System-Services-Policy-Layer-v2.md §2.2) — another real IPC
+# SERVER (like fs-native/compositor/mm-service), the real peer
+# `simurgh-diagnostics`'s own long-existing client transport talks to.
+xbuild-subsystem-log-collector-native-x86_64  = "build -p log-collector-native --bin log-collector-native-bin --target targets/x86_64-hal.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
+xbuild-subsystem-log-collector-native-aarch64 = "build -p log-collector-native --bin log-collector-native-bin --target targets/aarch64-hal.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
+xbuild-subsystem-log-collector-native-riscv64 = "build -p log-collector-native --bin log-collector-native-bin --target targets/riscv64gc-hal.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
+# Same shape, for the CapGrant/CapRevoke intermediary's own separately-
+# built ELF (Issue #28) — another real IPC SERVER (like fs-native/
+# compositor/mm-service), and the first process that itself issues a real
+# SyscallOp::CapGrant/CapRevoke.
+xbuild-subsystem-security-broker-intermediary-x86_64  = "build -p security-broker-intermediary --bin security-broker-intermediary-bin --target targets/x86_64-hal.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
+xbuild-subsystem-security-broker-intermediary-aarch64 = "build -p security-broker-intermediary --bin security-broker-intermediary-bin --target targets/aarch64-hal.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
+xbuild-subsystem-security-broker-intermediary-riscv64 = "build -p security-broker-intermediary --bin security-broker-intermediary-bin --target targets/riscv64gc-hal.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
+# Same shape, for the real i8042 keyboard driver's own separately-built
+# ELF (real-input-handling plan, Stage B) — x86_64-only: no such device
+# exists on aarch64/riscv64, so this is the only one of these aliases
+# for driver-i8042.
+xbuild-subsystem-driver-i8042-x86_64 = "build -p driver-i8042 --bin driver-i8042-bin --target targets/x86_64-hal.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
+# Same shape, for the real PS/2 mouse driver's own separately-built ELF
+# (mouse-input plan, Stage 1b) — x86_64-only, same reason as driver-i8042.
+xbuild-subsystem-driver-mouse-x86_64 = "build -p driver-mouse --bin driver-mouse-bin --target targets/x86_64-hal.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
+# Same shape, for the real NVMe block driver's own separately-built ELF
+# (03-Kernel-Subsystems-Layer.md's own driver list) — x86_64-only, same
+# reason as driver-i8042 (NVMe discovery only exists in hal_x86_64 today).
+xbuild-subsystem-driver-nvme-x86_64 = "build -p driver-nvme --bin driver-nvme-bin --target targets/x86_64-hal.json -Z build-std=core,alloc -Z build-std-features=compiler-builtins-mem"
+
+# ----------------------------------------------------------------------------
+# Host build behavior (no --target passed)
+#
+# Intentionally left with no [build] table / no default target override:
+# a plain `cargo build` or `cargo test` at the workspace root must keep
+# targeting the developer's native host triple, so that hal-core /
+# hal-manifest / hal-direct unit tests (mock hardware, per WORKSPACE.md)
+# run normally without cross-compilation.
+# ----------------------------------------------------------------------------

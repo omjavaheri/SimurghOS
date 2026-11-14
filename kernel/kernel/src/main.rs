@@ -1,0 +1,11238 @@
+//! ============================================================================
+//! kernel  (binary)
+//!
+//! Purpose: the real bootable Simurgh microkernel image. Receives the HAL
+//! handoff (`hal_core::HalInterface` + `hal_core::BootInfo`) via the fixed
+//! `extern "Rust" fn kernel_main` symbol the `hal-<arch>` entry code calls
+//! (01-HAL-Layer.md §0), runs microkernel bring-up through
+//! `kernel_arch_glue::run` (build the first `UntypedMemory` objects + the
+//! Root Task — 02-Microkernel-Layer.md §8.1), prints the boot report over
+//! serial, and halts.
+//!
+//! Architecture reference: 02-Microkernel-Layer.md §8.1/§8.2; 01-HAL-Layer.md
+//! §0 (HAL and the microkernel share one privileged binary; handoff is a
+//! direct Rust call).
+//!
+//! Position in the system: the workspace's second `[[bin]]` (alongside
+//! `kernel-stub`, which stays the pure HAL smoke test). Built per
+//! architecture against `targets/*.json`; links exactly one `hal-<arch>`
+//! crate (selected by `target_arch` in Cargo.toml) for `_start`, the boot
+//! assembly, the linker script, and — being the final binary — the single
+//! `#[panic_handler]`.
+//!
+//! Safety/invariants: the serial backends here are boot-diagnostics only,
+//! identical in scope to `kernel-stub`'s; they are not real drivers.
+//! ============================================================================
+
+#![no_std]
+#![no_main]
+#![forbid(unsafe_op_in_unsafe_fn)]
+
+use core::fmt::Write;
+use core::panic::PanicInfo;
+
+use hal_core::BootInfo;
+
+// ----------------------------------------------------------------------------
+// A minimal global allocator — boot-time only, for the Root Task's OWN
+// policy code (`root_task::plan_boot` returns a `Vec<MemoryGrant>`).
+// `kernel/*` itself stays heap-free by design (IMPLEMENTATION-PLAN.md D1);
+// this exists ONLY because `root-task` — a layer-3, user-space process —
+// genuinely has a heap "once it retypes some untyped memory" per that
+// crate's own docs, and this binary is presently the vehicle that runs its
+// boot-time planning in-kernel (MVP, before a real per-process heap wired
+// through `UntypedMemory` exists). A bump allocator with no reclaim is
+// deliberate and sufficient: the handful of small, short-lived boot-time
+// allocations this binary makes are never freed anyway.
+// ----------------------------------------------------------------------------
+
+const BOOT_HEAP_BYTES: usize = 64 * 1024;
+
+/// Backing storage for the bump allocator below. `.bss`, zeroed by the
+/// loader — never read before being written by an allocation.
+static mut BOOT_HEAP: [u8; BOOT_HEAP_BYTES] = [0; BOOT_HEAP_BYTES];
+
+struct BumpAllocator {
+    /// Byte offset of the next free slot in `BOOT_HEAP`. `AtomicUsize`
+    /// purely so `alloc` can take `&self` (the `GlobalAlloc` contract) —
+    /// this binary is single-core, so `Relaxed` ordering is all a bump
+    /// pointer needs.
+    offset: core::sync::atomic::AtomicUsize,
+}
+
+// SAFETY: `alloc`'s only memory access is through `BOOT_HEAP.as_mut_ptr()`
+// at an offset this same call reserved via the atomic bump (never handed
+// out to two callers — single-core, and the compare-exchange below is the
+// sole writer of `offset`); `dealloc` touches nothing.
+unsafe impl core::alloc::GlobalAlloc for BumpAllocator {
+    unsafe fn alloc(&self, layout: core::alloc::Layout) -> *mut u8 {
+        use core::sync::atomic::Ordering;
+        let (align, size) = (layout.align(), layout.size());
+        loop {
+            let cur = self.offset.load(Ordering::Relaxed);
+            let aligned = (cur + align - 1) & !(align - 1);
+            let Some(new_offset) = aligned.checked_add(size) else {
+                return core::ptr::null_mut();
+            };
+            if new_offset > BOOT_HEAP_BYTES {
+                return core::ptr::null_mut();
+            }
+            if self
+                .offset
+                .compare_exchange(cur, new_offset, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                // SAFETY: `aligned + size <= BOOT_HEAP_BYTES`, just checked;
+                // `aligned` is a multiple of `align` by construction.
+                return unsafe { core::ptr::addr_of_mut!(BOOT_HEAP).cast::<u8>().add(aligned) };
+            }
+        }
+    }
+
+    unsafe fn dealloc(&self, _ptr: *mut u8, _layout: core::alloc::Layout) {
+        // No reclaim — see this section's module-level doc comment.
+    }
+}
+
+#[global_allocator]
+static BOOT_ALLOCATOR: BumpAllocator = BumpAllocator {
+    offset: core::sync::atomic::AtomicUsize::new(0),
+};
+
+// Link-only: pull in this architecture's boot assembly / `_start` /
+// panic-handler-adjacent code via its `hal-<arch>` crate. Never referenced
+// by type — `kernel_main` depends solely on the architecture-erased
+// `hal_core::HalInterface`.
+#[cfg(target_arch = "aarch64")]
+use hal_arm64 as _;
+#[cfg(target_arch = "riscv64")]
+use hal_riscv64 as _;
+#[cfg(target_arch = "x86_64")]
+use hal_x86_64 as _;
+
+/// `device-manager-bin`'s separately-built, statically-linked ELF image
+/// for THIS architecture (see that crate's own doc comment —
+/// "subsystems as processes" packaging, IMPLEMENTATION-PLAN.md
+/// follow-up), baked into THIS binary's own `.rodata` at compile time.
+/// `DEVICE_MANAGER_ELF_PATH` is set by `build.rs` after locating the
+/// file built via `cargo xbuild-subsystem-device-manager-<arch>` —
+/// same pattern `uefi-bootloader/src/main.rs` already uses for its own
+/// embedded kernel image. One `static` for all three architectures:
+/// `build.rs` selects the right pre-built artifact per `target_arch`,
+/// so this line never needs a `cfg`.
+static DEVICE_MANAGER_ELF: &[u8] = include_bytes!(env!("DEVICE_MANAGER_ELF_PATH"));
+
+/// `fs-native-bin`'s own separately-built ELF image — same packaging as
+/// `DEVICE_MANAGER_ELF` (see its own doc comment), the second real
+/// subsystem process (03-Kernel-Subsystems-Layer.md §2.2/§5.3).
+static FS_NATIVE_ELF: &[u8] = include_bytes!(env!("FS_NATIVE_ELF_PATH"));
+
+/// `driver-virtio-blk-bin`'s own separately-built ELF image — same
+/// packaging as `DEVICE_MANAGER_ELF` (see its own doc comment), the
+/// third real subsystem process (03-Kernel-Subsystems-Layer.md §5.1).
+static DRIVER_VIRTIO_BLK_ELF: &[u8] = include_bytes!(env!("DRIVER_VIRTIO_BLK_ELF_PATH"));
+
+/// `driver-virtio-net-bin`'s own separately-built ELF image — same
+/// packaging as `DEVICE_MANAGER_ELF` (see its own doc comment), the
+/// fourth real subsystem process (03-Kernel-Subsystems-Layer.md
+/// §2.3/§5.4), now fanned out to all three architectures — `build.rs`
+/// emits `DRIVER_VIRTIO_NET_ELF_PATH` unconditionally for every
+/// `target_arch`, same as `DRIVER_VIRTIO_BLK_ELF` above.
+static DRIVER_VIRTIO_NET_ELF: &[u8] = include_bytes!(env!("DRIVER_VIRTIO_NET_ELF_PATH"));
+
+/// `netstack-bin`'s own separately-built ELF image — same packaging as
+/// `DEVICE_MANAGER_ELF` (see its own doc comment), the fifth real
+/// subsystem process (03-Kernel-Subsystems-Layer.md §2.3/§5.4), and the
+/// first that is an IPC CLIENT of another subsystem process rather than
+/// a server — `netstack::subsystem_entry`'s own module doc comment has
+/// the full picture.
+static NETSTACK_ELF: &[u8] = include_bytes!(env!("NETSTACK_ELF_PATH"));
+
+/// `compositor-bin`'s own separately-built ELF image — same packaging as
+/// `DEVICE_MANAGER_ELF` (see its own doc comment), the sixth real
+/// subsystem process (03-Kernel-Subsystems-Layer.md §2.4/§5.4.2), and a
+/// real IPC SERVER (like fs-native), not a client (unlike Netstack).
+static COMPOSITOR_ELF: &[u8] = include_bytes!(env!("COMPOSITOR_ELF_PATH"));
+
+/// `mm-service-bin`'s own separately-built ELF image — same packaging as
+/// `DEVICE_MANAGER_ELF` (see its own doc comment), the seventh real
+/// subsystem process (03-Kernel-Subsystems-Layer.md §2.5), and a real
+/// IPC SERVER (like fs-native/Compositor), not a client (unlike
+/// Netstack).
+static MM_SERVICE_ELF: &[u8] = include_bytes!(env!("MM_SERVICE_ELF_PATH"));
+
+/// `security-broker-bin`'s own separately-built ELF image — same
+/// packaging as `DEVICE_MANAGER_ELF` (see its own doc comment), but the
+/// FIRST LAYER-4 process this project spawns (`simurgh-security-broker`,
+/// a separate git repo — REPO-simurgh-security-broker.md §1), not a
+/// layer-3 one. See `kernel/build.rs`'s own doc comment on this static's
+/// `SECURITY_BROKER_ELF_PATH` for why its build output crosses out of
+/// this workspace entirely (a local-dev-only path assumption, flagged
+/// there for Omid).
+static SECURITY_BROKER_ELF: &[u8] = include_bytes!(env!("SECURITY_BROKER_ELF_PATH"));
+
+/// `security-broker-intermediary-bin`'s own separately-built ELF image —
+/// same packaging as `DEVICE_MANAGER_ELF` (see its own doc comment), and
+/// (unlike `SECURITY_BROKER_ELF`) an IN-TREE layer-3 subsystem: the
+/// CapGrant/CapRevoke intermediary Issue #28 designed
+/// (`ipc-protocol/src/security.rs`, `root_task::Service::
+/// SecurityBrokerIntermediary`) but never wired to a real process until
+/// now — see `kernel_arch_glue::security_broker_intermediary_demo_start`'s
+/// own doc comment for the full rationale.
+static SECURITY_BROKER_INTERMEDIARY_ELF: &[u8] = include_bytes!(env!("SECURITY_BROKER_INTERMEDIARY_ELF_PATH"));
+
+/// `init-bin`'s own separately-built ELF image — same packaging as
+/// `SECURITY_BROKER_ELF` (see its own doc comment): the SECOND layer-4
+/// process this project spawns (`simurgh-init`, a separate git repo —
+/// REPO-simurgh-init.md §1: "the very first one the kernel's Root Task
+/// would start"), out-of-tree for the same local-dev-only path-stitch
+/// reason `SECURITY_BROKER_ELF` is.
+static INIT_ELF: &[u8] = include_bytes!(env!("INIT_ELF_PATH"));
+
+/// `account-manager-bin`'s own separately-built ELF image — same
+/// packaging as `INIT_ELF` (see its own doc comment): the THIRD layer-4
+/// process this project spawns (`simurgh-account-manager`, a separate
+/// git repo), out-of-tree for the same local-dev-only path-stitch reason.
+static ACCOUNT_MANAGER_ELF: &[u8] = include_bytes!(env!("ACCOUNT_MANAGER_ELF_PATH"));
+
+/// `backup-manager-bin`'s own separately-built ELF image — same packaging
+/// as `ACCOUNT_MANAGER_ELF` (see its own doc comment): the FOURTH layer-4
+/// process this project spawns (`simurgh-backup-manager`, a separate git
+/// repo), out-of-tree for the same local-dev-only path-stitch reason.
+static BACKUP_MANAGER_ELF: &[u8] = include_bytes!(env!("BACKUP_MANAGER_ELF_PATH"));
+
+/// `diagnostics-manager-bin`'s own separately-built ELF image — same
+/// packaging as `BACKUP_MANAGER_ELF` (see its own doc comment): the
+/// FIFTH layer-4 process this project spawns (`simurgh-diagnostics`, a
+/// separate git repo), out-of-tree for the same local-dev-only
+/// path-stitch reason.
+static DIAGNOSTICS_MANAGER_ELF: &[u8] = include_bytes!(env!("DIAGNOSTICS_MANAGER_ELF_PATH"));
+
+/// `log-collector-native-bin`'s own separately-built ELF image — unlike
+/// every other subsystem ELF near this one, IN-TREE (`subsystems/log-
+/// collector-native`, this same repo) — the real, kernel-side Log
+/// Collector service `simurgh-diagnostics::diagnostics-manager`'s own
+/// long-existing `RealLogCollector` client transport had no peer to talk
+/// to until this crate existed (see that repo's own README).
+static LOG_COLLECTOR_ELF: &[u8] = include_bytes!(env!("LOG_COLLECTOR_ELF_PATH"));
+
+/// `store-bin`'s own separately-built ELF image — same packaging as
+/// `DIAGNOSTICS_MANAGER_ELF` (see its own doc comment): the SIXTH
+/// layer-4 process this project spawns (`simurgh-store`, a separate git
+/// repo), out-of-tree for the same local-dev-only path-stitch reason.
+static STORE_ELF: &[u8] = include_bytes!(env!("STORE_ELF_PATH"));
+
+/// `native-loader-bin`'s own separately-built ELF image — same packaging
+/// as `STORE_ELF` (see its own doc comment): the SEVENTH layer-4 process
+/// this project spawns (`simurgh-native-sdk`, a separate git repo),
+/// out-of-tree for the same local-dev-only path-stitch reason.
+static NATIVE_LOADER_ELF: &[u8] = include_bytes!(env!("NATIVE_LOADER_ELF_PATH"));
+
+/// `policy-engine-bin`'s own separately-built ELF image — same packaging
+/// as `NATIVE_LOADER_ELF` (see its own doc comment): the EIGHTH layer-4
+/// process this project spawns (`simurgh-profile-policy`, a separate git
+/// repo), out-of-tree for the same local-dev-only path-stitch reason.
+static POLICY_ENGINE_ELF: &[u8] = include_bytes!(env!("POLICY_ENGINE_ELF_PATH"));
+
+/// `shell-bin`'s own separately-built ELF image — same packaging as
+/// `POLICY_ENGINE_ELF` (see its own doc comment): the NINTH layer-4
+/// process this project spawns (`simurgh-shell`, a separate git repo, no
+/// `MD/REPO-Simurgh-OS/` charter — Omid's own 2026-09-10 direction), out-
+/// of-tree for the same local-dev-only path-stitch reason. Unlike every
+/// other subsystem here, this one is reachable via `sys::SPAWN_KNOWN_ELF`
+/// (`elf_id` 16) as well as being spawned once at boot — see
+/// `spawn_known_elf_x86`'s own match arms.
+static SHELL_ELF: &[u8] = include_bytes!(env!("SHELL_ELF_PATH"));
+
+/// `fm-core-bin`'s own separately-built ELF image — same packaging as
+/// `SHELL_ELF` (see its own doc comment): the TENTH layer-4 process this
+/// project spawns (`simurgh-file-manager`, a separate git repo), out-of-
+/// tree for the same local-dev-only path-stitch reason. `fm-core` had
+/// never been ported to a real bootable subsystem at all before this
+/// (2026-09-10): its VFS operations were blocked on `fs-native` having no
+/// way to register an arbitrary path string at all (`ipc_protocol::fs::
+/// FsRequest::RegisterPath`, added the same day — see `wire_file_manager_
+/// to_fs_native`'s own doc comment for the full story).
+static FILE_MANAGER_ELF: &[u8] = include_bytes!(env!("FILE_MANAGER_ELF_PATH"));
+
+/// VA `simurgh-shell`'s own dedicated debug-print page is mapped at, in
+/// ITS OWN address space (`spawn_shell_x86`'s own `kernel_arch_glue::
+/// wire_debug_print_page` call) — must stay numerically equal to
+/// `simurgh-shell::shell-core::subsystem_entry::SHELL_OUT_VA`, and to
+/// `sys::SERIAL_PRINT`'s own dispatch (below), which reads this SAME
+/// constant directly (that opcode's own doc comment explains why no
+/// addr_space/root_pt lookup is needed there).
+#[cfg(target_arch = "x86_64")]
+const SHELL_OUT_VA: usize = 0xD900_0000;
+
+/// VA `simurgh-native-sdk`'s own real app-upload buffer is mapped at, in
+/// ITS OWN address space (`spawn_native_loader_x86`'s own `kernel_arch_
+/// glue::wire_shared_pages` call) — must stay numerically equal to
+/// `simurgh-native-sdk::native-loader::subsystem_entry::APP_BUFFER_VA`,
+/// and to `sys::SPAWN_FROM_BUFFER`'s own dispatch (below), which reads
+/// this SAME constant directly (same "no addr_space/root_pt lookup
+/// needed" reasoning `sys::SERIAL_PRINT`'s own doc comment gives).
+#[cfg(target_arch = "x86_64")]
+const APP_BUFFER_VA: usize = 0xD880_0000;
+
+/// Byte length of the app-upload buffer [`APP_BUFFER_VA`] maps — must
+/// stay numerically equal to `simurgh-native-sdk::native-loader::
+/// subsystem_entry::APP_BUFFER_LEN` (that constant's own doc comment for
+/// the size rationale).
+#[cfg(target_arch = "x86_64")]
+const APP_BUFFER_LEN: usize = 4 * 1024 * 1024;
+
+/// VA `simurgh-file-manager`'s own copy of the shared `fs-native` message
+/// page is mapped at, in ITS OWN address space (`spawn_file_manager_x86`'s
+/// own `kernel_arch_glue::wire_file_manager_to_fs_native` call) — must
+/// stay numerically equal to `simurgh-file-manager::fm-core::
+/// subsystem_entry::FS_SHARED_VA`. Deliberately the SAME numeric value as
+/// `fs-native`'s own `FS_SHARED_VA` (`fs_demo_start`'s own doc comment) —
+/// safe to reuse since each process has its own, independent address
+/// space; this is not the same physical page mapped at two different VAs
+/// in one space, just the same VA chosen independently in two different
+/// spaces.
+#[cfg(target_arch = "x86_64")]
+const FILE_MANAGER_FS_SHARED_VA: usize = 0xD800_0000;
+
+/// VA `simurgh-file-manager`'s own copy of the shared `fs-native` bulk-
+/// data page is mapped at — must stay numerically equal to `simurgh-file-
+/// manager::fm-core::subsystem_entry::FS_DATA_VA`. Same "independently
+/// reused numeric VA, different address space" reasoning as
+/// [`FILE_MANAGER_FS_SHARED_VA`].
+#[cfg(target_arch = "x86_64")]
+const FILE_MANAGER_FS_DATA_VA: usize = 0xD810_0000;
+
+/// VA `simurgh-init`'s own copy of the shared `fs-native` message page is
+/// mapped at, in ITS OWN address space (`spawn_init_x86`'s own
+/// `kernel_arch_glue::wire_file_manager_to_fs_native` call) — must stay
+/// numerically equal to `simurgh-init::init-core::subsystem_entry::
+/// FS_SHARED_VA`. Deliberately the SAME numeric value as [`FILE_MANAGER_
+/// FS_SHARED_VA`] — safe to reuse, same "independently chosen in a
+/// different address space" reasoning that constant's own doc comment
+/// gives.
+#[cfg(target_arch = "x86_64")]
+const INIT_FS_SHARED_VA: usize = 0xD800_0000;
+
+/// VA `simurgh-init`'s own copy of the shared `fs-native` bulk-data page
+/// is mapped at — must stay numerically equal to `simurgh-init::
+/// init-core::subsystem_entry::FS_DATA_VA`. Same reasoning as
+/// [`INIT_FS_SHARED_VA`].
+#[cfg(target_arch = "x86_64")]
+const INIT_FS_DATA_VA: usize = 0xD810_0000;
+
+/// `ui-core-bin`'s own separately-built ELF image — same packaging as
+/// `FILE_MANAGER_ELF` (see its own doc comment): the ELEVENTH layer-4/5/6
+/// process this project spawns (`Simurgh-UI-Template01`, a separate git
+/// repo, no `MD/REPO-Simurgh-OS/` charter — Omid's own 2026-09-11
+/// direction: the base graphical desktop environment), out-of-tree for
+/// the same local-dev-only path-stitch reason.
+static UI_CORE_ELF: &[u8] = include_bytes!(env!("UI_CORE_ELF_PATH"));
+
+/// VA `Simurgh-UI-Template01`'s own copy of the shared Compositor message
+/// page is mapped at, in ITS OWN address space (`spawn_ui_core_x86`'s own
+/// `kernel_arch_glue::wire_ui_core_to_compositor` call) — must stay
+/// numerically equal to `ui_core::subsystem_entry::COMPOSITOR_SHARED_VA`.
+/// Deliberately the SAME numeric value as Compositor's own
+/// `COMPOSITOR_SHARED_VA` (`compositor_demo_start`'s own doc comment) —
+/// safe to reuse since each process has its own, independent address
+/// space, same reasoning [`FILE_MANAGER_FS_SHARED_VA`]'s own doc comment
+/// gives for the identical fs-native precedent.
+#[cfg(target_arch = "x86_64")]
+const UI_CORE_COMPOSITOR_SHARED_VA: usize = 0xD840_0000;
+
+/// VA `Simurgh-UI-Template01`'s own copy of the shared Compositor frame-
+/// buffer page is mapped at — must stay numerically equal to `ui_core::
+/// subsystem_entry::COMPOSITOR_FB_VA`. Same "independently reused
+/// numeric VA, different address space" reasoning as
+/// [`UI_CORE_COMPOSITOR_SHARED_VA`].
+#[cfg(target_arch = "x86_64")]
+const UI_CORE_COMPOSITOR_FB_VA: usize = 0xD850_0000;
+
+/// VA of the READ-ONLY machine-id info page in `ui-core`'s own address
+/// space (`spawn_ui_core_x86` -> `kernel_arch_glue::map_machine_id_info`);
+/// the ui-core client must use the same number. Free in that space (its
+/// other mappings are 0xD840/0xD850(+1.9 MiB)/0xD870/0xD880/0xD890/0xD8A0).
+/// Page layout: see `kernel_arch_glue::MACHINE_ID_INFO_MAGIC`'s section.
+#[cfg(target_arch = "x86_64")]
+const UI_CORE_MACHINE_ID_VA: usize = 0xD8B0_0000;
+/// VA of the read-only device-list info page in ui-core (two pages, after the machine-id page).
+const UI_CORE_DEVICE_LIST_VA: usize = 0xD8B0_1000;
+/// VA of the read-only network status page in ui-core (right after the two device-list pages).
+const UI_CORE_NET_INFO_VA: usize = 0xD8B0_3000;
+
+/// `driver-i8042-bin`'s own separately-built ELF image (real-input-
+/// handling plan, Stage B) — x86_64-only: no i8042 device exists on
+/// aarch64/riscv64 (`hal_manifest::raw::PeripheralKindRaw::Input`'s own
+/// doc comment), so this crate has no linker script for those targets
+/// and `build.rs` only emits `DRIVER_I8042_ELF_PATH` when building for
+/// x86_64 — this `static` is gated to match.
+#[cfg(target_arch = "x86_64")]
+static DRIVER_I8042_ELF: &[u8] = include_bytes!(env!("DRIVER_I8042_ELF_PATH"));
+
+/// `driver-mouse-bin`'s own separately-built ELF image (mouse-input
+/// plan, Stage 1b) — x86_64-only, same reasoning as `DRIVER_I8042_ELF`.
+#[cfg(target_arch = "x86_64")]
+static DRIVER_MOUSE_ELF: &[u8] = include_bytes!(env!("DRIVER_MOUSE_ELF_PATH"));
+
+/// `driver-nvme-bin`'s own separately-built ELF image — x86_64-only,
+/// same reasoning as `DRIVER_I8042_ELF` (NVMe discovery only exists in
+/// `hal_x86_64::peripheral` today).
+#[cfg(target_arch = "x86_64")]
+static DRIVER_NVME_ELF: &[u8] = include_bytes!(env!("DRIVER_NVME_ELF_PATH"));
+
+// ----------------------------------------------------------------------------
+// Minimal serial output, per architecture — identical scope to
+// kernel-stub's backends (boot diagnostics only, not a driver).
+// ----------------------------------------------------------------------------
+
+struct SerialWriter;
+
+#[cfg(target_arch = "x86_64")]
+mod backend {
+    //! x86_64: UART 16550 on COM1 via I/O ports.
+    const COM1_PORT: u16 = 0x3F8;
+
+    pub fn init() {
+        // SAFETY: standard 16550 bring-up on COM1's fixed ISA port range,
+        // universally safe on every x86_64 QEMU machine this project
+        // targets — same sequence as kernel-stub's backend.
+        unsafe {
+            out_byte(COM1_PORT + 1, 0x00);
+            out_byte(COM1_PORT + 3, 0x80);
+            out_byte(COM1_PORT + 0, 0x03);
+            out_byte(COM1_PORT + 1, 0x00);
+            out_byte(COM1_PORT + 3, 0x03);
+            out_byte(COM1_PORT + 2, 0xC7);
+            out_byte(COM1_PORT + 4, 0x0B);
+        }
+    }
+
+    /// Non-blocking real UART receive — `simurgh-shell`'s own `sys::
+    /// SERIAL_TRY_READ`. Standard 16550 polled-receive sequence: LSR bit
+    /// 0 (Data Ready) set means a real byte is already sitting in RBR
+    /// (offset 0, the SAME I/O port `write_byte` uses for THR — the
+    /// 16550 multiplexes transmit/receive onto one port, direction
+    /// implied by read-vs-write). Never blocks — `None` if nothing is
+    /// waiting, so the caller (`sys::SERIAL_TRY_READ`'s own dispatch)
+    /// stays a plain, non-blocking syscall the real preemptive scheduler
+    /// can freely interleave around, the same reasoning `simurgh-shell`'s
+    /// own `run_forever` polling loop relies on.
+    pub fn try_read_byte() -> Option<u8> {
+        // SAFETY: same COM1 I/O ports `write_byte`/`init` already use;
+        // reading LSR/RBR has no precondition beyond the port existing.
+        unsafe {
+            if in_byte(COM1_PORT + 5) & 0x01 == 0 {
+                return None;
+            }
+            Some(in_byte(COM1_PORT))
+        }
+    }
+
+    pub fn write_byte(byte: u8) {
+        // SAFETY: polling LSR bit 5 before writing THR is the standard
+        // 16550 transmit sequence.
+        unsafe {
+            while in_byte(COM1_PORT + 5) & 0x20 == 0 {
+                core::hint::spin_loop();
+            }
+            out_byte(COM1_PORT, byte);
+        }
+    }
+
+    /// # Safety
+    /// `port` must be a valid I/O port; every call site targets COM1.
+    unsafe fn out_byte(port: u16, value: u8) {
+        unsafe {
+            core::arch::asm!("out dx, al", in("dx") port, in("al") value);
+        }
+    }
+
+    /// # Safety
+    /// Same contract as `out_byte`.
+    unsafe fn in_byte(port: u16) -> u8 {
+        let value: u8;
+        unsafe {
+            core::arch::asm!("in al, dx", in("dx") port, out("al") value);
+        }
+        value
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+mod backend {
+    //! ARM64: PL011 UART via MMIO at QEMU virt's documented default base.
+    const PL011_BASE: u64 = 0x0900_0000;
+    const PL011_DR: u64 = 0x000;
+    const PL011_FR: u64 = 0x018;
+    const PL011_FR_TXFF: u32 = 1 << 5;
+
+    pub fn init() {
+        // QEMU's virt PL011 starts enabled for polled transmit; nothing to
+        // do here (same rationale as kernel-stub's backend).
+    }
+
+    pub fn write_byte(byte: u8) {
+        // SAFETY: PL011_BASE is QEMU virt's fixed, documented PL011 MMIO
+        // base; poll FR.TXFF before writing DR — the standard PL011
+        // polled-transmit sequence. Covered by hal-arm64's boot-time
+        // identity map for this MVP phase.
+        unsafe {
+            while (core::ptr::read_volatile((PL011_BASE + PL011_FR) as *const u32) & PL011_FR_TXFF)
+                != 0
+            {
+                core::hint::spin_loop();
+            }
+            core::ptr::write_volatile((PL011_BASE + PL011_DR) as *mut u32, byte as u32);
+        }
+    }
+}
+
+#[cfg(target_arch = "riscv64")]
+mod backend {
+    //! RISC-V: NS16550 UART via MMIO at QEMU virt's documented base
+    //! (0x1000_0000). Deliberately NOT the SBI console `ecall` used by
+    //! `kernel-stub`: once the microkernel runs a U-mode Root Task, an
+    //! `ecall` from S-mode would trap to M-mode (SBI) while every U-mode
+    //! `ecall` traps to *our* S-mode handler — mixing the two consoles
+    //! is confusing and couples the kernel's own logging to firmware.
+    //! MMIO polled transmit has neither problem and matches the ARM64
+    //! backend's shape.
+    const UART_BASE: usize = 0x1000_0000;
+    const UART_THR: usize = 0x0; // transmit holding register
+    const UART_LSR: usize = 0x5; // line status register
+    const LSR_THRE: u8 = 1 << 5; // transmit-holding-register empty
+
+    pub fn init() {
+        // QEMU's NS16550 starts usable for polled transmit; no line-
+        // control / baud programming needed for this diagnostics path.
+    }
+
+    pub fn write_byte(byte: u8) {
+        // SAFETY: `UART_BASE` is QEMU virt's fixed, documented NS16550
+        // MMIO base; OpenSBI leaves S/U with R/W access to it (PMP
+        // region 07 in the boot log). Poll LSR.THRE before writing THR —
+        // the standard 16550 polled-transmit sequence.
+        unsafe {
+            while core::ptr::read_volatile((UART_BASE + UART_LSR) as *const u8) & LSR_THRE == 0 {
+                core::hint::spin_loop();
+            }
+            core::ptr::write_volatile((UART_BASE + UART_THR) as *mut u8, byte);
+        }
+    }
+}
+
+impl SerialWriter {
+    fn init() {
+        backend::init();
+    }
+}
+
+impl Write for SerialWriter {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        for byte in s.bytes() {
+            backend::write_byte(byte);
+        }
+        Ok(())
+    }
+}
+
+/// The logger `kernel-arch-glue` calls for Root Task / scheduler output.
+fn serial_log(args: core::fmt::Arguments<'_>) {
+    let mut s = SerialWriter;
+    let _ = s.write_fmt(args);
+}
+
+// ----------------------------------------------------------------------------
+// User-space (layer 3) Root Task + the syscall the trap handler routes to.
+//
+// This is the arch-specific bottom of the syscall ABI — `ecall` on RISC-V,
+// analogous instructions on the others — so it lives here in the final
+// binary (which is already `#[cfg(target_arch)]`-gated throughout), not in
+// the architecture-erased `kernel-arch-glue`.
+// ----------------------------------------------------------------------------
+
+/// Syscall selectors (a7 on RISC-V; `rax` on x86_64; `x8` on AArch64).
+/// riscv64, x86_64, and aarch64 all now run a U-mode/EL0 Root Task and
+/// wire a trap handler; most of these opcodes below (everything past
+/// `ALIVE`/`REPORT`) are riscv64-only demo machinery the other two
+/// don't use yet.
+#[cfg(any(
+    target_arch = "riscv64",
+    target_arch = "x86_64",
+    target_arch = "aarch64"
+))]
+mod sys {
+    /// Write `a1` bytes of UTF-8 at address `a0` to the kernel log.
+    pub const DEBUG_LOG: usize = 0;
+    /// Retype one `Endpoint` from the Root Task's first `UntypedMemory`
+    /// capability; returns the new capability slot.
+    pub const RETYPE_ENDPOINT: usize = 1;
+    /// Map one fresh page at `a0` = virtual address. The kernel allocates
+    /// a real physical frame from the Root Task's `UntypedMemory`, walks a
+    /// genuine Sv39 leaf (`R+W+U`) for it into the Root Task's **live**
+    /// page table, records it in the software `AddressSpace` model too,
+    /// and returns the physical address it chose (`usize::MAX` on error).
+    ///
+    /// MVP: still not capability-gated per `02-Microkernel-Layer.md §6`
+    /// (a real `Map` takes a `Frame` + `PageTable` capability); the frame
+    /// is picked by the kernel rather than named by the caller. What is
+    /// now real: the hardware mapping and `satp`.
+    pub const MAP_PAGE: usize = 2;
+    /// Translate `a0` = virtual address through the Root Task's address
+    /// space (software model); returns the physical address, or
+    /// `usize::MAX` if unmapped.
+    pub const TRANSLATE: usize = 3;
+    /// Map a second virtual address `a0` onto the SAME physical frame the
+    /// most recent `MAP_PAGE` returned — an intra-address-space alias, the
+    /// zero-copy shared-memory primitive of `02-Microkernel-Layer.md
+    /// §5.2 / §8.4`. Real Sv39 leaf + model update. Returns 0 /
+    /// `usize::MAX`. `a1` is ignored (the frame is kernel-tracked so a
+    /// bogus physical address cannot be smuggled in).
+    pub const MAP_ALIAS: usize = 4;
+    /// No arguments — the kernel logs a fixed "Root Task alive under
+    /// paging" line. Used by the isolated U-mode entry, which carries no
+    /// string literals of its own.
+    pub const ALIVE: usize = 9;
+    /// `a0` = a value the kernel should echo into the log (used to report
+    /// a `TRANSLATE` result from code that cannot format it itself).
+    pub const REPORT: usize = 10;
+    /// Cross-check a shared frame: `a0` = the physical address `MAP_PAGE`
+    /// returned, `a1` = the value the Root Task read back through the
+    /// alias VA. The kernel reads the SAME physical frame through its own
+    /// identity map and logs whether all three views agree — the
+    /// hardware-level proof behind `02-Microkernel-Layer.md §8.4`
+    /// (zero-copy shared memory).
+    pub const XCHECK: usize = 11;
+
+    // -- Two-process zero-copy proof (02-Microkernel-Layer.md §8.4) --
+    //
+    // Cooperative hand-off between two U-mode threads living in two
+    // MMU-isolated Sv39 address spaces that share exactly one physical
+    // frame (mapped at a different VA in each). The kernel side is
+    // `kernel_arch_glue::{p2_yield, p2_report_a, p2_report_b}`.
+
+    /// No arguments. The calling U-mode thread is suspended (full context
+    /// saved) and the *other* process is resumed in its own address
+    /// space — `TrapOutcome::SwitchTo`. First `P2_YIELD` runs process A
+    /// -> B; the second (from B) runs B -> A.
+    pub const P2_YIELD: usize = 20;
+    /// `a0` = the value process A re-read through its VA of the shared
+    /// frame after process B ran. The kernel logs the final A->B->A
+    /// round-trip verdict.
+    pub const P2_REPORT_A: usize = 21;
+    /// `a0` = the value process B read through its VA of the shared frame
+    /// (which process A wrote before the first hand-off).
+    pub const P2_REPORT_B: usize = 22;
+    /// No arguments. The cooperative §8.4 round-trip is done — the kernel
+    /// arms the supervisor timer so from here the two processes are
+    /// switched by PREEMPTION (02-Microkernel-Layer.md §4), not an
+    /// explicit `P2_YIELD`. Both then run unbounded counting loops.
+    pub const P2_PREEMPT_START: usize = 23;
+
+    /// `device-manager::subsystem_entry`'s state-transition report — the
+    /// first REAL `subsystems/*` crate's own logic running as a spawned
+    /// isolated process, not this demo's own code. Must stay numerically
+    /// equal to `device_manager::subsystem_entry::DM_REPORT` (that
+    /// module's own doc comment says so too — no shared protocol crate
+    /// for this demo-scoped raw ABI number, same as every other opcode
+    /// above). `a0` = `DriverState` discriminant, `a1` =
+    /// `restarts_in_window`.
+    pub const DM_REPORT: usize = 30;
+
+    // Real IPC-driven driver supervision (03-Kernel-Subsystems-Layer.md
+    // §5.2's actual acceptance test): device-manager reacts to a REAL
+    // crash of `umode_faulty_driver`, not its own timer. Kernel side is
+    // `kernel_arch_glue::{p2_watch_driver, p2_dm_wait_crash,
+    // p2_poll_crash}` and `spawn_faulty_driver`'s respawn path.
+
+    /// No arguments. Blocks the calling thread until the driver process
+    /// `kernel_arch_glue::p2_watch_driver` currently names takes a fatal
+    /// exception, or returns immediately if that already happened before
+    /// this call. The caller must follow up with `DM_POLL_CRASH` to
+    /// consume the crash's raw trap value.
+    pub const DM_WAIT_CRASH: usize = 31;
+    /// No arguments. Consumes and returns (via `a0`) the pending crash's
+    /// raw `scause` value recorded by `DM_WAIT_CRASH`'s wake, or `0` if
+    /// none is pending.
+    pub const DM_POLL_CRASH: usize = 32;
+    /// No arguments. Spawns a fresh instance of the faulty-driver demo
+    /// process — the automatic-restart half of §5.2 — and re-arms
+    /// `p2_watch_driver` on its new `ThreadId` (a respawned driver is a
+    /// brand-new thread, not the dead one coming back).
+    pub const DM_RESPAWN_DRIVER: usize = 33;
+
+    // -- Real U-mode Call/Recv/Reply demo (02-Microkernel-Layer.md
+    //    §5.1/§8.2) — unlike EVERY opcode above, these route through the
+    //    REAL `kernel_core::SyscallOp::{Call,Recv,Reply}` IPC surface
+    //    (`kernel_arch_glue::{p2_ipc_demo_start,p2_ipc_call,p2_ipc_recv,
+    //    p2_ipc_reply}`), not ad-hoc kernel-side bookkeeping — the
+    //    concrete thing the still-pending register-only IPC fast path
+    //    (`kernel_ipc::fastpath`'s own doc comment) needs a genuine trap
+    //    boundary to attach to and be verified against. --
+
+    /// No arguments. Creates the demo's shared endpoint and spawns the
+    /// SERVER thread (`umode_ipc_server`), then switches straight to it.
+    /// The value this returns in `a0` once the caller resumes (later,
+    /// after the server's own first `IPC_RECV` switches back) is
+    /// meaningless — follow up with `IPC_ENDPOINT_CAP`.
+    pub const IPC_DEMO_START: usize = 40;
+    /// No arguments. Returns the demo endpoint's capability slot (set by
+    /// `IPC_DEMO_START`) — both the client and the server call this to
+    /// learn it independently; a fresh thread has no other way to learn
+    /// a value computed during someone ELSE's own execution.
+    pub const IPC_ENDPOINT_CAP: usize = 41;
+    /// `a0` = endpoint capability slot, `a1` = request label. A REAL
+    /// `SyscallOp::Call` — always blocks (per that op's own semantics)
+    /// until replied to, then returns the reply label in `a0`.
+    pub const IPC_CALL: usize = 42;
+    /// `a0` = endpoint capability slot. A REAL `SyscallOp::Recv` —
+    /// returns `(from_thread_id, label)` in `(a0, a1)` (needs
+    /// `raw_syscall2`, not the ordinary single-value `raw_syscall`).
+    pub const IPC_RECV: usize = 43;
+    /// `a0` = the `ThreadId` `IPC_RECV` returned as `from`, `a1` = reply
+    /// label. A REAL `SyscallOp::Reply` — always switches away (per that
+    /// op's own semantics); the value in `a0` if this ever DID return
+    /// (an error case only) is meaningless.
+    pub const IPC_REPLY: usize = 44;
+
+    // -- fs-native: the REAL FsRequest/FsResponse wire protocol over the
+    //    REAL Call/Recv/Reply mechanism above (03-Kernel-Subsystems-
+    //    Layer.md §2.2/§5.3) — unlike every opcode above, `.user_text`
+    //    code passes only plain integers here; the real `ipc_protocol`
+    //    encoding/decoding happens kernel-side, in `kernel_arch_glue`
+    //    (see its own module-level doc comment on why calling
+    //    `ipc_protocol::codec` directly from `.user_text` would be
+    //    unsafe). --
+
+    /// No arguments. Spawns fs-native as a genuinely isolated process
+    /// (its own address + capability space, own separately-built ELF —
+    /// unlike the demo IPC server's `IPC_DEMO_START`, which shares the
+    /// caller's own spaces) and grants it a capability to a fresh
+    /// endpoint. Returns the endpoint's capability slot IN THE CALLER's
+    /// own capability space (fs-native's own copy always lands at slot
+    /// 0 in ITS space — see `kernel_arch_glue::grant_cap_into`'s own
+    /// doc comment for why that is deterministic, so fs-native needs no
+    /// equivalent of `IPC_ENDPOINT_CAP` to discover it).
+    pub const FS_DEMO_START: usize = 45;
+    /// `a0` = a registered `PathId` (this MVP demo only ever registers
+    /// `PathId(0)` = `/greeting`, pre-seeded by fs-native at boot),
+    /// `a1` = `ipc_protocol::fs::OpenFlags` bits. Builds a REAL
+    /// `FsRequest::Open`, marshals it through the shared fs page, and
+    /// issues a REAL `Call` — always blocks until fs-native replies.
+    pub const FS_OPEN: usize = 46;
+    /// No arguments. Reads back the REAL `FsResponse` fs-native's
+    /// `Reply` just wrote into the shared fs page (call this AFTER
+    /// `FS_OPEN` returns, i.e. after being woken by the reply). Returns
+    /// the new handle in `a0`, or `usize::MAX` on any error.
+    pub const FS_OPEN_RESULT: usize = 47;
+    /// `a0` = a registered `PathId`. Builds a REAL `FsRequest::Stat`.
+    pub const FS_STAT: usize = 48;
+    /// No arguments. Returns the file's REAL size in `a0`, or
+    /// `usize::MAX` on any error.
+    pub const FS_STAT_RESULT: usize = 49;
+    /// `a0` = a handle `FS_OPEN_RESULT` returned. Builds a REAL
+    /// `FsRequest::Close`.
+    pub const FS_CLOSE: usize = 50;
+    /// No arguments. Returns `1` in `a0` for a real `Closed`, `0`
+    /// otherwise.
+    pub const FS_CLOSE_RESULT: usize = 51;
+    /// `a0` = a handle `FS_OPEN_RESULT` returned. Writes a fixed MVP test
+    /// payload (`kernel_arch_glue::FS_DEMO_WRITE_DATA`) into the shared
+    /// data region, then builds a REAL `FsRequest::Write` at offset 0.
+    pub const FS_WRITE: usize = 52;
+    /// No arguments. Returns the REAL byte count written in `a0`, or
+    /// `usize::MAX` on any error.
+    pub const FS_WRITE_RESULT: usize = 53;
+    /// `a0` = a handle, `a1` = length to read. Builds a REAL
+    /// `FsRequest::Read` at offset 0.
+    pub const FS_READ: usize = 54;
+    /// No arguments. Returns the REAL byte count read in `a0` (and logs
+    /// a MATCH/MISMATCH verdict against the `FS_WRITE` payload — see
+    /// `kernel_arch_glue::fs_read_result`'s own doc comment), or
+    /// `usize::MAX` on any error.
+    pub const FS_READ_RESULT: usize = 55;
+
+    /// No arguments. Spawns the virtio-blk driver process
+    /// (`kernel_arch_glue::spawn_virtio_blk_driver`) and returns its
+    /// endpoint capability slot in `a0`, or `usize::MAX` if no
+    /// `Block`-kind peripheral was discovered at boot (mirrors
+    /// `FS_DEMO_START`'s own return convention).
+    pub const DRV_BLK_DEMO_START: usize = 56;
+    /// `a0` = the endpoint slot `DRV_BLK_DEMO_START` returned. Builds a
+    /// REAL `DriverRequest::Probe`.
+    pub const DRV_BLK_PROBE: usize = 57;
+    /// No arguments. Returns the REAL sector size in `a0` (`u32::MAX` on
+    /// error) — `kernel_arch_glue::drv_blk_probe_result`'s own `(u32,
+    /// u64)` sector-count half is not surfaced via this raw ecall ABI
+    /// (2 registers), only reported in the boot log by the demo driver
+    /// itself if ever needed.
+    pub const DRV_BLK_PROBE_RESULT: usize = 58;
+    /// `a0` = the endpoint slot. Builds a REAL `DriverRequest::
+    /// WriteBlocks` for one sector at lba 0.
+    pub const DRV_BLK_WRITE: usize = 59;
+    /// No arguments. Returns the REAL sector count written in `a0`, or
+    /// `usize::MAX` on any error.
+    pub const DRV_BLK_WRITE_RESULT: usize = 60;
+    /// `a0` = the endpoint slot. Builds a REAL `DriverRequest::
+    /// ReadBlocks` for one sector at lba 0.
+    pub const DRV_BLK_READ: usize = 61;
+    /// No arguments. Returns the REAL sector count read in `a0` (and
+    /// logs a MATCH/MISMATCH verdict against the `DRV_BLK_WRITE`
+    /// payload — see `kernel_arch_glue::drv_blk_read_result`'s own doc
+    /// comment), or `usize::MAX` on any error.
+    pub const DRV_BLK_READ_RESULT: usize = 62;
+
+    /// `a0` = the `Notification` capability slot the calling process's
+    /// own `IrqBind` grant bound to its device's IRQ line. Issues one
+    /// REAL `SyscallOp::Wait` and reports whatever bits are (or become)
+    /// pending in `a0` — riscv64 only for now
+    /// (`driver_virtio_blk::subsystem_entry::wait_for_irq`, the
+    /// virtio-blk driver process's own real interrupt-driven completion
+    /// wait, 03-Kernel-Subsystems-Layer.md §2.1/§5.1). If nothing is
+    /// pending yet, this genuinely idles the core (`hal_riscv64::cpu::
+    /// wfi`) rather than busy-polling — see this opcode's own riscv64
+    /// dispatch arm.
+    pub const DRV_IRQ_WAIT: usize = 63;
+
+    /// No arguments. Spawns the virtio-net driver process
+    /// (`kernel_arch_glue::spawn_virtio_net_driver`) and returns its
+    /// endpoint capability slot in `a0`, or `usize::MAX` if no
+    /// `Network`-kind peripheral was discovered at boot — unchanged
+    /// behavior from before Session 22's own Netstack extraction
+    /// (`kernel_arch_glue::spawn_virtio_net_driver`'s own doc comment).
+    /// A SEPARATE opcode from `NET_DEMO_START` below (not chained into
+    /// one): `spawn_virtio_net_driver`'s own "switch straight to the
+    /// driver" tail is what lets the driver reach its own first `Recv`
+    /// BEFORE anyone ever `Call`s it (`spawn_virtio_blk_driver`'s own
+    /// doc comment on why that ordering matters) — that switch is a
+    /// real trap return, so `NET_DEMO_START`'s own `spawn_netstack_
+    /// service` call (which needs the driver ALREADY sitting in `Recv`,
+    /// so Netstack's own first `IPC_CALL` can take the fast path) can
+    /// only safely run in a LATER, separate ecall, once the caller has
+    /// actually been resumed again.
+    pub const DRV_NET_DEMO_START: usize = 64;
+    /// `a0` = the endpoint slot `DRV_NET_DEMO_START` returned. Spawns
+    /// the real Netstack process (`kernel_arch_glue::spawn_netstack_
+    /// service`), granting it a derived copy of that endpoint — it
+    /// immediately starts driving the driver over real IPC (`sys::
+    /// IPC_CALL`) to run the ARP-resolve/ICMP-echo MVP demo autonomously
+    /// (03-Kernel-Subsystems-Layer.md §2.3/§5.4). Returns `0` on
+    /// success, `usize::MAX` on any spawn failure — the caller should
+    /// skip the `NET_STATUS_POLL` loop below in that case.
+    pub const NET_DEMO_START: usize = 65;
+    /// No arguments. Reads the Netstack process's own status region
+    /// directly (`kernel_arch_glue::netstack_status`'s own doc comment)
+    /// — `0` while it is still running (keep polling), `1` once ARP
+    /// failed, `2` once ARP resolved but the ping failed/mismatched, `3`
+    /// on full success (logs the verdict either way, once, on the FIRST
+    /// call that observes a non-zero value — the caller's own retry loop
+    /// must stop polling once it sees one, not call this again
+    /// afterward).
+    pub const NET_STATUS_POLL: usize = 66;
+
+    // -- Compositor: the REAL DisplayRequest/DisplayResponse wire
+    //    protocol over the REAL Call/Recv/Reply mechanism above
+    //    (03-Kernel-Subsystems-Layer.md §2.4/§5.4.2) — same "`.user_text`
+    //    passes only plain integers, the real `ipc_protocol` encoding
+    //    happens kernel-side" shape as fs-native's own block above; a
+    //    real IPC SERVER (like fs-native), not a client (unlike
+    //    Netstack). --
+
+    /// No arguments. Spawns Compositor as a genuinely isolated process
+    /// (own address + capability space, own separately-built ELF) and
+    /// grants it an Endpoint plus the frame-buffer/confirm regions
+    /// (`kernel_arch_glue::compositor_demo_start`'s own doc comment).
+    /// Returns the endpoint's capability slot in the CALLER's own
+    /// capability space, or `usize::MAX` on any spawn failure.
+    pub const COMPOSITOR_DEMO_START: usize = 67;
+    /// `a0` = the endpoint slot `COMPOSITOR_DEMO_START` returned. Builds
+    /// a REAL `DisplayRequest::CreateSurface` — always blocks until
+    /// Compositor replies.
+    pub const COMPOSITOR_CREATE_SURFACE: usize = 68;
+    /// No arguments. Returns the REAL new surface handle in `a0`, or
+    /// `usize::MAX` on any error.
+    pub const COMPOSITOR_CREATE_SURFACE_RESULT: usize = 69;
+    /// `a0` = a surface handle `COMPOSITOR_CREATE_SURFACE_RESULT`
+    /// returned. Writes a fixed MVP test frame (`kernel_arch_glue::
+    /// COMPOSITOR_DEMO_FRAME`, a 2x2 packed-BGRA8 sentinel) into the
+    /// shared frame buffer, then builds a REAL `DisplayRequest::
+    /// CommitBuffer` naming it.
+    pub const COMPOSITOR_COMMIT_BUFFER: usize = 70;
+    /// No arguments. Returns `1` in `a0` for a real `Committed` AND a
+    /// byte-for-byte confirm-region match proving Compositor genuinely
+    /// dereferenced the shared frame buffer (zero-copy — see `kernel_
+    /// arch_glue::compositor_commit_verify`'s own doc comment), `0`
+    /// otherwise (logs the exact verdict either way).
+    pub const COMPOSITOR_COMMIT_VERIFY: usize = 71;
+    /// `a0` = a surface handle. Builds a REAL `DisplayRequest::
+    /// DestroySurface`.
+    pub const COMPOSITOR_DESTROY_SURFACE: usize = 72;
+    /// No arguments. Returns `1` in `a0` for a real `Destroyed`, `0`
+    /// otherwise.
+    pub const COMPOSITOR_DESTROY_RESULT: usize = 73;
+
+    // -- mm-service: the REAL MmRequest/MmResponse wire protocol over
+    //    the REAL Call/Recv/Reply mechanism above (03-Kernel-Subsystems-
+    //    Layer.md §2.5) — a real IPC SERVER (like fs-native/Compositor).
+
+    /// No arguments. Spawns mm-service as a genuinely isolated process
+    /// (own address + capability space, own separately-built ELF) and
+    /// grants it an Endpoint plus the shared message page (`kernel_arch_
+    /// glue::mm_demo_start`'s own doc comment). Returns the endpoint's
+    /// capability slot in the CALLER's own capability space, or
+    /// `usize::MAX` on any spawn failure.
+    pub const MM_DEMO_START: usize = 74;
+    /// `a0` = `0` or `1` selecting `kernel_arch_glue::MM_DEMO_PROCS[a0]`
+    /// (a fixed MVP demo process — see that constant's own doc comment).
+    /// Builds a REAL `MmRequest::Register` — always blocks until
+    /// mm-service replies.
+    pub const MM_REGISTER: usize = 75;
+    /// No arguments. Returns `1` in `a0` for a real `Registered`, `0`
+    /// otherwise.
+    pub const MM_REGISTER_RESULT: usize = 76;
+    /// `a0` = a thread id (`100` or `200` — `kernel_arch_glue::MM_DEMO_
+    /// PROCS`' own thread ids). Builds a REAL `MmRequest::Unregister`.
+    pub const MM_UNREGISTER: usize = 77;
+    /// No arguments. Returns `1` in `a0` for a real `Unregistered`, `0`
+    /// otherwise.
+    pub const MM_UNREGISTER_RESULT: usize = 78;
+    /// No arguments. Builds a REAL `MmRequest::QueryVictim`.
+    pub const MM_QUERY_VICTIM: usize = 79;
+    /// No arguments. Returns the REAL OOM victim's thread id in `a0`
+    /// (and logs a MATCH/MISMATCH verdict against `kernel_arch_glue::
+    /// MM_DEMO_EXPECTED_VICTIM` — see `kernel_arch_glue::mm_query_
+    /// victim_result`'s own doc comment), or `usize::MAX` on any error.
+    pub const MM_QUERY_VICTIM_RESULT: usize = 80;
+    /// No arguments. Builds a REAL `MmRequest::QueryTotalResident`.
+    pub const MM_QUERY_TOTAL_RESIDENT: usize = 81;
+    /// No arguments. Returns the REAL total resident byte count in `a0`
+    /// (and logs a MATCH/MISMATCH verdict against `kernel_arch_glue::
+    /// MM_DEMO_EXPECTED_TOTAL`), or `usize::MAX` on any error.
+    pub const MM_QUERY_TOTAL_RESIDENT_RESULT: usize = 82;
+
+    // -- kernel-bypass networking: the REAL NetBypassRequest/
+    //    NetBypassResponse control-plane handshake (03-Kernel-Subsystems-
+    //    Layer.md §2.3/§5.4.1) over Netstack's own `BYPASS_ENDPOINT_CAP`
+    //    server loop, followed by a data-path SEND that goes directly
+    //    from kernel mode to the driver's own already-live TX queue, with
+    //    NO further IPC and NO driver-process involvement at all.
+
+    /// No arguments. Builds a REAL `NetBypassRequest::RequestDirectNic`
+    /// and calls Netstack's own `BYPASS_ENDPOINT_CAP` (`kernel_arch_glue::
+    /// net_bypass_request_call`'s own doc comment on why this needs no
+    /// per-arch endpoint global, unlike `MM_REGISTER`'s own `G_MM_EP_*`).
+    pub const NET_BYPASS_REQUEST: usize = 83;
+    /// No arguments. Returns `1` in `a0` for a real `Granted`, `0`
+    /// otherwise.
+    pub const NET_BYPASS_REQUEST_RESULT: usize = 84;
+    /// No arguments. Directly publishes one descriptor onto the driver's
+    /// own already-probed TX queue and rings its doorbell from KERNEL
+    /// mode (`kernel_arch_glue::net_bypass_direct_send`'s own doc
+    /// comment) — the data-path leg of §5.4.1, bypassing both the driver
+    /// process AND any further IPC. Returns the elapsed nanoseconds in
+    /// `a0`, or `usize::MAX` on failure/timeout.
+    pub const NET_BYPASS_SEND: usize = 85;
+
+    /// No arguments. Returns `hal.now_ns()` in `a0` - a plain timestamp
+    /// read, no kernel state touched. Exists so `.user_text` benchmark
+    /// loops (`mm_bench_*`, 02-Microkernel-Layer.md §8.3) can bracket a
+    /// REAL cross-process `SwitchToFast` round trip (e.g. `MM_QUERY_
+    /// TOTAL_RESIDENT`/`_RESULT`) with timestamps from the SAME clock
+    /// the kernel's own `now_ns()`-based benchmarks already use, without
+    /// needing an in-kernel timing loop the way the existing §8.3
+    /// harness (`bench_thread_main`) does - that one measures a
+    /// DIFFERENT thing (in-kernel cooperative `yield_to`, not a real
+    /// U-mode `SwitchToFast` restore).
+    pub const NOW_NS: usize = 86;
+
+    /// No arguments. Same real round trip as `MM_QUERY_TOTAL_RESIDENT`/
+    /// `_RESULT`, but the RESULT half skips the MATCH/MISMATCH `klog!`
+    /// (`kernel_arch_glue::mm_query_total_resident_result_quiet`'s own
+    /// doc comment) - used by `mm_bench_*`'s own 200-iteration §8.3
+    /// timing loop so it doesn't spam 200 near-identical log lines.
+    /// Issue `MM_QUERY_TOTAL_RESIDENT` itself as usual to trigger the
+    /// real `Call`; only the result read differs.
+    pub const MM_QUERY_TOTAL_RESIDENT_RESULT_QUIET: usize = 87;
+
+    // -- kernel-bypass §5.4.1 latency comparison: the "standard path"
+    //    counterpart to `NET_BYPASS_SEND`, so the ">=30-40% faster" claim
+    //    has something real to compare against instead of being asserted.
+
+    /// No arguments. Builds a REAL `NetBypassRequest::RelayFrame` and
+    /// calls Netstack's own `BYPASS_ENDPOINT_CAP` (`kernel_arch_glue::
+    /// net_standard_send_call`'s own doc comment) - Netstack itself then
+    /// makes a SECOND real IPC round trip to the driver and waits for
+    /// the real hardware TX completion before replying.
+    pub const NET_STANDARD_SEND_REQUEST: usize = 88;
+    /// No arguments. Returns `1` in `a0` for a real `Relayed`, `0`
+    /// otherwise.
+    pub const NET_STANDARD_SEND_REQUEST_RESULT: usize = 89;
+    /// `a0` = bypass path average latency (ns), `a1` = standard path
+    /// average latency (ns) — both computed in `.user_text` from several
+    /// real samples each. Logs one honest verdict line comparing them
+    /// (`kernel_arch_glue::net_latency_summary`'s own doc comment).
+    pub const NET_LATENCY_SUMMARY: usize = 90;
+
+    // -- VFS throughput benchmark (03-Kernel-Subsystems-Layer.md §5,
+    //    item 5: "VFS read/write throughput relative to a reference
+    //    system... reported"). `.user_text` loops `FS_WRITE`/`FS_WRITE_
+    //    RESULT` (then `FS_READ`/`FS_READ_RESULT`) many times, bracketing
+    //    each phase with `NOW_NS`, then reports the phase totals here.
+
+    /// `a0` = total bytes written, `a1` = total elapsed ns, both summed
+    /// across a `.user_text` write-throughput loop. Logs one MB/s line
+    /// (`kernel_arch_glue::fs_write_throughput_summary`'s own doc comment).
+    pub const FS_WRITE_THROUGHPUT_SUMMARY: usize = 91;
+    /// Same shape as `FS_WRITE_THROUGHPUT_SUMMARY`, for the read phase.
+    pub const FS_READ_THROUGHPUT_SUMMARY: usize = 92;
+    /// Same real round trip as `FS_READ`/`FS_READ_RESULT`, but skips the
+    /// MATCH/MISMATCH `klog!` (`kernel_arch_glue::fs_read_result_quiet`'s
+    /// own doc comment) — used by the read-throughput loop so it doesn't
+    /// spam one near-identical log line per iteration (same reason
+    /// `MM_QUERY_TOTAL_RESIDENT_RESULT_QUIET` exists). Issue `FS_READ`
+    /// itself as usual to trigger the real `Call`; only the result read
+    /// differs.
+    pub const FS_READ_RESULT_QUIET: usize = 93;
+
+    // -- CAP_GRANT/CAP_REVOKE: the REAL, generic `SyscallOp::CapGrant`/
+    //    `CapRevoke` syscalls, exposed to ANY U-mode process for the
+    //    first time (Issue #28's security-broker-intermediary boundary,
+    //    `ipc-protocol/src/security.rs`) — unlike every opcode above,
+    //    these are not routed through one demo-specific glue function;
+    //    they go straight to `kernel_core::syscall`'s own dispatch, the
+    //    same real mechanism `kernel_arch_glue::grant_cap_into`'s doc
+    //    comment already describes as "the real, capability-gated"
+    //    path — see `kernel_arch_glue::cap_grant`/`cap_revoke`'s own doc
+    //    comments for the full rationale. --
+
+    /// `a0` = `target_thread` capability slot (a `ThreadControlBlock`
+    /// capability the CALLER already holds, in ITS OWN cap space — see
+    /// `kernel_core::syscall::do_cap_grant`'s own doc comment; there is
+    /// no "master grant" shortcut). `a1` = `cap` (low 32 bits — the
+    /// capability slot to copy, also in the caller's own space) packed
+    /// with `rights` (bits 32-37, `CapabilityRights::bits()`) in the SAME
+    /// word — chosen over a 3rd register argument so this reuses the
+    /// existing 2-argument `raw_syscall`/dispatcher ABI unchanged, rather
+    /// than needing new per-architecture trap-entry plumbing. Returns the
+    /// new capability's slot number in the DESTINATION's own cap space,
+    /// or `usize::MAX` on any failure (bad `target_thread`/`cap`, missing
+    /// `GRANT` right, or a rights escalation — `kernel_core::syscall::
+    /// SyscallError` is not distinguished on this wire, same "usize::MAX
+    /// means failure, check the kernel log for why" convention as
+    /// `DRV_BLK_DEMO_START` etc.).
+    pub const CAP_GRANT: usize = 94;
+    /// `a0` = `cap` (the capability, in the caller's own space, to revoke
+    /// — subtree root). A REAL `SyscallOp::CapRevoke`. Returns the number
+    /// of slots freed (across every capability space the kernel's
+    /// `CapRevoke` reached), or `usize::MAX` on failure (bad `cap`, or
+    /// missing `REVOKE` right).
+    pub const CAP_REVOKE: usize = 95;
+
+    // -- security-broker-intermediary: the REAL `SecurityRequest`/
+    //    `SecurityResponse` wire protocol over the REAL Call/Recv/Reply
+    //    mechanism above (Issue #28) — same "plain integers here, real
+    //    `ipc_protocol` encoding happens kernel-side" shape the fs-native
+    //    block above already established. --
+
+    /// No arguments (`security_broker_tid` is threaded in kernel-side —
+    /// `spawn_security_broker_intermediary` already knows it). Spawns
+    /// `security-broker-intermediary` as a genuinely isolated process,
+    /// grants it its own Endpoint (slot 0), a fresh TCB capability for
+    /// the already-spawned `security-broker` process (slot 1), and one
+    /// demo resource capability (slot 2) — see `kernel_arch_glue::
+    /// security_broker_intermediary_demo_start`'s own doc comment for the
+    /// full rationale on each slot. Follow up with `SBI_ENDPOINT_CAP`.
+    pub const SBI_DEMO_START: usize = 96;
+    /// No arguments. Returns the intermediary demo endpoint's capability
+    /// slot (set by `SBI_DEMO_START`) — same role as `IPC_ENDPOINT_CAP`.
+    pub const SBI_ENDPOINT_CAP: usize = 97;
+    /// `a0` = endpoint capability slot (from `SBI_ENDPOINT_CAP`), `a1` =
+    /// `target_service` (`kernel_arch_glue::SBI_TARGET_SECURITY_BROKER`
+    /// for the one target this demo wires up). Builds and sends a REAL
+    /// `SecurityRequest::CapGrant { target_service, cap: 2, rights:
+    /// READ|WRITE }` (`cap`/`rights` are fixed for this demo — see
+    /// `sbi_cap_grant_call`'s own doc comment). Follow up with
+    /// `SBI_CAP_GRANT_RESULT`.
+    pub const SBI_CAP_GRANT: usize = 98;
+    /// No arguments. Returns the new capability's slot number in
+    /// security-broker's OWN capability space (proof that a REAL
+    /// capability now exists there, minted end to end through the
+    /// intermediary — the entire point of Issue #28), or `usize::MAX` on
+    /// failure/`Error`.
+    pub const SBI_CAP_GRANT_RESULT: usize = 99;
+    /// `a0` = endpoint capability slot (from `SBI_ENDPOINT_CAP`). Builds
+    /// and sends a REAL `SecurityRequest::CapRevoke { cap: 2 }` — the SAME
+    /// resource `SBI_CAP_GRANT`'s own demo just granted a derived copy of
+    /// into security-broker's cap space, so a successful revoke here MUST
+    /// free capabilities in TWO capability spaces at once (the
+    /// intermediary's own slot 2, AND security-broker's derived copy),
+    /// proving the real kernel `revoke_cross_space` walk — not just a
+    /// single-table delete — actually ran (`kernel_core::syscall::
+    /// SyscallOp::CapRevoke`'s own doc comment). Follow up with
+    /// `SBI_CAP_REVOKE_RESULT`.
+    pub const SBI_CAP_REVOKE: usize = 100;
+    /// No arguments. Returns the number of capability-table slots freed
+    /// (expected: 2 — see `SBI_CAP_REVOKE`'s own doc comment), or
+    /// `usize::MAX` on failure/`Error`.
+    pub const SBI_CAP_REVOKE_RESULT: usize = 101;
+
+    // -- Second target_service demo (mm-service, `kernel_arch_glue::
+    //    SBI_TARGET_MM_SERVICE` = 1) — proves `target_service` resolution
+    //    generalizes beyond the one hardcoded `SBI_CAP_GRANT` case above.
+    //    Same shape as `SBI_CAP_GRANT`/`SBI_CAP_REVOKE`, `cap: 5` instead
+    //    of `cap: 2` (`security_broker_intermediary_demo_start`'s own
+    //    slot 3/4 doc comment). No new `kernel_arch_glue` functions were
+    //    needed for this — `sbi_cap_grant_call`/`sbi_cap_revoke_call`
+    //    already take `target_service`/`cap` as plain arguments. --
+
+    /// `a0` = endpoint capability slot (from `SBI_ENDPOINT_CAP`), `a1` =
+    /// `target_service` (`kernel_arch_glue::SBI_TARGET_MM_SERVICE` for
+    /// this demo). Sends a REAL `SecurityRequest::CapGrant { target_service,
+    /// cap: 5, rights: READ|WRITE }`. Follow up with
+    /// `SBI_CAP_GRANT2_RESULT`. A no-op (returns `usize::MAX` immediately)
+    /// if mm-service was never spawned — see `security_broker_
+    /// intermediary_demo_start`'s own doc comment.
+    pub const SBI_CAP_GRANT2: usize = 102;
+    /// No arguments. Returns the new capability's slot number in
+    /// mm-service's OWN capability space, or `usize::MAX` on failure.
+    pub const SBI_CAP_GRANT2_RESULT: usize = 103;
+    /// `a0` = endpoint capability slot. Sends a REAL `SecurityRequest::
+    /// CapRevoke { cap: 5 }`. Follow up with `SBI_CAP_REVOKE2_RESULT`.
+    pub const SBI_CAP_REVOKE2: usize = 104;
+    /// No arguments. Returns the number of capability-table slots freed
+    /// (expected: 2, same cross-space reasoning as `SBI_CAP_REVOKE_
+    /// RESULT`), or `usize::MAX` on failure.
+    pub const SBI_CAP_REVOKE2_RESULT: usize = 105;
+    /// `a0` = 1 iff `request_capability`'s real round trip to security-
+    /// broker returned `Ok`, 0 otherwise; `a1` = the granted
+    /// `Capability.object_ref`'s raw bits when `a0 == 1` (0 otherwise).
+    /// Mirrors `DM_REPORT`'s own "U-mode process reports state, kernel
+    /// logs it" shape (`native-loader`, this session's real-IPC plan
+    /// Phase 1) — this project's ONE lever for a genuinely isolated
+    /// U-mode process (not Root Task) to prove a real round-tripped VALUE
+    /// on the serial log, not just "didn't crash".
+    pub const NL_REPORT: usize = 106;
+    /// `a0` = the decoded request's `requester` id; `a1` = 1 iff security-
+    /// broker's own real [`Broker::request_capability`] granted it, 0
+    /// otherwise. Server-side counterpart of `NL_REPORT` — see that
+    /// constant's own doc comment for why a U-mode process needs this
+    /// kind of opcode at all to prove a real value, not just survival.
+    pub const SB_REPORT: usize = 107;
+    /// `a0` = endpoint capability slot. `SyscallOp::Recv`, WITHOUT
+    /// `p2_ipc_recv`'s own hardcoded `root_thread` fallback — see
+    /// `kernel_arch_glue::p2_ipc_recv_general`'s own doc comment for the
+    /// real bug this exists to route around (real-IPC plan, Phase 1:
+    /// `security-broker`'s new `request_capability` service loop). A
+    /// SEPARATE opcode from `IPC_RECV`, not a change to it, so `fs-
+    /// native`/`compositor`/`mm-service`/the original demo keep their own
+    /// already-proven, unchanged behavior.
+    pub const SBS_IPC_RECV: usize = 108;
+    /// `a0` = notification capability slot. `SyscallOp::Wait`, performing
+    /// a REAL context switch when it blocks (unlike the single-purpose
+    /// `DRV_IRQ_WAIT`, which busy-idles instead — see `kernel_arch_glue::
+    /// p2_wait_general`'s own doc comment for why that shortcut is wrong
+    /// here). Returns the pending bit-set in `a0` once it becomes
+    /// non-zero (real-IPC plan, Phase 2: `security-broker`'s own fan-in
+    /// across several dedicated per-client `Endpoint`s).
+    pub const NOTIF_WAIT: usize = 109;
+    /// `a0` = notification capability slot, `a1` = bits to OR in.
+    /// `SyscallOp::Signal` — never blocks the caller (see `kernel_arch_
+    /// glue::p2_signal`'s own doc comment). The client-side half of
+    /// `NOTIF_WAIT`'s own fan-in.
+    pub const NOTIF_SIGNAL: usize = 110;
+    /// `a0` = how many of `simurgh-store`'s own self-check packages
+    /// passed BOTH the security-broker signature check and profile-
+    /// policy's own compatibility check; `a1` = how many were attempted.
+    /// Same "prove a real value, not just survival" reasoning `NL_REPORT`/
+    /// `SB_REPORT`'s own doc comments give — real-IPC plan's newest edge
+    /// (`store` <-> `profile-policy`) has no other on-hardware evidence
+    /// its own real IPC round trips actually SUCCEEDED, not just "did not
+    /// crash".
+    pub const ST_REPORT: usize = 111;
+    /// `a0` = the decoded request's `from` tid; `a1` = 1 iff `simurgh-
+    /// profile-policy`'s own real `Manager::is_compatible_with_active`
+    /// granted it, 0 otherwise. Server-side counterpart of `ST_REPORT`,
+    /// same reasoning — this edge's own server side had no on-hardware
+    /// evidence of its own that it was ever really entered/serving at
+    /// all, which mattered during this edge's own real-IPC-plan
+    /// root-cause hunt and stays valuable observability going forward.
+    pub const PP_REPORT: usize = 112;
+    /// `a0` = the decoded request's `from` tid; `a1` = unused (`0`).
+    /// Server-side counterpart of the real-IPC plan's `simurgh-backup-
+    /// manager` <-> `simurgh-account-manager` edge — same "prove a real
+    /// value, not just survival" reasoning `ST_REPORT`/`PP_REPORT`'s own
+    /// doc comments give.
+    pub const AM_REPORT: usize = 113;
+    /// `a0` = the decoded request's `from` tid; `a1` = 1 iff `simurgh-
+    /// store`'s own real reinstall check accepted every requested package
+    /// (every name matched its own fixed `KNOWN_PACKAGES` catalog), 0
+    /// otherwise. Server-side counterpart of the real-IPC plan's `simurgh-
+    /// backup-manager` <-> `simurgh-store` edge.
+    pub const STR_REPORT: usize = 114;
+    /// `a0` = the crash-report batch size just (simulated-)sent; `a1` =
+    /// the simulated HTTP status code (`200`). `simurgh-diagnostics`'s own
+    /// `ReportSender` has no real network path yet (no TCP/IP stack
+    /// reachable from a bare-metal Simurgh-OS user process) — Omid's own
+    /// 2026-09-10 direction: point it at a local placeholder
+    /// (`http://localhost:1366`) and simulate the round trip (a real
+    /// ~3-second delay via `NOW_NS`, then a simulated 200) until a real
+    /// backend and HTTP/TCP path exist. Same "prove a real value, not
+    /// just survival" reasoning `ST_REPORT`/`PP_REPORT`/`AM_REPORT`/
+    /// `STR_REPORT`'s own doc comments give — this process has no server
+    /// peer to report FROM, so this is its own client-side proof instead.
+    pub const DG_REPORT: usize = 115;
+    /// `a0` = a [`KnownElfId`]-numbered value (0..=15, matching `simurgh-
+    /// init::init-core::wire::KnownElfId`'s own numeric layout exactly —
+    /// `DeviceManager`=0 .. `PolicyEngine`=15). Returns the newly spawned
+    /// process's own raw `ThreadId` (as `a0` on success), or `usize::MAX`
+    /// on denial/failure (unknown `elf_id`, a target outside the v1
+    /// allow-list, or `spawn_process_from_elf` itself failing).
+    ///
+    /// [`KnownElfId`]: (mirrored, not a real type here — see `simurgh-
+    /// init::init-core::wire`)
+    ///
+    /// This is `simurgh-init`'s own real process-launch mechanism (Omid's
+    /// 2026-09-10 approval to implement the session's own earlier-scoped
+    /// design) — the first syscall in this project that lets a genuinely
+    /// unprivileged U-mode process (not Root Task) trigger spawning a new
+    /// process. Deliberately SIMPLER than `simurgh-init::init-core::
+    /// wire::SpawnKnownElfRequest`'s own provisional 5-field shape (which
+    /// assumed a caller-supplied `Untyped`/pre-`Retype`d `CapSpace`/
+    /// `AddrSpace`, mirroring a fuller seL4-style capability-delegation
+    /// model): this v1 takes only `elf_id`, and the kernel carves its own
+    /// untyped memory internally via the SAME `kernel_arch_glue::
+    /// spawn_process_from_elf` helper every boot-time spawn already uses
+    /// (`carve_from_any_untyped`, not a caller-owned `Untyped` capability).
+    /// The security boundary is a plain caller-tid check (only `simurgh-
+    /// init`'s own recorded tid, `kernel_arch_glue::init_tid()`, may call
+    /// this successfully) rather than a capability grant — TODO(spec):
+    /// the fuller Untyped-Retype-based delegation model the client-side
+    /// wire format still documents remains a real, larger follow-up (a
+    /// generalized `Retype` reachable by non-root callers, plus per-
+    /// process `Untyped` ownership tracking), deliberately deferred here
+    /// to land a genuinely working v1 without also taking on that
+    /// additional capability-security-model risk in one pass.
+    ///
+    /// Allow-list (v1 scope): only `SecurityBroker`(7), `Init`(9),
+    /// `AccountManager`(10), `BackupManager`(11), `DiagnosticsManager`(12),
+    /// `Store`(13), `NativeLoader`(14), `PolicyEngine`(15) — the layer-4/
+    /// already-proven-standalone subsystems this session's own real-IPC
+    /// work already spawns once at boot with no hardware/IRQ ownership or
+    /// boot-order singleton dependency. `DeviceManager`(0), `FsNative`(1),
+    /// `DriverVirtioBlk`(2), `DriverVirtioNet`(3), `Netstack`(4),
+    /// `Compositor`(5), `MmService`(6), `SecurityBrokerIntermediary`(8)
+    /// are core kernel-subsystems-layer singletons with real hardware/IRQ
+    /// ownership or intricate boot-order dependencies — spawning a SECOND
+    /// instance of any of those is explicit future work, not yet safe to
+    /// allow blindly.
+    pub const SPAWN_KNOWN_ELF: usize = 116;
+    /// No arguments. Returns the next waiting real UART byte in `a0`, or
+    /// `usize::MAX` if nothing is waiting — never blocks (`backend::
+    /// try_read_byte`'s own doc comment). `simurgh-shell`'s own real
+    /// input path (Omid's own 2026-09-10 direction, alongside `SPAWN_
+    /// KNOWN_ELF`'s own extension to accept this repo as a second real
+    /// caller): the first syscall in this project that lets a U-mode
+    /// process read real, host-typed keystrokes rather than only ever
+    /// producing output.
+    pub const SERIAL_TRY_READ: usize = 117;
+    /// `a0` = byte count (capped at 4096, one page). Writes those bytes,
+    /// read from the CALLING process's own dedicated shared page (mapped
+    /// at boot by `kernel_arch_glue::wire_debug_print_page`, one page per
+    /// caller — currently only `simurgh-shell`, at `spawn_shell_x86`'s
+    /// own fixed VA), to the real serial console via `kernel_arch_glue::
+    /// log`, lossily as UTF-8. Deliberately NOT `sys::DEBUG_LOG`'s own
+    /// shape (`a0` as a raw, directly-dereferenced pointer): that opcode
+    /// predates real per-process page tables and is only safe for the
+    /// single-address-space MVP demo phase that still uses it — a
+    /// genuinely isolated Sv39/4-level-paged process's own `a0` would not
+    /// name the right physical bytes there. Reading from a caller's own
+    /// FIXED, already-mapped shared page instead is the SAME safe
+    /// pattern every real-IPC edge in this project already uses to move
+    /// bytes across an address-space boundary.
+    pub const SERIAL_PRINT: usize = 118;
+    /// `a0` = the `UserId` a real scheduled backup was just attempted
+    /// for; `a1` = 1 iff `simurgh-backup-manager`'s own real `Manager::
+    /// run_due_backups` trigger succeeded, 0 otherwise. Same "prove a
+    /// real value, not just survival" reasoning `ST_REPORT`/`PP_REPORT`/
+    /// `AM_REPORT`/`STR_REPORT`/`DG_REPORT`'s own doc comments give —
+    /// this process has no server peer to report FROM (its own automatic
+    /// trigger runs on a real periodic timer, not in response to a real
+    /// IPC caller), so this is its own client-side proof instead.
+    pub const BM_REPORT: usize = 119;
+    /// `a0` = byte count (capped at [`APP_BUFFER_LEN`], one page-aligned
+    /// buffer). Reads that many bytes from the CALLING process's own
+    /// dedicated app-upload buffer (mapped at boot by `kernel_arch_glue::
+    /// wire_shared_pages`, currently only `simurgh-native-sdk`'s own
+    /// `native-loader`, at `spawn_native_loader_x86`'s own fixed VA,
+    /// [`APP_BUFFER_VA`]) and spawns a REAL process from them via the
+    /// SAME `kernel_arch_glue::spawn_process_from_elf` helper every
+    /// boot-time spawn and `sys::SPAWN_KNOWN_ELF` already use — the ONE
+    /// real difference is the ELF bytes come from a caller-supplied
+    /// buffer, not a kernel-embedded array, so this is NOT restricted to
+    /// a fixed allow-list of known targets the way `SPAWN_KNOWN_ELF` is.
+    /// Returns the newly spawned process's own raw `ThreadId` on success,
+    /// `usize::MAX` on denial/failure (caller is not `simurgh-native-sdk`,
+    /// a malformed ELF, or the kernel itself out of resources).
+    ///
+    /// Omid's own 2026-09-10 approval to build this: `simurgh-native-
+    /// sdk::native-loader::Loader::spawn`'s own real completion of
+    /// "creating the process" (05-Legacy-Compat-Applications-Layer.md
+    /// §2) — that repo's own `ProcessSpawner` trait doc comment has the
+    /// full design, including what this does NOT yet connect to (the
+    /// capabilities `Loader::load`'s own separate, already-real IPC round
+    /// trip to `simurgh-security-broker` grants are not transferred into
+    /// the newly spawned process's own capability space — same open gap
+    /// `simurgh-store::AppInstallRecord::granted_capabilities`'s own
+    /// always-empty field is flagged for).
+    pub const SPAWN_FROM_BUFFER: usize = 120;
+    /// `a0` = 1 iff `simurgh-native-sdk`'s own real `Loader::spawn` call
+    /// (via `sys::SPAWN_FROM_BUFFER`) succeeded, 0 otherwise; `a1` = the
+    /// newly spawned process's own raw tid when it did. Same "prove a
+    /// real value, not just survival" reasoning `NL_REPORT`'s own doc
+    /// comment gives, for this separate real round trip.
+    pub const NL_SPAWN_REPORT: usize = 121;
+    /// `a0` = 1 iff `simurgh-file-manager`'s own real `self_check` — a
+    /// real `Open`/`Write`/`Close`/`Stat` round trip to `fs-native` via
+    /// `sys::IPC_CALL`, followed by `FileManagerCore::copy`'s own real
+    /// `Open`/`Read`/`Write`/`Close` sequence — succeeded, 0 otherwise.
+    /// Same "prove a real value, not just survival" reasoning `NL_REPORT`'s
+    /// own doc comment gives.
+    pub const FM_REPORT: usize = 122;
+    /// `a0` = 1 iff `Simurgh-UI-Template01`'s own real `self_check` — a
+    /// real `CreateSurface`/`CommitBuffer`/`QueryOutputs`/`DestroySurface`
+    /// round trip to Compositor via `sys::IPC_CALL` — succeeded, 0
+    /// otherwise; `a1` names which step failed when it did not. Same
+    /// "prove a real value, not just survival" reasoning `NL_REPORT`'s
+    /// own doc comment gives.
+    pub const UI_REPORT: usize = 123;
+    /// `a0` = `0` to reboot, `1` to shut down; `a1` unused. Calls
+    /// straight into `kernel_arch_glue::khal()`'s `reboot()`/
+    /// `shutdown()` (`hal_core::power::SystemControl`, built once per
+    /// architecture in that architecture's own `power.rs`) — both are
+    /// `-> !`, so a successful call never returns to the caller at all.
+    /// No capability gating yet (mirrors every other syscall opcode in
+    /// this MVP phase, e.g. `MAP_PAGE`'s own doc comment) — real
+    /// capability-gated power control is a tracked follow-up, not a
+    /// silent scope cut specific to this opcode.
+    pub const POWER_CONTROL: usize = 124;
+    /// `a0` = notification capability slot. `SyscallOp::Poll` — never
+    /// blocks (see `kernel_arch_glue::p2_poll`'s own doc comment).
+    /// Returns the notification's own pending bit-set in `a0`,
+    /// draining it on read, same as `NOTIF_WAIT`'s own return value —
+    /// the difference is purely "block until non-zero" (`NOTIF_WAIT`)
+    /// vs. "return whatever is pending right now, even zero"
+    /// (`NOTIF_POLL`). Real-input-handling plan, Stage B/C: Compositor's
+    /// own additive loop uses this at the top of every iteration to
+    /// check its i8042-signal Notification without blocking its main
+    /// `SBS_IPC_RECV` — the same "no 'any of N' syscall exists" gap
+    /// `wire_notification`'s own doc comment describes, solved by
+    /// polling instead of a genuine multi-endpoint `Wait`.
+    pub const NOTIF_POLL: usize = 125;
+    /// `a0` = raw `ThreadId` table index (`0..kernel_core::config::
+    /// MAX_THREADS`). Real per-process-introspection query for
+    /// `simurgh-shell`'s own `ps` command (that repo's own README long
+    /// flagged `ps` as not a real process table — no kernel syscall
+    /// exposed this before). Returns `usize::MAX` if `a0` is out of
+    /// range or that TCB slot is empty (`kernel_arch_glue::ps_list_
+    /// entry`'s own doc comment — a normal, expected outcome for most
+    /// slots, not an error); otherwise `(tid << 8) | state_code`
+    /// (`kernel_arch_glue`'s own `thread_state_wire_code` mapping) — tid
+    /// fits comfortably in the remaining bits (`MAX_THREADS` is 96,
+    /// `state_code` is `0..=6`, both far under a `usize`'s own width on
+    /// every target this project builds for).
+    pub const PS_LIST_ENTRY: usize = 126;
+    /// `a0` = `simurgh-init`'s own real `self_check`-started-unit count;
+    /// `a1` = its own real `real_spawn_demo` `bool` (`0`/`1`). Same
+    /// "prove a real value, not just survival" reasoning `NL_REPORT`'s
+    /// own doc comment gives — `simurgh-init` was the one ported repo
+    /// with no such report opcode at all (found via a cross-repo audit,
+    /// 2026-09-12), so a silently-broken DAG resolution or a broken real
+    /// spawn left zero observable trace on real hardware before this.
+    pub const IN_REPORT: usize = 127;
+    /// `a0` = `1` iff `simurgh-diagnostics`'s own real log-collector
+    /// round-trip demo (push one real event via `ReportEvent`, pull it
+    /// back via `NextEvent`, confirm it decodes to the SAME event)
+    /// succeeded, `0` otherwise; `a1` unused. A SEPARATE opcode from
+    /// `DG_REPORT` (which reports an unrelated, already-existing
+    /// simulated-network-send proof) — see `simurgh-diagnostics::
+    /// diagnostics-manager::subsystem_entry::real_log_collector_round_
+    /// trip_demo`'s own doc comment for the full reasoning.
+    pub const DG_LC_REPORT: usize = 128;
+    /// `a0` = `1` iff `simurgh-native-sdk`'s own real `de-framework::
+    /// display::DisplayClient` round trip to Compositor (`CreateSurface`
+    /// -> `CommitBuffer` -> `QueryOutputs` -> `DestroySurface`, all via
+    /// `sys::IPC_CALL`) succeeded, `0` otherwise; `a1` names which step
+    /// failed when it did not (`0..=3` in that same order). A SECOND,
+    /// independent real Compositor client alongside `ui-core`'s own
+    /// (`UI_REPORT`) — proves `de-framework`'s own `DisplayClient` trait
+    /// has a real, working transport now, not just the mock every host
+    /// test exercised until this opcode existed. Same "prove a real
+    /// value, not just survival" reasoning `NL_REPORT`'s own doc comment
+    /// gives.
+    pub const NL_DISPLAY_REPORT: usize = 129;
+    /// `a0` = `1` iff `driver-nvme`'s own real `Nvme::probe()` (the real
+    /// MMIO register/queue handshake against the granted BAR0 window)
+    /// succeeded, `0` otherwise; `a1` = the real `DeviceInfo::
+    /// sector_count` it returned when it did, `0` otherwise. Before this
+    /// opcode, `subsystem_main` discarded `probe()`'s own real `Result`
+    /// entirely (`let _ = drv.probe();`) — the real capability grant and
+    /// BAR0/queue-page mapping (`kernel_arch_glue::spawn_nvme_driver`)
+    /// were already proven end to end in an earlier session, but nothing
+    /// let `probe()`'s own real outcome reach the serial log; every
+    /// request this process serves before this opcode existed already
+    /// answered honestly (`Failed { code: ProbeFailed }` on any failure),
+    /// so this closes an observability gap, not a correctness one. Same
+    /// "prove a real value, not just survival" reasoning `NL_REPORT`'s
+    /// own doc comment gives.
+    pub const DRV_NVME_PROBE_REPORT: usize = 130;
+    /// `a0` = `1` iff `driver-virtio-blk`'s own real `VirtioBlk::probe()`
+    /// succeeded, `0` otherwise; `a1` = the real `DeviceInfo::
+    /// sector_count` it returned when it did, `0` otherwise. Same
+    /// "`subsystem_main` used to discard `probe()`'s own real `Result`
+    /// entirely" gap [`DRV_NVME_PROBE_REPORT`]'s own doc comment
+    /// describes, found via the same audit. x86_64 dispatch only for
+    /// now (this opcode's own real caller is spawned on all three
+    /// architectures when a Block-kind peripheral is discovered, but
+    /// only x86_64 gets a dispatch arm here today — aarch64/riscv64 are
+    /// a real, honest follow-up, not silently dropped).
+    pub const DRV_VBLK_PROBE_REPORT: usize = 131;
+    /// `a0` = `1` iff `driver-virtio-net`'s own real `VirtioNet::
+    /// probe()` succeeded, `0` otherwise; `a1` unused (no real
+    /// `DeviceInfo`-equivalent value for a network device — `probe`'s
+    /// own success is the only real signal). Same reasoning and same
+    /// "x86_64 dispatch only for now" scope as [`DRV_VBLK_PROBE_REPORT`]'s
+    /// own doc comment.
+    pub const DRV_VNET_PROBE_REPORT: usize = 132;
+    /// `a0` = `1` iff `simurgh-store`'s own real (simulated) catalog
+    /// lookup succeeded, `0` otherwise; `a1` = how many packages were
+    /// resolved this way during `self_check`. Same "point this at a
+    /// placeholder address and simulate the round trip — no real TCP/IP
+    /// stack is reachable from a bare-metal Simurgh-OS user process
+    /// today" convention Omid's own 2026-09-10 direction already
+    /// established for `simurgh-diagnostics::DG_REPORT` (a REAL
+    /// wall-clock delay via `NOW_NS`, not a fixed spin count, followed by
+    /// a simulated success) — `PackageLookup` was the one seam in
+    /// `simurgh-store` still exercised only against `SelfCheckCatalog`
+    /// even on real hardware; this closes that gap the same
+    /// already-established way, not a new invention.
+    pub const ST_CATALOG_REPORT: usize = 133;
+    /// `a0` = how many real crash reports `simurgh-diagnostics`'s own
+    /// real periodic-flush scheduler just queued via `poll_log_
+    /// collector`; `a1` = `1` iff `flush_pending_reports` was then
+    /// actually attempted (only when something was pending), `0`
+    /// otherwise. Fired once per scheduler TICK that actually found real
+    /// work to do — not every idle tick (same "only report when
+    /// something real happened" discipline `simurgh-backup-manager::
+    /// BM_REPORT`'s own scheduler loop already established), so this
+    /// stays a real, honest signal rather than log spam. Closes the real
+    /// gap this crate's own README long flagged: `flush_pending_reports`
+    /// existed and was tested, but nothing called it on a real interval
+    /// — `subsystem_main` used to prove the underlying IPC mechanism
+    /// once (`DG_LC_REPORT`) then just park forever.
+    pub const DG_FLUSH_REPORT: usize = 134;
+    /// Install a new SYSTEM-WIDE scheduling policy — the real kernel edge
+    /// behind a user picking a profile in `Simurgh-UI-Template01::
+    /// ui-core`'s own PROFILE submenu (2026-09-18).
+    ///
+    /// `a0` = `kernel_sched::SchedulerMode::wire_code` (`0` =
+    /// `Interactive`, `1` = `Throughput`). `a1` = 02-Microkernel-Layer.md
+    /// §4.3's `aging_cap_ms`, where `0` is a REAL value (aging off —
+    /// `simurgh-profile-policy`'s own `RealTime` default, 04-System-
+    /// Services-Policy-Layer-v2.md §7.3), not a "unset" sentinel.
+    ///
+    /// Returns the number of already-admitted threads whose scheduling
+    /// discipline this call actually CHANGED, or `usize::MAX` if `a0` is
+    /// not a mode this kernel knows (in which case nothing at all is
+    /// changed — not even `a1`). A return of `0` is a normal success: it
+    /// means every thread following the system default was already in the
+    /// requested mode.
+    ///
+    /// Genuinely system-wide, which is the point: a "profile" is a
+    /// whole-machine setting, so unlike every other opcode here this one
+    /// changes how EVERY spawned subsystem process is scheduled, not just
+    /// the caller. Threads that pinned a discipline at admit time — the
+    /// Root Task above all (`kernel_core::KernelState::init`'s own Step 4
+    /// comment) — are deliberately exempt, per §4.4's per-thread
+    /// override. The real mechanism is `kernel_arch_glue::set_system_
+    /// scheduler_policy` → `kernel_sched::Scheduler::set_system_
+    /// scheduler_policy`.
+    ///
+    /// The one real caller is `simurgh-profile-policy`'s own
+    /// `policy-engine` process, from its `switch_profile` server handler.
+    /// Not capability-gated yet — `kernel_arch_glue::set_system_scheduler_
+    /// policy`'s own `TODO(spec)` covers that gap honestly (shared with
+    /// `MAP_PAGE`/`POWER_CONTROL` and every other MVP-phase opcode).
+    pub const SCHED_SET_SYSTEM_POLICY: usize = 135;
+    /// `a0` = the raw `ThreadId` of a thread the CALLER spawned. Asks
+    /// whether that thread has terminated, and if so why — the general
+    /// process-supervision syscall (2026-09-18).
+    ///
+    /// Returns TWO registers (`TrapOutcome::Resume2`, as `IPC_RECV`
+    /// already does for its own two-value answer): `a0` = a status code,
+    /// `a1` = its companion payload. The codes are
+    /// `kernel_arch_glue`'s own `THREAD_EXIT_*` constants —
+    /// `THREAD_EXIT_RUNNING`(0, payload `0`: still alive, including
+    /// spawned-but-not-yet-started), `THREAD_EXIT_CLEAN`(1, payload =
+    /// the thread's self-reported exit code), `THREAD_EXIT_FAULTED`(2,
+    /// payload = the RAW architecture trap cause it died of, NOT
+    /// normalized across architectures), `THREAD_EXIT_UNKNOWN`(3,
+    /// payload `0`: dead, reason unrecorded — unreachable today, kept so
+    /// the encoding is total), and `THREAD_EXIT_DENIED`(`usize::MAX`,
+    /// payload `0`: no such thread, OR the caller is not its spawner —
+    /// deliberately one indistinguishable value for both, see that
+    /// constant's own doc comment).
+    ///
+    /// This is the real, GENERAL primitive behind `simurgh-init`'s own
+    /// post-launch crash-loop detection (that repo's README long flagged
+    /// its absence as the blocker for acting on
+    /// `ServiceUnit::restart_policy` after a successful launch). It
+    /// replaces nothing: device-manager's own `DM_WAIT_CRASH`/
+    /// `DM_POLL_CRASH`/`DM_RESPAWN_DRIVER` trio stays exactly as it is —
+    /// those are a bespoke, single-slot mechanism hardwired to one
+    /// watched demo driver (`kernel_arch_glue`'s `WATCHED_DRIVER_TID`/
+    /// `DM_TID` statics), load-bearing for the §5.2 fault-isolation
+    /// acceptance demo, and deliberately left untouched. Both are
+    /// populated from the same real fault in `p2_fault`.
+    ///
+    /// Two deliberate design decisions, both documented at length on
+    /// `kernel_core::SyscallOp::ThreadExitStatus` itself rather than
+    /// here:
+    /// - **It polls, it does not block.** A supervisor watches MANY
+    ///   children, so a syscall that parked it on ONE named thread would
+    ///   blind it to all the others (device-manager can block because it
+    ///   watches exactly one driver). The answer is STICKY — a
+    ///   terminated thread's reason is recorded once and never cleared —
+    ///   so polling cannot MISS an exit, however long the gap between
+    ///   two polls. Same `Wait`/`Poll` split as `NOTIF_WAIT`/
+    ///   `NOTIF_POLL`, landing on the `Poll` side for the same reason
+    ///   Compositor's own input loop does.
+    /// - **Only the spawner may ask.** Unlike `sys::PS_LIST_ENTRY`
+    ///   (unrestricted, but deliberately coarser — a bare `ThreadState`
+    ///   code and nothing more), this answer includes a raw fault cause,
+    ///   and a raw `ThreadId` is guessable in this MVP. Unrestricted, it
+    ///   would let any process sweep the whole TCB table and read every
+    ///   other process's crash details.
+    pub const THREAD_EXIT_POLL: usize = 136;
+    /// `a0` = `1` iff `simurgh-init`'s own real post-launch crash-
+    /// supervision self-check passed — a real `sys::THREAD_EXIT_POLL`
+    /// round trip about a process init genuinely spawned itself, plus a
+    /// real ACCESS-CONTROL check that a query about a thread init did NOT
+    /// spawn is refused. `a1` = the raw `THREAD_EXIT_*` status code that
+    /// query actually returned, so the serial log carries the real
+    /// observed value rather than only a pass/fail bit.
+    ///
+    /// A SEPARATE opcode from `sys::IN_REPORT` (which reports init's own
+    /// unrelated DAG-resolution / spawn / manifest-read results, and
+    /// whose `a0`/`a1` are both fully spoken for) — the same "one opcode
+    /// per distinct real proof" split `sys::DG_LC_REPORT` already made
+    /// from `sys::DG_REPORT`, for the same reason.
+    pub const IN_SUPERVISE_REPORT: usize = 137;
+    /// No arguments. Desktop build only: the idle thread's wait. If no other
+    /// thread is `Ready` the core is halted until the next interrupt
+    /// (`hlt`/`wfi`) instead of spinning; either way the call then behaves
+    /// as one scheduler tick (`kernel_arch_glue::desktop_idle_wait`), so a
+    /// thread an interrupt just woke runs immediately.
+    pub const IDLE_WAIT: usize = 138;
+    /// `a0` = notification capability slot, `a1` = timeout in nanoseconds.
+    /// `NOTIF_WAIT` with a deadline: returns the pending bit-set (in `a0`) as
+    /// soon as it is non-zero, or `0` once `a1` ns have passed with nothing
+    /// signalled. Blocks (a real switch, the caller is not Ready meanwhile), so
+    /// it lets a server sleep until "a signal OR a deadline" instead of polling
+    /// with `NOTIF_POLL`. `a1` = 0 never blocks (a plain poll). Granularity is
+    /// one scheduler tick (2 ms). See `kernel_arch_glue::p2_wait_timeout_general`.
+    pub const NOTIF_WAIT_TIMEOUT: usize = 139;
+    /// `a0` = byte count (capped at 512). Netstack only: prints that many
+    /// bytes of UTF-8 text, read from the log area of Netstack's OWN status
+    /// region (`kernel_arch_glue::netstack_log`), as one `netstack: ...`
+    /// serial line. Same "peek the process's own pre-mapped page by physical
+    /// address, no VA in a syscall argument" shape as `SERIAL_PRINT`, but
+    /// keyed on Netstack's page instead of the shell's. Any other caller is
+    /// ignored (returns `usize::MAX`).
+    pub const NET_LOG: usize = 140;
+}
+
+/// Human-readable name for one of `kernel_arch_glue`'s `THREAD_EXIT_*`
+/// wire status codes, for the serial log only (`sys::IN_SUPERVISE_REPORT`'s
+/// own handler). Architecture-independent and shared by all three
+/// handlers — the raw numbers are what cross the syscall boundary; this
+/// exists purely so a real boot log reads as prose instead of an
+/// unexplained integer.
+fn thread_exit_status_name(code: usize) -> &'static str {
+    match code {
+        kernel_arch_glue::THREAD_EXIT_RUNNING => "still running",
+        kernel_arch_glue::THREAD_EXIT_CLEAN => "exited cleanly",
+        kernel_arch_glue::THREAD_EXIT_FAULTED => "faulted",
+        kernel_arch_glue::THREAD_EXIT_UNKNOWN => "exited, reason unrecorded",
+        kernel_arch_glue::THREAD_EXIT_DENIED => "denied (no such thread, or caller is not its spawner)",
+        _ => "unrecognized status",
+    }
+}
+
+#[cfg(target_arch = "riscv64")]
+#[inline(never)]
+#[link_section = ".user_text"]
+unsafe fn raw_syscall(a7: usize, a0: usize, a1: usize) -> usize {
+    let ret;
+    // SAFETY: `ecall` from U-mode traps to our S-mode handler. For an
+    // ORDINARY (non-switching) opcode this preserves every register
+    // except a0.
+    //
+    // **Real, deep bug found via QEMU** (this session's fs-native demo
+    // — the FIRST code to ever issue multiple `raw_syscall`s in a row
+    // after a SWITCHING opcode, e.g. right after `IPC_CALL`): a
+    // sequence like `raw_syscall(sys::IPC_CALL, ep, 0xC0FFEE);
+    // raw_syscall(sys::FS_DEMO_START, 0, 0);` kept observing a1 = a
+    // STALE value (the earlier call's own delivered reply data, then —
+    // after various fix attempts — other garbage, including what looked
+    // like a raw `satp` value) instead of the literal `0` the SECOND
+    // call actually passed, for EVERY later `raw_syscall` in the same
+    // function, not just the one right after the switch. Two things
+    // were tried and did NOT fully fix it on their own: (1) declaring
+    // `a1` `inlateout` instead of a plain `in()` operand (correct in
+    // principle — it tells the compiler the asm may change `a1`, so it
+    // should stop assuming a cached value survives across the ecall —
+    // but the observed garbage value changed shape with each variant of
+    // this fix rather than disappearing, meaning something deeper was
+    // wrong); (2) explicitly re-verified `TrapFrame::A0` extraction and
+    // the fast-path restore's own register offsets in `hal-riscv64`
+    // (both correct, matching `RiscvUserContext`'s real field layout —
+    // ruled out as the cause). What actually fixed it: `#[inline(never)]`
+    // (plus `#[link_section = ".user_text"]`, mandatory once NOT
+    // inlined, so this function stays in the U=1-mapped range rather
+    // than landing in ordinary U=0 kernel `.text` — see `spawn_process`'s
+    // own doc comment on why a call from `.user_text` into anything
+    // else would fault). With `#[inline(always)]` (this function's
+    // original attribute, used successfully by every OTHER opcode in
+    // this project until now), LLVM under this project's pinned nightly
+    // (`nightly-2025-01-15`) was producing genuinely incorrect codegen
+    // for the specific combination of "inline asm with an `ecall` that
+    // can switch threads" + "multiple sequential calls to the SAME
+    // `#[inline(always)]` function within one large, deeply-nested
+    // caller (`umode_root`)" — forcibly inlining every call site let
+    // some value-tracking optimization conflate `a1`'s value ACROSS
+    // call sites that must be treated as fully opaque (since the asm's
+    // OWN visible side effect — a full thread switch — can change
+    // ANY register the compiler didn't explicitly account for). A real
+    // function call boundary (this fix) uses RISC-V's own standard
+    // calling convention instead, which the compiler already treats as
+    // fully clobbering `a0`-`a7` — sidestepping the bug entirely rather
+    // than trying to out-annotate it. `inlateout("a1")` is kept below
+    // anyway (harmless, and correct in its own right).
+    let mut a1 = a1;
+    unsafe {
+        core::arch::asm!(
+            "ecall",
+            in("a7") a7,
+            inlateout("a0") a0 => ret,
+            inlateout("a1") a1,
+            options(nostack),
+        );
+    }
+    let _ = a1;
+    ret
+}
+
+/// Like `raw_syscall`, but also reads back `a1` — for `IPC_RECV`, the
+/// ONE opcode whose result genuinely does not fit in a single register
+/// (see `TrapOutcome::Resume2`'s own doc comment). Every OTHER opcode's
+/// single-value convention is `raw_syscall`'s exact `in("a1") a1`
+/// (write-only from this function's perspective, discarding whatever
+/// ends up there) — this is a narrow exception, not a change to the
+/// general syscall ABI.
+///
+/// `#[inline(never)]` for the SAME reason as `raw_syscall` — see that
+/// function's own extensive doc comment on the real, QEMU-found
+/// miscompilation this avoids. This function's own `a1` was ALREADY
+/// `inlateout` (needed for its real second return value), so it was
+/// never directly OBSERVED to exhibit the bug — but the same "multiple
+/// `#[inline(always)]` calls to an asm-with-a-switch function in one
+/// large caller" shape applies here too, so it gets the identical fix
+/// for consistency and defense-in-depth, not because it was proven
+/// broken on its own.
+#[cfg(target_arch = "riscv64")]
+#[inline(never)]
+#[link_section = ".user_text"]
+unsafe fn raw_syscall2(a7: usize, a0: usize, a1: usize) -> (usize, usize) {
+    let (r0, r1);
+    // SAFETY: same contract as `raw_syscall` — `ecall` preserves every
+    // register except a0/a1 for this opcode specifically.
+    unsafe {
+        core::arch::asm!(
+            "ecall",
+            in("a7") a7,
+            inlateout("a0") a0 => r0,
+            inlateout("a1") a1 => r1,
+            options(nostack),
+        );
+    }
+    (r0, r1)
+}
+
+/// The real Call/Recv/Reply demo's endpoint capability slot, set once by
+/// `IPC_DEMO_START`'s handler and read by `IPC_ENDPOINT_CAP` — both the
+/// client (`umode_root`) and the server (`umode_ipc_server`) call the
+/// latter to learn it independently, since the server (a fresh thread)
+/// has no other way to learn a value computed during the client's own
+/// earlier execution.
+#[cfg(target_arch = "riscv64")]
+static mut G_IPC_EP: u32 = 0;
+
+/// fs-native's endpoint capability slot IN THE CALLER's (root's) own
+/// capability space, set once by `FS_DEMO_START`'s handler and read by
+/// every later `FS_OPEN`/`FS_STAT`/`FS_CLOSE` handler — kept server-
+/// side (unlike `G_IPC_EP`, which BOTH client and server independently
+/// discover) since fs-native's own copy is a fixed, hardcoded constant
+/// in its own process (`FS_ENDPOINT_CAP` in `subsystem_entry.rs`), not
+/// something it needs to learn from the caller at all.
+#[cfg(target_arch = "riscv64")]
+static mut G_FS_EP: u32 = 0;
+
+/// Compositor's own endpoint capability slot IN THE CALLER's (root's)
+/// own capability space, set once by `COMPOSITOR_DEMO_START`'s handler
+/// and read by every later `COMPOSITOR_CREATE_SURFACE`/`COMPOSITOR_
+/// COMMIT_BUFFER`/`COMPOSITOR_DESTROY_SURFACE` handler — same role as
+/// `G_FS_EP`.
+#[cfg(target_arch = "riscv64")]
+static mut G_COMPOSITOR_EP: u32 = 0;
+
+/// mm-service's own endpoint capability slot IN THE CALLER's (root's)
+/// own capability space, set once by `MM_DEMO_START`'s handler and read
+/// by every later `MM_REGISTER`/`MM_UNREGISTER`/`MM_QUERY_VICTIM`/
+/// `MM_QUERY_TOTAL_RESIDENT` handler — same role as `G_FS_EP`.
+#[cfg(target_arch = "riscv64")]
+static mut G_MM_EP: u32 = 0;
+
+/// The virtio-blk driver's endpoint capability slot IN THE CALLER's
+/// (root's) own capability space, set once by `DRV_BLK_DEMO_START`'s
+/// handler and read by every later `DRV_BLK_PROBE`/`DRV_BLK_WRITE`/
+/// `DRV_BLK_READ` handler — same role as `G_FS_EP`.
+#[cfg(target_arch = "riscv64")]
+static mut G_DRV_EP: u32 = 0;
+
+/// `security-broker-intermediary`'s own endpoint capability slot IN THE
+/// CALLER's (root's) own capability space — same role as `G_FS_EP`.
+#[cfg(target_arch = "riscv64")]
+static mut G_SBI_EP: u32 = 0;
+
+/// The virtio-net driver's endpoint capability slot in the caller's
+/// (root's) own capability space — written once by `DRV_NET_DEMO_START`,
+/// read once by `NET_DEMO_START` (x86_64's own `sys::DRV_NET_DEMO_START`
+/// doc comment on why a kernel-side cache, not this switching syscall's
+/// own "return value", is what carries it across).
+#[cfg(target_arch = "riscv64")]
+static mut G_DRV_NET_EP: u32 = 0;
+
+/// The virtio-net demo (03-Kernel-Subsystems-Layer.md §2.3/§5.4): spawns
+/// the real network driver process AND a real Netstack process on top of
+/// it (`sys::NET_DEMO_START`'s own doc comment), then polls the
+/// Netstack process's own status region (`sys::NET_STATUS_POLL`) until
+/// it reaches a terminal verdict. Unlike the pre-Session-22 shape this
+/// function used to have (a `.user_text`-driven retry loop issuing TWO
+/// separate ecalls per attempt against `kernel_arch_glue`'s own direct
+/// driving of the driver), the ENTIRE ARP-resolve/ICMP-echo sequence —
+/// including its own bounded retry loop — now runs inside the real
+/// Netstack process itself, over genuine IPC (`netstack::subsystem_
+/// entry`'s own module doc comment); this function only needs ONE
+/// bounded poll loop, issuing ONE ecall per attempt.
+///
+/// A SEPARATE `#[link_section = ".user_text"]` `#[inline(never)]`
+/// function, called once from `umode_root` — same "a call between two
+/// `.user_text` functions is safe, no relocation to anything outside
+/// that section" reasoning `umode_root`'s own doc comment gives.
+///
+/// **Honest history, carried over from before this extraction**: an
+/// intermittent hang was once observed at the unrelated "arm the
+/// preemptive timer" step further down `umode_root`, on boots where the
+/// ARP+ICMP round trip had already succeeded — investigated at length in
+/// a prior session (`hal/hal-riscv64/src/linker.ld`'s own `__boot_stack_
+/// bottom` comment has the fullest account) without a reliably
+/// reproducible fix; the leading theory is QEMU/host timing jitter
+/// interacting with an already timing-fragile 40-tick preemption demo,
+/// not a kernel-code bug. This extraction changes WHERE the ARP/ICMP
+/// logic runs, not the preemption demo itself — TODO(omid): do not read
+/// this function's own existence as proof the hang is resolved.
+#[cfg(target_arch = "riscv64")]
+#[inline(never)]
+#[link_section = ".user_text"]
+fn net_demo_riscv64() {
+    // SAFETY: same contract as every other `raw_syscall`/`raw_syscall2`
+    // call site in this file's own `.user_text` code.
+    unsafe {
+        macro_rules! zero {
+            () => {{
+                let mut v: usize = 0;
+                core::arch::asm!("/* {0} */", inout(reg) v, options(nomem, nostack, preserves_flags));
+                v
+            }};
+        }
+        let drv_ep = raw_syscall(sys::DRV_NET_DEMO_START, zero!(), zero!());
+        raw_syscall(sys::REPORT, drv_ep, zero!());
+        if drv_ep != usize::MAX {
+            let started = raw_syscall(sys::NET_DEMO_START, drv_ep, zero!());
+            raw_syscall(sys::REPORT, started, zero!());
+            if started != usize::MAX {
+                const MAX_STATUS_POLL_ATTEMPTS: usize = 5_000;
+                let mut verdict = 0usize;
+                for _ in 0..MAX_STATUS_POLL_ATTEMPTS {
+                    verdict = raw_syscall(sys::NET_STATUS_POLL, zero!(), zero!());
+                    if verdict != 0 {
+                        break;
+                    }
+                }
+                raw_syscall(sys::REPORT, verdict, zero!());
+            }
+        }
+    }
+}
+
+/// The Compositor demo (03-Kernel-Subsystems-Layer.md §2.4/§5.4.2):
+/// spawns the real Compositor process, creates a surface, commits a
+/// fixed test frame (proving Compositor genuinely dereferenced the
+/// shared frame buffer — `kernel_arch_glue::compositor_commit_verify`'s
+/// own doc comment), then destroys the surface. A SEPARATE `#[link_
+/// section = ".user_text"]` `#[inline(never)]` function, called once
+/// from `umode_root` — same "a call between two `.user_text` functions
+/// is safe" reasoning `net_demo_riscv64`'s own doc comment gives.
+#[cfg(target_arch = "riscv64")]
+#[inline(never)]
+#[link_section = ".user_text"]
+fn compositor_demo_riscv64() {
+    // SAFETY: same contract as every other `raw_syscall`/`raw_syscall2`
+    // call site in this file's own `.user_text` code.
+    unsafe {
+        macro_rules! zero {
+            () => {{
+                let mut v: usize = 0;
+                core::arch::asm!("/* {0} */", inout(reg) v, options(nomem, nostack, preserves_flags));
+                v
+            }};
+        }
+        let ep = raw_syscall(sys::COMPOSITOR_DEMO_START, zero!(), zero!());
+        raw_syscall(sys::REPORT, ep, zero!());
+        if ep != usize::MAX {
+            raw_syscall(sys::COMPOSITOR_CREATE_SURFACE, zero!(), zero!());
+            let surface = raw_syscall(sys::COMPOSITOR_CREATE_SURFACE_RESULT, zero!(), zero!());
+            raw_syscall(sys::REPORT, surface, zero!());
+            if surface != usize::MAX {
+                raw_syscall(sys::COMPOSITOR_COMMIT_BUFFER, surface, zero!());
+                let committed = raw_syscall(sys::COMPOSITOR_COMMIT_VERIFY, zero!(), zero!());
+                raw_syscall(sys::REPORT, committed, zero!());
+                raw_syscall(sys::COMPOSITOR_DESTROY_SURFACE, surface, zero!());
+                let destroyed = raw_syscall(sys::COMPOSITOR_DESTROY_RESULT, zero!(), zero!());
+                raw_syscall(sys::REPORT, destroyed, zero!());
+            }
+        }
+    }
+}
+
+/// The mm-service demo (03-Kernel-Subsystems-Layer.md §2.5): spawns the
+/// real mm-service process, registers the two fixed `MM_DEMO_PROCS`
+/// (a large `Normal` one and a small `Sacrificial` one), queries the
+/// real total resident bytes and the real OOM victim (both verified
+/// against `mm_service`'s own already-host-tested policy answer — see
+/// `kernel_arch_glue::mm_query_victim_result`'s own doc comment), then
+/// unregisters both. A SEPARATE `#[link_section = ".user_text"]`
+/// `#[inline(never)]` function, called once from `umode_root` — same "a
+/// call between two `.user_text` functions is safe" reasoning `net_demo_
+/// riscv64`'s own doc comment gives.
+#[cfg(target_arch = "riscv64")]
+#[inline(never)]
+#[link_section = ".user_text"]
+fn mm_demo_riscv64() {
+    // SAFETY: same contract as every other `raw_syscall`/`raw_syscall2`
+    // call site in this file's own `.user_text` code.
+    unsafe {
+        macro_rules! zero {
+            () => {{
+                let mut v: usize = 0;
+                core::arch::asm!("/* {0} */", inout(reg) v, options(nomem, nostack, preserves_flags));
+                v
+            }};
+        }
+        let ep = raw_syscall(sys::MM_DEMO_START, zero!(), zero!());
+        raw_syscall(sys::REPORT, ep, zero!());
+        if ep != usize::MAX {
+            raw_syscall(sys::MM_REGISTER, zero!(), zero!()); // MM_DEMO_PROCS[0]: thread 100, Normal
+            let reg0 = raw_syscall(sys::MM_REGISTER_RESULT, zero!(), zero!());
+            raw_syscall(sys::REPORT, reg0, zero!());
+            raw_syscall(sys::MM_REGISTER, 1, zero!()); // MM_DEMO_PROCS[1]: thread 200, Sacrificial
+            let reg1 = raw_syscall(sys::MM_REGISTER_RESULT, zero!(), zero!());
+            raw_syscall(sys::REPORT, reg1, zero!());
+            raw_syscall(sys::MM_QUERY_TOTAL_RESIDENT, zero!(), zero!());
+            let total = raw_syscall(sys::MM_QUERY_TOTAL_RESIDENT_RESULT, zero!(), zero!());
+            raw_syscall(sys::REPORT, total, zero!());
+            raw_syscall(sys::MM_QUERY_VICTIM, zero!(), zero!());
+            let victim = raw_syscall(sys::MM_QUERY_VICTIM_RESULT, zero!(), zero!());
+            raw_syscall(sys::REPORT, victim, zero!());
+            // The REAL §8.3 IPC fast-path benchmark (see `mm_bench_
+            // riscv64`'s own doc comment) — deliberately BEFORE
+            // unregistering below: `MM_QUERY_TOTAL_RESIDENT_RESULT`'s
+            // own kernel-side verdict compares against `MM_DEMO_
+            // EXPECTED_TOTAL`, which only holds while both demo
+            // processes are still registered; running this loop after
+            // unregistering would log 200 spurious MISMATCH lines for a
+            // total that's supposed to be different by then.
+            mm_bench_riscv64();
+            raw_syscall(sys::MM_UNREGISTER, 100, zero!());
+            let unreg0 = raw_syscall(sys::MM_UNREGISTER_RESULT, zero!(), zero!());
+            raw_syscall(sys::REPORT, unreg0, zero!());
+            raw_syscall(sys::MM_UNREGISTER, 200, zero!());
+            let unreg1 = raw_syscall(sys::MM_UNREGISTER_RESULT, zero!(), zero!());
+            raw_syscall(sys::REPORT, unreg1, zero!());
+        }
+    }
+}
+
+/// The REAL §8.3 IPC fast-path benchmark (02-Microkernel-Layer.md §8.3:
+/// "ipc_call fast-path < 500 ns on reference hardware"). `bench_thread_
+/// main`'s own in-kernel benchmark (5b, above, run earlier in `umode_
+/// root`) measures a DIFFERENT thing — a purely in-kernel cooperative
+/// `yield_to` between two kernel threads, using `hal_core::HalInterface::
+/// context_switch`'s full GPR save/restore, never touching a real U-mode
+/// process at all. THIS benchmark instead times 200 REAL round trips
+/// between two genuinely isolated U-mode processes (root and mm-service,
+/// already spawned by `mm_demo_riscv64` above) over the SAME `SyscallOp::
+/// Call`/`Reply` + `TrapOutcome::SwitchToFast` + register-only `hal_
+/// riscv64::cpu::{save,restore}_ipc_fast_context` mechanism every real
+/// subsystem (mm-service, Compositor, Netstack's bypass control-plane)
+/// already uses in production — closing the "register-only HAL primitive
+/// still pending" gap `bench_thread_main`'s own log line has documented
+/// since it was written (the primitive was built, one subsystem at a
+/// time, across several later sessions; this is the first thing to
+/// actually TIME it end to end). Reuses `MM_QUERY_TOTAL_RESIDENT` as the
+/// request (any already-real, repeatable request would do). Called from
+/// `mm_demo_riscv64` itself, deliberately BEFORE its own `MM_UNREGISTER`
+/// calls — `MM_QUERY_TOTAL_RESIDENT_RESULT`'s own kernel-side verdict
+/// compares against `MM_DEMO_EXPECTED_TOTAL`, which only holds while
+/// both demo processes are still registered; running this loop after
+/// unregistering would log 200 spurious MISMATCH lines instead of one
+/// real MATCH per iteration — reads the result via `sys::MM_QUERY_
+/// TOTAL_RESIDENT_RESULT_QUIET` rather than the regular (verdict-
+/// logging) opcode for the same reason: even a MATCH every time would
+/// still be 200 near-identical log lines for no reason. `sys::NOW_NS`
+/// (a trivial `hal.now_ns()` passthrough) brackets each round trip from
+/// `.user_text` itself, since `hal.now_ns()` is not otherwise reachable
+/// from U-mode.
+#[cfg(target_arch = "riscv64")]
+#[inline(never)]
+#[link_section = ".user_text"]
+fn mm_bench_riscv64() {
+    // SAFETY: same contract as every other `raw_syscall`/`raw_syscall2`
+    // call site in this file's own `.user_text` code.
+    unsafe {
+        macro_rules! zero {
+            () => {{
+                let mut v: usize = 0;
+                core::arch::asm!("/* {0} */", inout(reg) v, options(nomem, nostack, preserves_flags));
+                v
+            }};
+        }
+        const ITERS: usize = 200;
+        // `sum_ns / ITERS` written against the LITERAL divisor is a real,
+        // riscv64-ONLY fatal bug, not a style question — it was the cause
+        // of `FAULT: thread 0 ... (cause=0xd sepc=0xc0000398
+        // stval=0x84bc4da8)`, the load page fault that killed the Root
+        // Task on every riscv64 boot and stopped the boot sequence several
+        // steps before `umode_root`'s own device-manager fault-isolation
+        // demo.
+        //
+        // Why: LLVM lowers division by a compile-time constant to a
+        // magic-number multiply (`mulhu`), and RV64 cannot materialize the
+        // 64-bit magic multiplier as an immediate — it emits it into a
+        // CONSTANT POOL and loads it PC-relatively (`auipc a0, 0xc4bc5` /
+        // `ld a0, -0x5ec(a0)`). That pool is `.srodata.cst8`, which the
+        // linker places with the rest of the KERNEL's rodata (~0x84bc4da8,
+        // inside the kernel image), NOT inside the user image. `linker.ld`
+        // maps only `.user_text`/`.user_stack` U=1 (see its own "User
+        // (layer-3) Root Task image" block), so that address is simply
+        // absent from the Root Task's U-mode address space and the load
+        // traps. x86_64 and aarch64 are unaffected for a purely
+        // ISA-level reason: both materialize a 64-bit immediate in
+        // registers (`movabs` / `movz`+`movk`) with no memory reference at
+        // all, so the identical Rust source in `mm_bench_x86`/
+        // `mm_bench_aarch64` never leaves the user image.
+        //
+        // The fix pushes the divisor through the same `asm!` identity
+        // `zero!()` above already uses, making it opaque to LLVM. RV64
+        // then emits a plain hardware `divu` (the M extension is part of
+        // `riscv64gc`) — no constant pool, no reference out of
+        // `.user_text`. `checked_div(..).unwrap_or(0)` rather than `/`
+        // deliberately: a runtime divisor makes `/` emit a
+        // divide-by-zero panic branch, and a panic from `.user_text` would
+        // itself reference the kernel's `core::panicking` machinery it
+        // cannot reach.
+        //
+        // GENERAL INVARIANT this protects, for any future `.user_text`
+        // code on riscv64: nothing in `.user_text` may reference a symbol
+        // outside the user-mapped region. Division by a literal is the
+        // non-obvious way to violate it, because the reference is
+        // introduced by the back end, not written in the source.
+        let iters_opaque: usize = {
+            let mut v: usize = ITERS;
+            core::arch::asm!("/* {0} */", inout(reg) v, options(nomem, nostack, preserves_flags));
+            v
+        };
+        let (mut min_ns, mut max_ns, mut sum_ns) = (usize::MAX, 0usize, 0usize);
+        for _ in 0..ITERS {
+            let t0 = raw_syscall(sys::NOW_NS, zero!(), zero!());
+            raw_syscall(sys::MM_QUERY_TOTAL_RESIDENT, zero!(), zero!());
+            raw_syscall(sys::MM_QUERY_TOTAL_RESIDENT_RESULT_QUIET, zero!(), zero!());
+            let t1 = raw_syscall(sys::NOW_NS, zero!(), zero!());
+            let dt = t1.saturating_sub(t0);
+            if dt < min_ns {
+                min_ns = dt;
+            }
+            if dt > max_ns {
+                max_ns = dt;
+            }
+            sum_ns += dt;
+        }
+        raw_syscall(sys::REPORT, min_ns, zero!());
+        raw_syscall(
+            sys::REPORT,
+            sum_ns.checked_div(iters_opaque).unwrap_or(0),
+            zero!(),
+        );
+        raw_syscall(sys::REPORT, max_ns, zero!());
+    }
+}
+
+/// The kernel-bypass networking demo (03-Kernel-Subsystems-Layer.md
+/// §2.3/§5.4.1): issues the REAL `NetBypassRequest::RequestDirectNic`
+/// control-plane handshake to Netstack's own `BYPASS_ENDPOINT_CAP` server
+/// loop, then — if granted — SAMPLES (10) REAL kernel-mode data-path
+/// SENDs that drive the driver's own already-probed TX queue directly
+/// (no driver process, no further IPC, matching §5.4.1's own contract),
+/// immediately followed by SAMPLES REAL sends over the STANDARD path
+/// instead (client -> Netstack -> driver, two real IPC hops, `ipc_
+/// protocol::net::NetBypassRequest::RelayFrame`'s own doc comment) —
+/// then reports both paths' own min/avg/max (via `REPORT`) and a single
+/// honest verdict comparing the two averages (`sys::NET_LATENCY_
+/// SUMMARY`, `kernel_arch_glue::net_latency_summary`'s own doc comment)
+/// — §5.4.1's own "the bypass path is ≥30-40% lower latency than the
+/// standard path" claim, finally checked against something real instead
+/// of asserted. Must run AFTER the driver's own SendFrame/PollFrame demo
+/// and Netstack's own ARP/ICMP demo have both already completed
+/// (`kernel_arch_glue::net_bypass_direct_send`'s own doc comment on why
+/// this ordering is a real precondition, not just convenient sequencing
+/// — it refuses to interleave with a still-pending driver-owned TX
+/// request).
+#[cfg(target_arch = "riscv64")]
+#[inline(never)]
+#[link_section = ".user_text"]
+fn net_bypass_demo_riscv64() {
+    // SAFETY: same contract as every other `raw_syscall`/`raw_syscall2`
+    // call site in this file's own `.user_text` code.
+    unsafe {
+        macro_rules! zero {
+            () => {{
+                let mut v: usize = 0;
+                core::arch::asm!("/* {0} */", inout(reg) v, options(nomem, nostack, preserves_flags));
+                v
+            }};
+        }
+        raw_syscall(sys::NET_BYPASS_REQUEST, zero!(), zero!());
+        let granted = raw_syscall(sys::NET_BYPASS_REQUEST_RESULT, zero!(), zero!());
+        raw_syscall(sys::REPORT, granted, zero!());
+        if granted != 0 {
+            // §5.4.1's own latency comparison — SAMPLES real sends each
+            // way (not a statistically rigorous benchmark, but enough to
+            // see past one-off QEMU/TCG jitter). Standard path (via
+            // Netstack) FIRST, bypass SECOND — a real (if unconfirmed as
+            // the proximate cause here) latent risk motivates the order:
+            // a kernel-bypass send directly advances the TX ring's own
+            // physical avail/used indices without updating the driver
+            // PROCESS's own private `VirtioNet::tx_next_idx` field
+            // (unreachable from kernel-arch-glue), so a driver-process
+            // `SendFrame` issued AFTER a bypass send COULD compute its
+            // own next ring slot from a stale index. Investigated via
+            // QEMU when the standard path failed every sample — but it
+            // failed identically with bypass sends NOT run first either,
+            // and then stopped failing after an unrelated, purely
+            // diagnostic code change, matching the SAME class of rare,
+            // QEMU-timing-dependent flakiness already root-caused (as a
+            // `driver_virtio_net::do_probe` notify-offset race) for
+            // kernel-bypass's own earlier development — not this
+            // ordering theory, which remains a real but unconfirmed
+            // latent risk worth the harmless precaution of keeping
+            // anyway. Standard path: bracketed with `NOW_NS`, same
+            // convention `mm_bench_riscv64`'s own doc comment
+            // establishes. Bypass: `NET_BYPASS_SEND`'s own kernel-side
+            // timer already returns elapsed ns directly, no bracketing
+            // needed.
+            const SAMPLES: usize = 10;
+
+            let (mut s_min, mut s_max, mut s_sum, mut s_ok) = (usize::MAX, 0usize, 0usize, 0usize);
+            for _ in 0..SAMPLES {
+                let t0 = raw_syscall(sys::NOW_NS, zero!(), zero!());
+                raw_syscall(sys::NET_STANDARD_SEND_REQUEST, zero!(), zero!());
+                let relayed = raw_syscall(sys::NET_STANDARD_SEND_REQUEST_RESULT, zero!(), zero!());
+                let t1 = raw_syscall(sys::NOW_NS, zero!(), zero!());
+                if relayed != 0 {
+                    let dt = t1.saturating_sub(t0);
+                    s_ok += 1;
+                    if dt < s_min {
+                        s_min = dt;
+                    }
+                    if dt > s_max {
+                        s_max = dt;
+                    }
+                    s_sum += dt;
+                }
+            }
+            raw_syscall(sys::REPORT, s_ok, zero!());
+            let s_avg = if s_ok > 0 { s_sum / s_ok } else { 0 };
+            if s_ok > 0 {
+                raw_syscall(sys::REPORT, s_min, zero!());
+                raw_syscall(sys::REPORT, s_avg, zero!());
+                raw_syscall(sys::REPORT, s_max, zero!());
+            }
+
+            let (mut b_min, mut b_max, mut b_sum, mut b_ok) = (usize::MAX, 0usize, 0usize, 0usize);
+            for _ in 0..SAMPLES {
+                let ns = raw_syscall(sys::NET_BYPASS_SEND, zero!(), zero!());
+                if ns != usize::MAX {
+                    b_ok += 1;
+                    if ns < b_min {
+                        b_min = ns;
+                    }
+                    if ns > b_max {
+                        b_max = ns;
+                    }
+                    b_sum += ns;
+                }
+            }
+            raw_syscall(sys::REPORT, b_ok, zero!());
+            let b_avg = if b_ok > 0 { b_sum / b_ok } else { 0 };
+            if b_ok > 0 {
+                raw_syscall(sys::REPORT, b_min, zero!());
+                raw_syscall(sys::REPORT, b_avg, zero!());
+                raw_syscall(sys::REPORT, b_max, zero!());
+            }
+
+            raw_syscall(sys::NET_LATENCY_SUMMARY, b_avg, s_avg);
+        }
+    }
+}
+
+/// The user-space Root Task entry. Linked into `.user_text` (its own
+/// U=1 R+X pages at VMA 0xC000_0000, per hal-riscv64's linker.ld) and run
+/// in U-mode under Sv39 paging by `kernel-arch-glue::enter`.
+///
+/// Deliberately self-contained — every arg is an immediate or comes back
+/// in a register — so the code is correct at its linked VA no matter
+/// where the loader placed the LMA copy, and `.user_text` carries no
+/// relocations to data in kernel `.rodata`. Any human-readable output is
+/// produced by the kernel (`sys::ALIVE`, `sys::REPORT`).
+#[cfg(target_arch = "riscv64")]
+#[link_section = ".user_text"]
+extern "C" fn umode_root() -> ! {
+    // SAFETY: `ecall` from U-mode traps to our S-mode handler, which
+    // preserves every register except a0. The two direct memory accesses
+    // below go through pages the kernel maps `U=1 R+W` in response to our
+    // `MAP_PAGE` / `MAP_ALIAS` calls; they are written as inline `sw`/`lw`
+    // so `.user_text` stays free of calls into kernel `.text` and of any
+    // relocation.
+    unsafe {
+        raw_syscall(sys::ALIVE, 0, 0);
+        let _cap = raw_syscall(sys::RETYPE_ENDPOINT, 0, 0);
+
+        // 1. Ask the kernel to back VA 0xD000_0000 with a real frame
+        //    (genuine Sv39 leaf, U=1 R+W). `pa` is the physical address it
+        //    picked.
+        let pa = raw_syscall(sys::MAP_PAGE, 0xD000_0000, 0);
+
+        // 2. Store a sentinel THROUGH the virtual address. This completes
+        //    only if the PTE is real and user-writable; otherwise it
+        //    faults into the kernel trap handler.
+        core::arch::asm!(
+            "li {t}, 0x5eed",
+            "sw {t}, 0({va})",
+            va = in(reg) 0xD000_0000usize,
+            t = out(reg) _,
+            options(nostack),
+        );
+
+        // 3. Map a SECOND VA onto the same physical frame and read the
+        //    sentinel back through it — zero-copy aliasing, MMU-enforced.
+        raw_syscall(sys::MAP_ALIAS, 0xD000_1000, 0);
+        let via_alias: usize;
+        core::arch::asm!(
+            "lw {out}, 0({va})",
+            va = in(reg) 0xD000_1000usize,
+            out = out(reg) via_alias,
+            options(nostack, readonly),
+        );
+
+        // 4. Have the kernel read the frame directly and confirm all
+        //    three views agree.
+        raw_syscall(sys::XCHECK, pa, via_alias);
+
+        // 5. Two-process zero-copy proof (02-Microkernel-Layer.md §8.4).
+        //    `kernel-arch-glue::enter` has already mapped ONE physical
+        //    frame into BOTH this address space (at 0xC004_0000) and the
+        //    isolated space B (at a different VA). Write a sentinel
+        //    through our VA, then `P2_YIELD` — the kernel snapshots this
+        //    thread and resumes process B in space B.
+        core::arch::asm!(
+            "li {t}, 0xC0DE",
+            "sw {t}, 0({va})",
+            va = in(reg) 0xC004_0000usize,
+            t = out(reg) _,
+            options(nostack),
+        );
+        raw_syscall(sys::P2_YIELD, 0, 0);
+
+        // 6. Resumed here after process B ran. Re-read our VA: process B
+        //    wrote 0xB00B through ITS mapping of the same frame, in a
+        //    different address space, with no copy.
+        let after: usize;
+        core::arch::asm!(
+            "lw {out}, 0({va})",
+            va = in(reg) 0xC004_0000usize,
+            out = out(reg) after,
+            options(nostack, readonly),
+        );
+        raw_syscall(sys::P2_REPORT_A, after, 0);
+
+        // 7. Real Call/Recv/Reply demo (02-Microkernel-Layer.md
+        //    §5.1/§8.2) — unlike everything above (all ad-hoc raw
+        //    opcodes), this exercises the REAL `kernel_core::SyscallOp`
+        //    IPC surface through a genuine trap boundary (see
+        //    `sys::IPC_DEMO_START`'s own doc comment: the concrete thing
+        //    the still-pending register-only IPC fast path needs to
+        //    attach to). `IPC_DEMO_START` spawns the server
+        //    (`umode_ipc_server`) and switches straight to it; we resume
+        //    here once the server's own first `IPC_RECV` finds nothing
+        //    queued yet and switches back — exactly like step 5's
+        //    `P2_YIELD` above, just through the real IPC opcodes instead
+        //    of the demo-specific ones.
+        raw_syscall(sys::IPC_DEMO_START, 0, 0);
+        let ipc_ep = raw_syscall(sys::IPC_ENDPOINT_CAP, 0, 0);
+        let ipc_reply = raw_syscall(sys::IPC_CALL, ipc_ep, 0xC0FFEE);
+        raw_syscall(sys::REPORT, ipc_reply, 0);
+
+        // 7b. fs-native: the REAL FsRequest/FsResponse wire protocol,
+        //     over the SAME real Call/Recv/Reply mechanism, driving a
+        //     REAL isolated process's REAL MemFs (03-Kernel-Subsystems-
+        //     Layer.md §2.2/§5.3) — the first time this project's IPC
+        //     fast path drives a genuine subsystem's own logic, not
+        //     just a demo payload. Open the pre-seeded `/greeting`
+        //     (PathId 0), Stat it (confirms real content-length),
+        //     Close it — all three round-trip through fs-native's own
+        //     isolated process and back.
+        // `zero()` forces a FRESH materialization of the literal `0` at
+        // every call site — **real, deep bug found via QEMU** (this
+        // session's fs-native demo): LLVM's own stack-slot allocation
+        // for this function, at `-O0` under this project's pinned
+        // nightly, was reusing ONE stack slot across TWO logically-
+        // different values — the literal `0` many `raw_syscall` calls
+        // pass as an argument, AND `ipc_reply`'s own computed value
+        // (`0xc0ffef`) a few lines above — apparently believing
+        // (incorrectly) that once `ipc_reply`'s own live range ended,
+        // the slot could be reused for later "0" arguments WITHOUT
+        // actually re-writing it, leaving `ipc_reply`'s stale value in
+        // place. Confirmed via disassembly: the `FS_OPEN` call site
+        // loaded its own "0" argument via `ld a2, 0x30(sp); mv a1, a2`
+        // from the EXACT same stack offset several EARLIER "0"
+        // arguments also used — `#[inline(never)]` (kept anyway, for
+        // the separate class of bug it fixes — see `raw_syscall`'s own
+        // doc comment) did NOT prevent this, since the miscompilation
+        // is entirely within `umode_root`'s OWN stack-slot allocation,
+        // independent of whether `raw_syscall` itself is inlined. TWO
+        // OTHER fixes were tried and BOTH made things WORSE in the same
+        // new way: `core::hint::black_box` and `core::ptr::
+        // read_volatile` are both real, un-inlined function calls under
+        // this `-O0` build (`read_volatile` even includes a UB-check
+        // call) — landing in ordinary kernel `.text`, so calling either
+        // from `.user_text` faults immediately (confirmed via
+        // disassembly: the fault PC was exactly `core::ptr::
+        // read_volatile`'s own compiled body). A raw inline `asm!("",
+        // ...)` block is NEVER a function call — it is always emitted
+        // directly at the call site — so it is the only form of "treat
+        // this value as opaque" that is safe to use here.
+        macro_rules! zero {
+            () => {{
+                let mut v: usize = 0;
+                // SAFETY: a no-op asm block with no real instructions —
+                // its only purpose is the `inout` operand, which forces
+                // the compiler to treat `v` as unknown/possibly-changed
+                // after this point, so it cannot fold or reuse a stale
+                // stack slot for the value used below.
+                core::arch::asm!("/* {0} */", inout(reg) v, options(nomem, nostack, preserves_flags));
+                v
+            }};
+        }
+        raw_syscall(sys::FS_DEMO_START, zero!(), zero!());
+        raw_syscall(sys::FS_OPEN, zero!(), zero!() | 2); // path=0 ("/greeting"), flags=WRITE (real Write demo below needs it)
+        let fs_handle = raw_syscall(sys::FS_OPEN_RESULT, zero!(), zero!());
+        raw_syscall(sys::REPORT, fs_handle, zero!());
+        raw_syscall(sys::FS_STAT, zero!(), zero!()); // path=0
+        let fs_size = raw_syscall(sys::FS_STAT_RESULT, zero!(), zero!());
+        raw_syscall(sys::REPORT, fs_size, zero!());
+        raw_syscall(sys::FS_WRITE, fs_handle, zero!());
+        let fs_written = raw_syscall(sys::FS_WRITE_RESULT, zero!(), zero!());
+        raw_syscall(sys::REPORT, fs_written, zero!());
+        raw_syscall(sys::FS_READ, fs_handle, fs_written);
+        let fs_read = raw_syscall(sys::FS_READ_RESULT, zero!(), zero!());
+        raw_syscall(sys::REPORT, fs_read, zero!());
+
+        // VFS read/write throughput benchmark (03-Kernel-Subsystems-
+        // Layer.md §5, item 5) — riscv64's own copy of x86_64's
+        // `umode_root_x86` benchmark loop (see that one's own doc
+        // comment for the full rationale); identical shape, just this
+        // architecture's own `raw_syscall`.
+        const FS_BENCH_ITERS: usize = 100;
+        let mut w_total_bytes: usize = 0;
+        let mut w_total_ns: usize = 0;
+        for _ in 0..FS_BENCH_ITERS {
+            let t0 = raw_syscall(sys::NOW_NS, zero!(), zero!());
+            raw_syscall(sys::FS_WRITE, fs_handle, zero!());
+            let written = raw_syscall(sys::FS_WRITE_RESULT, zero!(), zero!());
+            let t1 = raw_syscall(sys::NOW_NS, zero!(), zero!());
+            if written != usize::MAX {
+                w_total_bytes += written;
+                w_total_ns += t1.saturating_sub(t0);
+            }
+        }
+        raw_syscall(sys::FS_WRITE_THROUGHPUT_SUMMARY, w_total_bytes, w_total_ns);
+
+        let mut r_total_bytes: usize = 0;
+        let mut r_total_ns: usize = 0;
+        for _ in 0..FS_BENCH_ITERS {
+            let t0 = raw_syscall(sys::NOW_NS, zero!(), zero!());
+            raw_syscall(sys::FS_READ, fs_handle, 4096);
+            let bytes_read = raw_syscall(sys::FS_READ_RESULT_QUIET, zero!(), zero!());
+            let t1 = raw_syscall(sys::NOW_NS, zero!(), zero!());
+            if bytes_read != usize::MAX {
+                r_total_bytes += bytes_read;
+                r_total_ns += t1.saturating_sub(t0);
+            }
+        }
+        raw_syscall(sys::FS_READ_THROUGHPUT_SUMMARY, r_total_bytes, r_total_ns);
+
+        raw_syscall(sys::FS_CLOSE, fs_handle, zero!());
+        let fs_closed = raw_syscall(sys::FS_CLOSE_RESULT, zero!(), zero!());
+        raw_syscall(sys::REPORT, fs_closed, zero!());
+
+        // 7b. virtio-blk demo (03-Kernel-Subsystems-Layer.md §5.1): a
+        // real block driver process, real MMIO handshake, real
+        // virtqueue Write->Read round trip. `DRV_BLK_DEMO_START`
+        // reports `usize::MAX` (mirroring `FS_DEMO_START`'s own
+        // convention) if no Block-kind peripheral was discovered at
+        // boot — the rest of this sequence is skipped in that case
+        // rather than driving IPC against a driver that was never
+        // spawned.
+        let drv_ep = raw_syscall(sys::DRV_BLK_DEMO_START, zero!(), zero!());
+        raw_syscall(sys::REPORT, drv_ep, zero!());
+        if drv_ep != usize::MAX {
+            raw_syscall(sys::DRV_BLK_PROBE, zero!(), zero!());
+            let drv_sector_size = raw_syscall(sys::DRV_BLK_PROBE_RESULT, zero!(), zero!());
+            raw_syscall(sys::REPORT, drv_sector_size, zero!());
+            raw_syscall(sys::DRV_BLK_WRITE, zero!(), zero!()); // lba=0
+            let drv_written = raw_syscall(sys::DRV_BLK_WRITE_RESULT, zero!(), zero!());
+            raw_syscall(sys::REPORT, drv_written, zero!());
+            raw_syscall(sys::DRV_BLK_READ, zero!(), zero!()); // lba=0
+            let drv_read = raw_syscall(sys::DRV_BLK_READ_RESULT, zero!(), zero!());
+            raw_syscall(sys::REPORT, drv_read, zero!());
+        }
+
+        // 7c. virtio-net demo (03-Kernel-Subsystems-Layer.md §2.3/§5.4) —
+        // see `net_demo_riscv64`'s own doc comment for what it does and
+        // why it is a SEPARATE `.user_text` function rather than inlined
+        // here.
+        net_demo_riscv64();
+
+        // 7d. Compositor demo (03-Kernel-Subsystems-Layer.md §2.4/§5.4.2)
+        // — see `compositor_demo_riscv64`'s own doc comment.
+        compositor_demo_riscv64();
+
+        // 7e. mm-service demo (03-Kernel-Subsystems-Layer.md §2.5) — see
+        // `mm_demo_riscv64`'s own doc comment. Also runs the REAL §8.3
+        // IPC fast-path benchmark internally, between the victim query
+        // and the unregister calls (see `mm_bench_riscv64`'s own doc
+        // comment).
+        mm_demo_riscv64();
+
+        // 7f. Kernel-bypass networking demo (03-Kernel-Subsystems-
+        // Layer.md §2.3/§5.4.1) — see `net_bypass_demo_riscv64`'s own
+        // doc comment. Runs LAST among the subsystem demos: it depends
+        // on the virtio-net driver's own TX queue already being idle,
+        // which `net_demo_riscv64` (7c) guarantees by construction.
+        net_bypass_demo_riscv64();
+
+        // 7h. security-broker-intermediary demo (Issue #28): spawns
+        //     security-broker AND the intermediary (via `SBI_DEMO_START`
+        //     — see that opcode's own doc comment for why security-broker
+        //     is spawned HERE and not inside `P2_PREEMPT_START`'s
+        //     handler), then issues one REAL `SecurityRequest::CapGrant`
+        //     targeting `SBI_TARGET_SECURITY_BROKER` (0) and reports the
+        //     new capability slot it lands at in security-broker's OWN
+        //     capability space — proof that a real kernel Capability now
+        //     exists there, minted end to end through the intermediary,
+        //     not just reported as `TransportUnavailable`
+        //     (`kernel_arch_glue::security_broker_intermediary_demo_
+        //     start`'s own doc comment has the full rationale).
+        raw_syscall(sys::SBI_DEMO_START, 0, 0);
+        let sbi_ep = raw_syscall(sys::SBI_ENDPOINT_CAP, 0, 0);
+        raw_syscall(sys::SBI_CAP_GRANT, sbi_ep, 0);
+        let sbi_dst = raw_syscall(sys::SBI_CAP_GRANT_RESULT, 0, 0);
+        raw_syscall(sys::REPORT, sbi_dst, 0);
+        // Now revoke the SAME capability — proves the real kernel
+        // CapRevoke cross-space walk, not just CapGrant (see
+        // `sys::SBI_CAP_REVOKE`'s own doc comment).
+        raw_syscall(sys::SBI_CAP_REVOKE, sbi_ep, 0);
+        let sbi_freed = raw_syscall(sys::SBI_CAP_REVOKE_RESULT, 0, 0);
+        raw_syscall(sys::REPORT, sbi_freed, 0);
+        // Second target_service (mm-service, target_service=1) — proves
+        // the intermediary's own resolution generalizes beyond the one
+        // hardcoded security-broker case (see `sys::SBI_CAP_GRANT2`'s own
+        // doc comment). `target_service: 1` is a plain integer here, same
+        // "kernel-side encoding, plain integers in `.user_text`"
+        // convention every other opcode in this sequence follows.
+        raw_syscall(sys::SBI_CAP_GRANT2, sbi_ep, 1);
+        let sbi_dst2 = raw_syscall(sys::SBI_CAP_GRANT2_RESULT, 0, 0);
+        raw_syscall(sys::REPORT, sbi_dst2, 0);
+        raw_syscall(sys::SBI_CAP_REVOKE2, sbi_ep, 0);
+        let sbi_freed2 = raw_syscall(sys::SBI_CAP_REVOKE2_RESULT, 0, 0);
+        raw_syscall(sys::REPORT, sbi_freed2, 0);
+
+        // 8. Preemption phase (02-Microkernel-Layer.md §4). Ask the
+        //    kernel to arm the supervisor timer, then loop forever
+        //    bumping this process's private counter word in the shared
+        //    frame (offset +8). From here NO `P2_YIELD` is issued — the
+        //    timer interrupt alone switches between this process and the
+        //    worker. Hand-written `lw`/`addi`/`sw` (NOT
+        //    `core::ptr::*_volatile`, which a debug build compiles to a
+        //    call into kernel `.text` that U-mode cannot execute) so
+        //    `.user_text` stays call- and relocation-free.
+        // Real, on-hardware self-exercise of sys::SCHED_SET_SYSTEM_POLICY
+        // (2026-09-18) — the one point in a real boot where this opcode can
+        // actually be observed end to end. simurgh-profile-policy's own
+        // process issues it for real when a user picks a profile in
+        // ui-core's PROFILE submenu, and once at its own startup, but
+        // neither happens on an unattended boot: policy-engine is spawned
+        // and then never scheduled before the fault-isolation demo below
+        // completes and powers the machine off (verified on a real QEMU
+        // boot — device-manager and the spawned security-broker are the
+        // only subsystem processes that run their own code at all here).
+        //
+        // Placed HERE deliberately: every subsystem process has already
+        // been spawned and admitted at this point, so the kernel's own log
+        // line reports a genuinely non-zero re-mode count over real,
+        // already-running threads — not a vacuous call against an empty
+        // scheduler table.
+        //
+        // A round trip, and net zero: Throughput (mode code 1) and
+        // straight back to Interactive (mode code 0), which is the mode
+        // every thread already had. No scheduling decision can happen
+        // between the two traps (each returns TrapOutcome::Resume, so
+        // this thread keeps the CPU across both), which is why this proves
+        // the mechanism without perturbing the boot that follows. Both
+        // calls pass kernel_sched::AGING_CAP_MS (50) — the cap already in
+        // force — so the aging term is left exactly as it was too.
+        raw_syscall(sys::SCHED_SET_SYSTEM_POLICY, 1, 50);
+        raw_syscall(sys::SCHED_SET_SYSTEM_POLICY, 0, 50);
+        raw_syscall(sys::P2_PREEMPT_START, 0, 0);
+        core::arch::asm!(
+            "2:",
+            "lw   t0, 0(t1)",
+            "addi t0, t0, 1",
+            "sw   t0, 0(t1)",
+            "j    2b",
+            in("t1") 0xC004_0008usize,
+            options(noreturn),
+        );
+    }
+}
+
+/// The SECOND user-space process (02-Microkernel-Layer.md §8.4). Linked
+/// into the same `.user_text` pages as `umode_root` but run in its OWN
+/// isolated Sv39 address space (space B) on its own stack by
+/// `kernel-arch-glue::enter`. Reads the shared frame through space B's VA
+/// (0xC020_0000), reports what it saw, writes its own sentinel back, and
+/// hands the core to process A. Self-contained: immediates only, no
+/// relocations, any human-readable output produced by the kernel.
+#[cfg(target_arch = "riscv64")]
+#[link_section = ".user_text"]
+extern "C" fn umode_worker() -> ! {
+    // SAFETY: `ecall` traps to our S-mode handler; the `lw`/`sw` go
+    // through 0xC020_0000, which `enter` mapped `U=1 R+W` onto the shared
+    // physical frame in space B's page table.
+    unsafe {
+        // 1. Read what process A wrote (0xC0DE) through space A's VA —
+        //    seen here via space B's independent mapping of the frame.
+        let seen: usize;
+        core::arch::asm!(
+            "lw {out}, 0({va})",
+            va = in(reg) 0xC020_0000usize,
+            out = out(reg) seen,
+            options(nostack, readonly),
+        );
+        raw_syscall(sys::P2_REPORT_B, seen, 0);
+
+        // 2. Write our own sentinel back through space B's VA.
+        core::arch::asm!(
+            "li {t}, 0xB00B",
+            "sw {t}, 0({va})",
+            va = in(reg) 0xC020_0000usize,
+            t = out(reg) _,
+            options(nostack),
+        );
+
+        // 3. Hand the core back to process A for its final §8.4 check.
+        raw_syscall(sys::P2_YIELD, 0, 0);
+
+        // 4. Resumed here (either by that hand-off's partner, or — once
+        //    process A calls P2_PREEMPT_START — by a timer tick). Loop
+        //    forever bumping this process's private counter word in the
+        //    shared frame (offset +12), issuing NO `P2_YIELD`. If the
+        //    kernel's tick handler is switching us in and out this
+        //    counter climbs; if it were not, it would stay 0. Inline
+        //    `lw`/`addi`/`sw` for the same reason as `umode_root`'s loop.
+        core::arch::asm!(
+            "2:",
+            "lw   t0, 0(t1)",
+            "addi t0, t0, 1",
+            "sw   t0, 0(t1)",
+            "j    2b",
+            in("t1") 0xC020_000Cusize,
+            options(noreturn),
+        );
+    }
+}
+
+/// A THIRD user-space process, spawned via `kernel_arch_glue::
+/// spawn_process` (the generic path, not `umode_root`/`umode_worker`'s
+/// hand-written A/B setup) into its OWN isolated Sv39 address space AND
+/// its OWN capability space — proof that process creation generalizes
+/// beyond the fixed two-process §8.4 proof (a step toward
+/// 03-Kernel-Subsystems-Layer.md §5's subsystems-as-processes). Shares
+/// `.user_text` with the other two (no separate subsystem binary yet).
+///
+/// Needs no endpoint/IPC of its own for this demo — it just bumps a
+/// private counter word at a fixed low address inside its OWN stack
+/// region (safe because this loop pushes no stack frame: pure register
+/// ops, so nothing else ever touches that address). `kernel-arch-glue`
+/// reads the SAME word later through the kernel's own identity map,
+/// using the physical address `spawn_process` returned, not this VA.
+#[cfg(target_arch = "riscv64")]
+#[link_section = ".user_text"]
+extern "C" fn umode_subsystem() -> ! {
+    // SAFETY: `t1` addresses the low end of this process's own `U=1 R+W`
+    // stack mapping (`kernel_arch_glue::spawn_process` set it up); pure
+    // register ops, no stack frame, no relocation.
+    unsafe {
+        core::arch::asm!(
+            "2:",
+            "lw   t0, 0(t1)",
+            "addi t0, t0, 1",
+            "sw   t0, 0(t1)",
+            "j    2b",
+            in("t1") 0xC030_0000usize,
+            options(noreturn),
+        );
+    }
+}
+
+/// The real Call/Recv/Reply demo's SERVER (02-Microkernel-Layer.md
+/// §5.1/§8.2 — see `sys::IPC_DEMO_START`'s own doc comment). Spawned by
+/// `kernel_arch_glue::p2_ipc_demo_start`, sharing `umode_root`'s OWN
+/// address space (not a separate isolated one — this demo is about the
+/// IPC mechanism itself, not process isolation, which is already proven
+/// elsewhere by process B / process C / device-manager). Blocks in
+/// `IPC_RECV`, replies with `label + 1` once a request arrives, then
+/// parks — its one job is done (a single round trip is enough to prove
+/// the real trap boundary works; looping this into a timed benchmark
+/// the way §8.3's in-kernel one already does is a natural follow-up,
+/// not attempted here).
+#[cfg(target_arch = "riscv64")]
+#[link_section = ".user_text"]
+extern "C" fn umode_ipc_server() -> ! {
+    // SAFETY: `ecall` traps to our S-mode handler; pure register ops, no
+    // stack frame, no relocation — same convention every other
+    // `.user_text` function here follows.
+    unsafe {
+        let ep = raw_syscall(sys::IPC_ENDPOINT_CAP, 0, 0);
+        let (from, label) = raw_syscall2(sys::IPC_RECV, ep, 0);
+        raw_syscall(sys::IPC_REPLY, from, label.wrapping_add(1));
+        // `IPC_REPLY` always switches away on success (see its own doc
+        // comment) — unreachable in that case; this is the fallback for
+        // the error case (a malformed `from`, say), so this thread
+        // parks instead of running off the end of the function.
+        core::arch::asm!("2:", "j 2b", options(noreturn));
+    }
+}
+
+/// Process A's preemptive-phase counting loop, run by a FRESH thread
+/// `kernel_arch_glue::p2_preempt_start` spawns to share root's own
+/// address space (not `umode_root` continuing to run itself — see that
+/// function's doc comment on why root's own vruntime-loaded TCB is
+/// retired instead of reused). Bumps the SAME counter word `umode_root`
+/// would have (`P2_VA_A_CONST + 8`), since it runs in the SAME space A.
+#[cfg(target_arch = "riscv64")]
+#[link_section = ".user_text"]
+extern "C" fn umode_a_loop() -> ! {
+    // SAFETY: `t1` addresses `0xC004_0008`, mapped `U=1 R+W` in space A by
+    // `enter`/`umode_root`'s own setup; pure register ops, no stack frame.
+    unsafe {
+        core::arch::asm!(
+            "2:",
+            "lw   t0, 0(t1)",
+            "addi t0, t0, 1",
+            "sw   t0, 0(t1)",
+            "j    2b",
+            in("t1") 0xC004_0008usize,
+            options(noreturn),
+        );
+    }
+}
+
+/// Desktop build's idle thread body (replaces the counting loop): waits
+/// for an interrupt through `sys::IDLE_WAIT` instead of spinning, so an
+/// idle desktop no longer pins a host core at 100%. The kernel side
+/// (`kernel_arch_glue::desktop_idle_wait`) only halts when nothing else
+/// is `Ready` and always finishes with one scheduler tick, which keeps
+/// the preemption timer alive and lets a just-woken input driver run at
+/// once.
+#[cfg(all(feature = "desktop", target_arch = "riscv64"))]
+#[link_section = ".user_text"]
+extern "C" fn umode_idle_loop() -> ! {
+    loop {
+        // SAFETY: plain trap into the kernel; `raw_syscall` lives in
+        // `.user_text` like every other U-mode syscall wrapper.
+        unsafe { raw_syscall(sys::IDLE_WAIT, 0, 0) };
+    }
+}
+
+/// Deliberately-crashing "driver" process — the 03-Kernel-Subsystems-
+/// Layer.md §5.2 acceptance-test demo: "inject a panic in a driver,
+/// prove the rest of the system is unaffected". Executes an illegal
+/// instruction the instant it is scheduled, taking a synchronous U-mode
+/// exception (scause=2) that `hal_riscv64`'s trap vector routes to the
+/// registered `FaultHandler` (`simurgh_fault` -> `kernel_arch_glue::
+/// p2_fault` -> `KernelState::terminate_thread`) instead of halting the
+/// system — proving per-thread fault isolation end-to-end, not just at
+/// the unit-test level (`kernel-core`'s `terminate_thread` tests already
+/// cover the state-machine in isolation).
+#[cfg(target_arch = "riscv64")]
+#[link_section = ".user_text"]
+extern "C" fn umode_faulty_driver() -> ! {
+    // SAFETY: `.word 0` is not a valid RV64GC instruction encoding —
+    // deliberately triggers an illegal-instruction exception, which is
+    // the entire point of this process. `options(noreturn)` is honest:
+    // control never falls through this instruction (the thread is
+    // terminated by the fault handler and never resumed).
+    unsafe {
+        core::arch::asm!(".word 0", options(noreturn));
+    }
+}
+
+/// Placeholder U-mode entry for architectures whose real-kernel boot is
+/// not yet wired (none currently — riscv64, x86_64, and aarch64 all
+/// have their own `umode_root_*` below; kept for forward-compatibility
+/// with a future fourth architecture).
+#[cfg(not(any(
+    target_arch = "riscv64",
+    target_arch = "x86_64",
+    target_arch = "aarch64"
+)))]
+extern "C" fn umode_root() -> ! {
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+/// # Safety
+/// `int 0x80` from Ring 3 traps to the dedicated DPL-3 gate
+/// (`hal_x86_64::cpu`'s `isr_syscall_trampoline`), which preserves every
+/// register except `rax` (the return value) — this project's own
+/// convention (see `hal_x86_64::cpu::SyscallHandler`'s doc comment):
+/// `rax` = opcode, `rdi` = a0, `rsi` = a1.
+///
+/// `#[inline(never)]` (+ mandatory `#[link_section = ".user_text"]`,
+/// since a non-inlined function must stay in the U=1-mapped range
+/// itself): see riscv64's own `raw_syscall`'s extensive doc comment for
+/// the real, QEMU-found miscompilation this avoids — LLVM under this
+/// project's pinned nightly produced incorrect codegen for multiple
+/// sequential calls to an `#[inline(always)]` function wrapping an asm
+/// block that can switch threads (this specific x86_64 arm was not
+/// independently exercised/observed broken, but gets the identical
+/// preventive fix for consistency).
+#[cfg(target_arch = "x86_64")]
+#[inline(never)]
+#[link_section = ".user_text"]
+unsafe fn raw_syscall_x86(opcode: usize, a0: usize, a1: usize) -> usize {
+    let ret: usize;
+    // SAFETY: forwarded from this function's own contract.
+    unsafe {
+        core::arch::asm!(
+            "int 0x80",
+            inlateout("rax") opcode => ret,
+            in("rdi") a0,
+            in("rsi") a1,
+            options(nostack),
+        );
+    }
+    ret
+}
+
+/// Like `raw_syscall_x86`, but also reads back `rsi` — for `IPC_RECV`,
+/// the ONE opcode whose result genuinely does not fit in a single
+/// register (see `hal_x86_64::cpu::TrapOutcome::Resume2`'s own doc
+/// comment). Mirrors riscv64's own `raw_syscall2` exactly, just with
+/// `rsi` (this project's own `a1` register on x86_64) in place of `a1`.
+///
+/// # Safety
+/// Same contract as `raw_syscall_x86` — `int 0x80` preserves every
+/// register except `rax`/`rsi` for this opcode specifically.
+///
+/// `#[inline(never)]` — see `raw_syscall_x86`'s own doc comment.
+#[cfg(target_arch = "x86_64")]
+#[inline(never)]
+#[link_section = ".user_text"]
+unsafe fn raw_syscall2_x86(opcode: usize, a0: usize, a1: usize) -> (usize, usize) {
+    let (r0, r1): (usize, usize);
+    // SAFETY: forwarded from this function's own contract.
+    unsafe {
+        core::arch::asm!(
+            "int 0x80",
+            inlateout("rax") opcode => r0,
+            in("rdi") a0,
+            inlateout("rsi") a1 => r1,
+            options(nostack),
+        );
+    }
+    (r0, r1)
+}
+
+/// The real Call/Recv/Reply demo's endpoint capability slot, set once by
+/// `IPC_DEMO_START`'s handler and read by `IPC_ENDPOINT_CAP` — both the
+/// client (`umode_root_x86`) and the server (`umode_ipc_server_x86`)
+/// call the latter to learn it independently. Mirrors riscv64's own
+/// `G_IPC_EP` exactly.
+#[cfg(target_arch = "x86_64")]
+static mut G_IPC_EP_X86: u32 = 0;
+
+/// fs-native's endpoint capability slot in the caller's (root's) own
+/// capability space — mirrors riscv64's own `G_FS_EP` exactly (see that
+/// static's own doc comment).
+#[cfg(target_arch = "x86_64")]
+static mut G_FS_EP_X86: u32 = 0;
+
+/// security-broker's own `ThreadId`, written once by `spawn_security_
+/// broker_x86` — needed later by `spawn_native_loader_x86` (and every
+/// future client this real-IPC plan wires to security-broker) to derive
+/// its `cap_space`/`addr_space` for `kernel_arch_glue::
+/// wire_service_endpoint`, same pattern `G_SBI_TID`/`G_MM_TID` already
+/// use for the same reason. `security-broker` is always spawned well
+/// before `native-loader` in this architecture's own boot sequence
+/// (`SBI_DEMO_START` runs before `P2_PREEMPT_START`), so this is always
+/// `Some` by the time it is read.
+#[cfg(target_arch = "x86_64")]
+static mut G_SECURITY_BROKER_TID_X86: Option<kernel_cap::ThreadId> = None;
+
+/// `account-manager`'s own `CapSpaceId`, written once its own edge to
+/// security-broker is wired (real-IPC plan, Phase 2) — needed by the
+/// LAST client wired in the `P2_PREEMPT_START` sequence (`native-loader`
+/// today) to wire the shared `Notification` fan-in across all clients in
+/// one final step, without needing to reorder the existing, proven boot
+/// sequence.
+#[cfg(target_arch = "x86_64")]
+static mut G_ACCOUNT_MANAGER_CS_X86: Option<kernel_cap::CapSpaceId> = None;
+
+/// `store`'s own `CapSpaceId` — see `G_ACCOUNT_MANAGER_CS_X86`'s own doc
+/// comment for why this exists.
+#[cfg(target_arch = "x86_64")]
+static mut G_STORE_CS_X86: Option<kernel_cap::CapSpaceId> = None;
+
+/// See the riscv64 `G_COMPOSITOR_EP`'s own doc comment.
+#[cfg(target_arch = "x86_64")]
+static mut G_COMPOSITOR_EP_X86: u32 = 0;
+
+/// See the riscv64 `G_MM_EP`'s own doc comment.
+#[cfg(target_arch = "x86_64")]
+static mut G_MM_EP_X86: u32 = 0;
+
+/// The virtio-blk driver's endpoint capability slot in the caller's
+/// (root's) own capability space — mirrors riscv64's own `G_DRV_EP`
+/// exactly (see that static's own doc comment).
+#[cfg(target_arch = "x86_64")]
+static mut G_DRV_EP_X86: u32 = 0;
+
+/// See the riscv64 `G_SBI_EP`'s own doc comment.
+#[cfg(target_arch = "x86_64")]
+static mut G_SBI_EP_X86: u32 = 0;
+
+/// The virtio-net driver's endpoint capability slot in the caller's
+/// (root's) own capability space — written once by `DRV_NET_DEMO_START`,
+/// read once by `NET_DEMO_START` (this file's own `sys::DRV_NET_DEMO_
+/// START` doc comment on why a kernel-side cache, not this switching
+/// syscall's own "return value", is what carries it across).
+#[cfg(target_arch = "x86_64")]
+static mut G_DRV_NET_EP_X86: u32 = 0;
+
+/// x86_64 counterpart of `net_demo_riscv64` — same sequence, same
+/// `usize::MAX`-means-"no Network-kind peripheral" convention, just
+/// `raw_syscall_x86` instead of `raw_syscall`. See `net_demo_riscv64`'s
+/// own doc comment for the full rationale.
+#[cfg(target_arch = "x86_64")]
+#[inline(never)]
+#[link_section = ".user_text"]
+fn net_demo_x86() {
+    // SAFETY: same contract as every other `raw_syscall_x86` call site in
+    // this file's own `.user_text` code.
+    unsafe {
+        macro_rules! zero {
+            () => {{
+                let mut v: usize = 0;
+                core::arch::asm!("/* {0} */", inout(reg) v, options(nomem, nostack, preserves_flags));
+                v
+            }};
+        }
+        let drv_ep = raw_syscall_x86(sys::DRV_NET_DEMO_START, zero!(), zero!());
+        raw_syscall_x86(sys::REPORT, drv_ep, zero!());
+        if drv_ep != usize::MAX {
+            let started = raw_syscall_x86(sys::NET_DEMO_START, drv_ep, zero!());
+            raw_syscall_x86(sys::REPORT, started, zero!());
+            if started != usize::MAX {
+                const MAX_STATUS_POLL_ATTEMPTS: usize = 5_000;
+                let mut verdict = 0usize;
+                for _ in 0..MAX_STATUS_POLL_ATTEMPTS {
+                    verdict = raw_syscall_x86(sys::NET_STATUS_POLL, zero!(), zero!());
+                    if verdict != 0 {
+                        break;
+                    }
+                }
+                raw_syscall_x86(sys::REPORT, verdict, zero!());
+            }
+        }
+    }
+}
+
+/// See the riscv64 `compositor_demo_riscv64`'s own doc comment.
+#[cfg(target_arch = "x86_64")]
+#[inline(never)]
+#[link_section = ".user_text"]
+fn compositor_demo_x86() {
+    // SAFETY: same contract as every other `raw_syscall_x86` call site in
+    // this file's own `.user_text` code.
+    unsafe {
+        macro_rules! zero {
+            () => {{
+                let mut v: usize = 0;
+                core::arch::asm!("/* {0} */", inout(reg) v, options(nomem, nostack, preserves_flags));
+                v
+            }};
+        }
+        let ep = raw_syscall_x86(sys::COMPOSITOR_DEMO_START, zero!(), zero!());
+        raw_syscall_x86(sys::REPORT, ep, zero!());
+        if ep != usize::MAX {
+            raw_syscall_x86(sys::COMPOSITOR_CREATE_SURFACE, zero!(), zero!());
+            let surface = raw_syscall_x86(sys::COMPOSITOR_CREATE_SURFACE_RESULT, zero!(), zero!());
+            raw_syscall_x86(sys::REPORT, surface, zero!());
+            if surface != usize::MAX {
+                raw_syscall_x86(sys::COMPOSITOR_COMMIT_BUFFER, surface, zero!());
+                let committed = raw_syscall_x86(sys::COMPOSITOR_COMMIT_VERIFY, zero!(), zero!());
+                raw_syscall_x86(sys::REPORT, committed, zero!());
+                raw_syscall_x86(sys::COMPOSITOR_DESTROY_SURFACE, surface, zero!());
+                let destroyed = raw_syscall_x86(sys::COMPOSITOR_DESTROY_RESULT, zero!(), zero!());
+                raw_syscall_x86(sys::REPORT, destroyed, zero!());
+            }
+        }
+    }
+}
+
+/// See the riscv64 `mm_demo_riscv64`'s own doc comment.
+#[cfg(target_arch = "x86_64")]
+#[inline(never)]
+#[link_section = ".user_text"]
+fn mm_demo_x86() {
+    // SAFETY: same contract as every other `raw_syscall_x86` call site in
+    // this file's own `.user_text` code.
+    unsafe {
+        macro_rules! zero {
+            () => {{
+                let mut v: usize = 0;
+                core::arch::asm!("/* {0} */", inout(reg) v, options(nomem, nostack, preserves_flags));
+                v
+            }};
+        }
+        let ep = raw_syscall_x86(sys::MM_DEMO_START, zero!(), zero!());
+        raw_syscall_x86(sys::REPORT, ep, zero!());
+        if ep != usize::MAX {
+            raw_syscall_x86(sys::MM_REGISTER, zero!(), zero!()); // MM_DEMO_PROCS[0]: thread 100, Normal
+            let reg0 = raw_syscall_x86(sys::MM_REGISTER_RESULT, zero!(), zero!());
+            raw_syscall_x86(sys::REPORT, reg0, zero!());
+            raw_syscall_x86(sys::MM_REGISTER, 1, zero!()); // MM_DEMO_PROCS[1]: thread 200, Sacrificial
+            let reg1 = raw_syscall_x86(sys::MM_REGISTER_RESULT, zero!(), zero!());
+            raw_syscall_x86(sys::REPORT, reg1, zero!());
+            raw_syscall_x86(sys::MM_QUERY_TOTAL_RESIDENT, zero!(), zero!());
+            let total = raw_syscall_x86(sys::MM_QUERY_TOTAL_RESIDENT_RESULT, zero!(), zero!());
+            raw_syscall_x86(sys::REPORT, total, zero!());
+            raw_syscall_x86(sys::MM_QUERY_VICTIM, zero!(), zero!());
+            let victim = raw_syscall_x86(sys::MM_QUERY_VICTIM_RESULT, zero!(), zero!());
+            raw_syscall_x86(sys::REPORT, victim, zero!());
+            // The REAL §8.3 IPC fast-path benchmark - see the riscv64
+            // `mm_bench_riscv64`'s own doc comment for why this runs
+            // BEFORE unregistering below. A pure measurement, so the
+            // `desktop` build skips it (mm-service stays spawned).
+            #[cfg(not(feature = "desktop"))]
+            mm_bench_x86();
+            raw_syscall_x86(sys::MM_UNREGISTER, 100, zero!());
+            let unreg0 = raw_syscall_x86(sys::MM_UNREGISTER_RESULT, zero!(), zero!());
+            raw_syscall_x86(sys::REPORT, unreg0, zero!());
+            raw_syscall_x86(sys::MM_UNREGISTER, 200, zero!());
+            let unreg1 = raw_syscall_x86(sys::MM_UNREGISTER_RESULT, zero!(), zero!());
+            raw_syscall_x86(sys::REPORT, unreg1, zero!());
+        }
+    }
+}
+
+/// See the riscv64 `mm_bench_riscv64`'s own doc comment. (Not called by
+/// the `desktop` build — a pure benchmark.)
+#[cfg(target_arch = "x86_64")]
+#[cfg_attr(feature = "desktop", allow(dead_code))]
+#[inline(never)]
+#[link_section = ".user_text"]
+fn mm_bench_x86() {
+    // SAFETY: same contract as every other `raw_syscall_x86` call site in
+    // this file's own `.user_text` code.
+    unsafe {
+        macro_rules! zero {
+            () => {{
+                let mut v: usize = 0;
+                core::arch::asm!("/* {0} */", inout(reg) v, options(nomem, nostack, preserves_flags));
+                v
+            }};
+        }
+        const ITERS: usize = 200;
+        let (mut min_ns, mut max_ns, mut sum_ns) = (usize::MAX, 0usize, 0usize);
+        for _ in 0..ITERS {
+            let t0 = raw_syscall_x86(sys::NOW_NS, zero!(), zero!());
+            raw_syscall_x86(sys::MM_QUERY_TOTAL_RESIDENT, zero!(), zero!());
+            raw_syscall_x86(sys::MM_QUERY_TOTAL_RESIDENT_RESULT_QUIET, zero!(), zero!());
+            let t1 = raw_syscall_x86(sys::NOW_NS, zero!(), zero!());
+            let dt = t1.saturating_sub(t0);
+            if dt < min_ns {
+                min_ns = dt;
+            }
+            if dt > max_ns {
+                max_ns = dt;
+            }
+            sum_ns += dt;
+        }
+        raw_syscall_x86(sys::REPORT, min_ns, zero!());
+        raw_syscall_x86(sys::REPORT, sum_ns / ITERS, zero!());
+        raw_syscall_x86(sys::REPORT, max_ns, zero!());
+    }
+}
+
+/// See the riscv64 `net_bypass_demo_riscv64`'s own doc comment. (Not
+/// called by the `desktop` build — a latency comparison only.)
+#[cfg(target_arch = "x86_64")]
+#[cfg_attr(feature = "desktop", allow(dead_code))]
+#[inline(never)]
+#[link_section = ".user_text"]
+fn net_bypass_demo_x86() {
+    // SAFETY: same contract as every other `raw_syscall_x86` call site in
+    // this file's own `.user_text` code.
+    unsafe {
+        macro_rules! zero {
+            () => {{
+                let mut v: usize = 0;
+                core::arch::asm!("/* {0} */", inout(reg) v, options(nomem, nostack, preserves_flags));
+                v
+            }};
+        }
+        raw_syscall_x86(sys::NET_BYPASS_REQUEST, zero!(), zero!());
+        let granted = raw_syscall_x86(sys::NET_BYPASS_REQUEST_RESULT, zero!(), zero!());
+        raw_syscall_x86(sys::REPORT, granted, zero!());
+        if granted != 0 {
+            // §5.4.1's own latency comparison - see the riscv64
+            // `net_bypass_demo_riscv64`'s own doc comment (standard path
+            // FIRST, bypass SECOND - deliberate order, not incidental).
+            const SAMPLES: usize = 10;
+
+            let (mut s_min, mut s_max, mut s_sum, mut s_ok) = (usize::MAX, 0usize, 0usize, 0usize);
+            for _ in 0..SAMPLES {
+                let t0 = raw_syscall_x86(sys::NOW_NS, zero!(), zero!());
+                raw_syscall_x86(sys::NET_STANDARD_SEND_REQUEST, zero!(), zero!());
+                let relayed = raw_syscall_x86(sys::NET_STANDARD_SEND_REQUEST_RESULT, zero!(), zero!());
+                let t1 = raw_syscall_x86(sys::NOW_NS, zero!(), zero!());
+                if relayed != 0 {
+                    let dt = t1.saturating_sub(t0);
+                    s_ok += 1;
+                    if dt < s_min {
+                        s_min = dt;
+                    }
+                    if dt > s_max {
+                        s_max = dt;
+                    }
+                    s_sum += dt;
+                }
+            }
+            raw_syscall_x86(sys::REPORT, s_ok, zero!());
+            let s_avg = if s_ok > 0 { s_sum / s_ok } else { 0 };
+            if s_ok > 0 {
+                raw_syscall_x86(sys::REPORT, s_min, zero!());
+                raw_syscall_x86(sys::REPORT, s_avg, zero!());
+                raw_syscall_x86(sys::REPORT, s_max, zero!());
+            }
+
+            let (mut b_min, mut b_max, mut b_sum, mut b_ok) = (usize::MAX, 0usize, 0usize, 0usize);
+            for _ in 0..SAMPLES {
+                let ns = raw_syscall_x86(sys::NET_BYPASS_SEND, zero!(), zero!());
+                if ns != usize::MAX {
+                    b_ok += 1;
+                    if ns < b_min {
+                        b_min = ns;
+                    }
+                    if ns > b_max {
+                        b_max = ns;
+                    }
+                    b_sum += ns;
+                }
+            }
+            raw_syscall_x86(sys::REPORT, b_ok, zero!());
+            let b_avg = if b_ok > 0 { b_sum / b_ok } else { 0 };
+            if b_ok > 0 {
+                raw_syscall_x86(sys::REPORT, b_min, zero!());
+                raw_syscall_x86(sys::REPORT, b_avg, zero!());
+                raw_syscall_x86(sys::REPORT, b_max, zero!());
+            }
+
+            raw_syscall_x86(sys::NET_LATENCY_SUMMARY, b_avg, s_avg);
+        }
+    }
+}
+
+/// The x86_64 Root Task entry. Linked into `.user_text` (its own
+/// `U=1` `R+X` pages at the linked VMA, per hal-x86_64's linker.ld) and
+/// run in Ring 3 by `kernel-arch-glue::enter`. Extends the original
+/// minimal ALIVE/REPORT proof with the cooperative two-process §8.4
+/// round-trip (mirroring riscv64's own `umode_root` steps 5-6 exactly —
+/// steps 1-4 there, MAP_PAGE/MAP_ALIAS/XCHECK, are riscv64-only demo
+/// machinery this milestone does not need: real paging correctness was
+/// already proven independently via `x86_64_paging_selftest`, entirely
+/// in Ring 0). Deliberately still self-contained: every VA is an
+/// immediate, matching riscv64's own "`.user_text` stays relocation-
+/// free" discipline.
+#[cfg(target_arch = "x86_64")]
+#[link_section = ".user_text"]
+extern "C" fn umode_root_x86() -> ! {
+    // SAFETY: see `raw_syscall_x86`'s own contract. The memory accesses
+    // below go through `P2_VA_A_CONST` (0xC0040000, a `kernel-arch-
+    // glue`-owned constant — see `setup_two_process`), which `enter`
+    // maps `U=1 R+W` onto the frame shared with process B.
+    unsafe {
+        raw_syscall_x86(sys::ALIVE, 0, 0);
+        raw_syscall_x86(sys::REPORT, 0x5eed_5eed, 0);
+
+        // 1. Write a sentinel through OUR mapping of the shared frame,
+        //    then `P2_YIELD` — the kernel snapshots this thread and
+        //    resumes process B in its own isolated space.
+        core::arch::asm!(
+            "mov dword ptr [{va}], 0xC0DE",
+            va = in(reg) 0xC004_0000u64,
+            options(nostack),
+        );
+        raw_syscall_x86(sys::P2_YIELD, 0, 0);
+
+        // 2. Resumed here after process B ran. Re-read our VA: process B
+        //    wrote 0xB00B through ITS OWN mapping of the same frame, in
+        //    a different address space, with no copy.
+        let after: usize;
+        core::arch::asm!(
+            "mov {out:e}, dword ptr [{va}]",
+            va = in(reg) 0xC004_0000u64,
+            out = out(reg) after,
+            options(nostack, readonly),
+        );
+        raw_syscall_x86(sys::P2_REPORT_A, after, 0);
+
+        // 3. Real Call/Recv/Reply demo (02-Microkernel-Layer.md
+        //    §5.1/§8.2) — unlike everything above (all ad-hoc raw
+        //    opcodes), this exercises the REAL `kernel_core::SyscallOp`
+        //    IPC surface through a genuine trap boundary. Mirrors
+        //    riscv64's own `umode_root` step 7 exactly: `IPC_DEMO_START`
+        //    spawns the server (`umode_ipc_server_x86`) and switches
+        //    straight to it; we resume here once the server's own first
+        //    `IPC_RECV` finds nothing queued yet and switches back.
+        raw_syscall_x86(sys::IPC_DEMO_START, 0, 0);
+        let ipc_ep = raw_syscall_x86(sys::IPC_ENDPOINT_CAP, 0, 0);
+        let ipc_reply = raw_syscall_x86(sys::IPC_CALL, ipc_ep, 0xC0FFEE);
+        raw_syscall_x86(sys::REPORT, ipc_reply, 0);
+
+        // 7b. fs-native: the REAL FsRequest/FsResponse wire protocol,
+        //     over the SAME real Call/Recv/Reply mechanism, driving a
+        //     REAL isolated process's REAL MemFs (03-Kernel-Subsystems-
+        //     Layer.md §2.2/§5.3) — mirrors riscv64's own `umode_root`
+        //     step 7b exactly (see its own doc comment). `zero!()`:
+        //     same stack-slot-reuse miscompilation riscv64's own comment
+        //     documents in full — not independently observed broken on
+        //     this arch, but applied for the identical preventive
+        //     reason `#[inline(never)]` was applied to `raw_syscall_x86`
+        //     itself (both are defense against the SAME LLVM `-O0`
+        //     behavior, which is a compiler/optimization-level property,
+        //     not an ISA one).
+        macro_rules! zero {
+            () => {{
+                let mut v: usize = 0;
+                // SAFETY: a no-op asm block — see riscv64's own
+                // `umode_root`'s identical macro for the full rationale.
+                core::arch::asm!("/* {0} */", inout(reg) v, options(nomem, nostack, preserves_flags));
+                v
+            }};
+        }
+        raw_syscall_x86(sys::FS_DEMO_START, zero!(), zero!());
+        raw_syscall_x86(sys::FS_OPEN, zero!(), zero!() | 2); // path=0 ("/greeting"), flags=WRITE (real Write demo below needs it)
+        let fs_handle = raw_syscall_x86(sys::FS_OPEN_RESULT, zero!(), zero!());
+        raw_syscall_x86(sys::REPORT, fs_handle, zero!());
+        raw_syscall_x86(sys::FS_STAT, zero!(), zero!()); // path=0
+        let fs_size = raw_syscall_x86(sys::FS_STAT_RESULT, zero!(), zero!());
+        raw_syscall_x86(sys::REPORT, fs_size, zero!());
+        raw_syscall_x86(sys::FS_WRITE, fs_handle, zero!());
+        let fs_written = raw_syscall_x86(sys::FS_WRITE_RESULT, zero!(), zero!());
+        raw_syscall_x86(sys::REPORT, fs_written, zero!());
+        raw_syscall_x86(sys::FS_READ, fs_handle, fs_written);
+        let fs_read = raw_syscall_x86(sys::FS_READ_RESULT, zero!(), zero!());
+        raw_syscall_x86(sys::REPORT, fs_read, zero!());
+
+        // 7b(ii). VFS read/write throughput benchmark
+        // (03-Kernel-Subsystems-Layer.md §5, item 5: "VFS read/write
+        // throughput relative to a reference system (currently Linux on
+        // the same QEMU)... reported — must not drop more than 20-30% in
+        // the MVP, due to IPC overhead"). Reuses the SAME open `fs_handle`
+        // and the full `FS_DEMO_WRITE_DATA` (4096-byte) payload the
+        // single-shot demo just proved correct above — fs-native's own
+        // `MemFs::write` always overwrites at offset 0, so repeating this
+        // never grows the file past one page. Write phase and read phase
+        // are timed and reported SEPARATELY (mirroring how `dd` itself
+        // times a write pass and a read pass independently), each
+        // bracketed with real `NOW_NS` timestamps around a real `Call`/
+        // `Reply` round trip through fs-native's own isolated process —
+        // the read phase uses `FS_READ_RESULT_QUIET` so it doesn't spam
+        // one MATCH/MISMATCH log line per iteration.
+        //
+        // Skipped in the `desktop` build: a pure measurement (200 real
+        // round trips) that spawns and wires nothing the desktop needs —
+        // fs-native itself was already spawned by `FS_DEMO_START` above
+        // and stays up for file-manager/init.
+        #[cfg(not(feature = "desktop"))]
+        {
+            const FS_BENCH_ITERS: usize = 100;
+            let mut w_total_bytes: usize = 0;
+            let mut w_total_ns: usize = 0;
+            for _ in 0..FS_BENCH_ITERS {
+                let t0 = raw_syscall_x86(sys::NOW_NS, zero!(), zero!());
+                raw_syscall_x86(sys::FS_WRITE, fs_handle, zero!());
+                let written = raw_syscall_x86(sys::FS_WRITE_RESULT, zero!(), zero!());
+                let t1 = raw_syscall_x86(sys::NOW_NS, zero!(), zero!());
+                if written != usize::MAX {
+                    w_total_bytes += written;
+                    w_total_ns += t1.saturating_sub(t0);
+                }
+            }
+            raw_syscall_x86(sys::FS_WRITE_THROUGHPUT_SUMMARY, w_total_bytes, w_total_ns);
+
+            let mut r_total_bytes: usize = 0;
+            let mut r_total_ns: usize = 0;
+            for _ in 0..FS_BENCH_ITERS {
+                let t0 = raw_syscall_x86(sys::NOW_NS, zero!(), zero!());
+                raw_syscall_x86(sys::FS_READ, fs_handle, 4096);
+                let bytes_read = raw_syscall_x86(sys::FS_READ_RESULT_QUIET, zero!(), zero!());
+                let t1 = raw_syscall_x86(sys::NOW_NS, zero!(), zero!());
+                if bytes_read != usize::MAX {
+                    r_total_bytes += bytes_read;
+                    r_total_ns += t1.saturating_sub(t0);
+                }
+            }
+            raw_syscall_x86(sys::FS_READ_THROUGHPUT_SUMMARY, r_total_bytes, r_total_ns);
+        }
+
+        raw_syscall_x86(sys::FS_CLOSE, fs_handle, zero!());
+        let fs_closed = raw_syscall_x86(sys::FS_CLOSE_RESULT, zero!(), zero!());
+        raw_syscall_x86(sys::REPORT, fs_closed, zero!());
+
+        // 7c. virtio-blk demo (03-Kernel-Subsystems-Layer.md §5.1) —
+        // mirrors aarch64's own `umode_root_aarch64` step 7c exactly
+        // (see its own doc comment), except the device here is
+        // discovered over ECAM PCI same as aarch64 but wired up with
+        // a REAL MSI-X interrupt (`hal_x86_64::interrupt::InterruptCtrl::
+        // msi_message`, `kernel_arch_glue::wire_virtio_pci_transport`'s
+        // own MSI-X branch), not a legacy INTx swizzle — see either's
+        // own doc comment for the full rationale. `DRV_BLK_DEMO_START`
+        // reports `usize::MAX` (mirroring `FS_DEMO_START`'s own
+        // convention) if no Block-kind peripheral was discovered at
+        // boot — the rest of this sequence is skipped in that case
+        // rather than driving IPC against a driver that was never
+        // spawned.
+        let drv_ep = raw_syscall_x86(sys::DRV_BLK_DEMO_START, zero!(), zero!());
+        raw_syscall_x86(sys::REPORT, drv_ep, zero!());
+        if drv_ep != usize::MAX {
+            raw_syscall_x86(sys::DRV_BLK_PROBE, zero!(), zero!());
+            let drv_sector_size = raw_syscall_x86(sys::DRV_BLK_PROBE_RESULT, zero!(), zero!());
+            raw_syscall_x86(sys::REPORT, drv_sector_size, zero!());
+            raw_syscall_x86(sys::DRV_BLK_WRITE, zero!(), zero!()); // lba=0
+            let drv_written = raw_syscall_x86(sys::DRV_BLK_WRITE_RESULT, zero!(), zero!());
+            raw_syscall_x86(sys::REPORT, drv_written, zero!());
+            raw_syscall_x86(sys::DRV_BLK_READ, zero!(), zero!()); // lba=0
+            let drv_read = raw_syscall_x86(sys::DRV_BLK_READ_RESULT, zero!(), zero!());
+            raw_syscall_x86(sys::REPORT, drv_read, zero!());
+        }
+
+        // 7d. virtio-net demo (03-Kernel-Subsystems-Layer.md §2.3/§5.4) —
+        // see `net_demo_x86`'s own doc comment for what it does and why
+        // it is a SEPARATE `.user_text` function rather than inlined
+        // here (mirrors riscv64's own `net_demo_riscv64` call site).
+        net_demo_x86();
+
+        // 7e. Compositor demo (03-Kernel-Subsystems-Layer.md §2.4/§5.4.2)
+        // — see `compositor_demo_x86`'s own doc comment.
+        compositor_demo_x86();
+
+        // 7f. mm-service demo (03-Kernel-Subsystems-Layer.md §2.5) — see
+        // `mm_demo_x86`'s own doc comment. Also runs the REAL §8.3 IPC
+        // fast-path benchmark internally (see `mm_bench_x86`'s own doc
+        // comment).
+        mm_demo_x86();
+
+        // 7g. Kernel-bypass networking demo (03-Kernel-Subsystems-
+        // Layer.md §2.3/§5.4.1) — see `net_bypass_demo_x86`'s own doc
+        // comment. Runs LAST among the subsystem demos, same ordering
+        // reason as riscv64's own identical call site. A latency
+        // comparison only (nothing the desktop uses is spawned by it), so
+        // the `desktop` build skips it.
+        #[cfg(not(feature = "desktop"))]
+        net_bypass_demo_x86();
+
+        // 7h. security-broker-intermediary demo (Issue #28): spawns
+        //     security-broker AND the intermediary (via `SBI_DEMO_START`
+        //     — see that opcode's own doc comment for why security-broker
+        //     is spawned HERE and not inside `P2_PREEMPT_START`'s
+        //     handler), then issues one REAL `SecurityRequest::CapGrant`
+        //     targeting `SBI_TARGET_SECURITY_BROKER` (0) and reports the
+        //     new capability slot it lands at in security-broker's OWN
+        //     capability space — proof that a real kernel Capability now
+        //     exists there, minted end to end through the intermediary,
+        //     not just reported as `TransportUnavailable`
+        //     (`kernel_arch_glue::security_broker_intermediary_demo_
+        //     start`'s own doc comment has the full rationale). Runs
+        //     BEFORE the preemption phase, same reason every other
+        //     `*_DEMO_START` sequential demo above does.
+        raw_syscall_x86(sys::SBI_DEMO_START, 0, 0);
+        let sbi_ep = raw_syscall_x86(sys::SBI_ENDPOINT_CAP, 0, 0);
+        raw_syscall_x86(sys::SBI_CAP_GRANT, sbi_ep, 0);
+        let sbi_dst = raw_syscall_x86(sys::SBI_CAP_GRANT_RESULT, 0, 0);
+        raw_syscall_x86(sys::REPORT, sbi_dst, 0);
+        raw_syscall_x86(sys::SBI_CAP_REVOKE, sbi_ep, 0);
+        let sbi_freed = raw_syscall_x86(sys::SBI_CAP_REVOKE_RESULT, 0, 0);
+        raw_syscall_x86(sys::REPORT, sbi_freed, 0);
+        raw_syscall_x86(sys::SBI_CAP_GRANT2, sbi_ep, 1);
+        let sbi_dst2 = raw_syscall_x86(sys::SBI_CAP_GRANT2_RESULT, 0, 0);
+        raw_syscall_x86(sys::REPORT, sbi_dst2, 0);
+        raw_syscall_x86(sys::SBI_CAP_REVOKE2, sbi_ep, 0);
+        let sbi_freed2 = raw_syscall_x86(sys::SBI_CAP_REVOKE2_RESULT, 0, 0);
+        raw_syscall_x86(sys::REPORT, sbi_freed2, 0);
+
+        // 8. Preemption phase (02-Microkernel-Layer.md §4). Ask the
+        //    kernel to arm the LAPIC timer, then loop forever bumping
+        //    this process's private counter word in the shared frame
+        //    (offset +8). From here NO `P2_YIELD` is issued — the timer
+        //    interrupt alone switches between this process and the
+        //    worker. In practice `kernel_arch_glue::p2_preempt_start`
+        //    always switches AWAY to a fresh thread sharing this same
+        //    address space before this `int 0x80` ever returns (see its
+        //    own doc comment on why root's own vruntime-loaded TCB is
+        //    retired rather than reused) — this loop is the fallback
+        //    for the rare case that spawn fails, mirroring riscv64's/
+        //    aarch64's own identical tail exactly.
+        // Real, on-hardware self-exercise of sys::SCHED_SET_SYSTEM_POLICY
+        // (2026-09-18) — the one point in a real boot where this opcode can
+        // actually be observed end to end. simurgh-profile-policy's own
+        // process issues it for real when a user picks a profile in
+        // ui-core's PROFILE submenu, and once at its own startup, but
+        // neither happens on an unattended boot: policy-engine is spawned
+        // and then never scheduled before the fault-isolation demo below
+        // completes and powers the machine off (verified on a real QEMU
+        // boot — device-manager and the spawned security-broker are the
+        // only subsystem processes that run their own code at all here).
+        //
+        // Placed HERE deliberately: every subsystem process has already
+        // been spawned and admitted at this point, so the kernel's own log
+        // line reports a genuinely non-zero re-mode count over real,
+        // already-running threads — not a vacuous call against an empty
+        // scheduler table.
+        //
+        // A round trip, and net zero: Throughput (mode code 1) and
+        // straight back to Interactive (mode code 0), which is the mode
+        // every thread already had. No scheduling decision can happen
+        // between the two traps (each returns TrapOutcome::Resume, so
+        // this thread keeps the CPU across both), which is why this proves
+        // the mechanism without perturbing the boot that follows. Both
+        // calls pass kernel_sched::AGING_CAP_MS (50) — the cap already in
+        // force — so the aging term is left exactly as it was too.
+        raw_syscall_x86(sys::SCHED_SET_SYSTEM_POLICY, 1, 50);
+        raw_syscall_x86(sys::SCHED_SET_SYSTEM_POLICY, 0, 50);
+        raw_syscall_x86(sys::P2_PREEMPT_START, 0, 0);
+        // Address in a HARDCODED `ecx` (loaded once, up front), data in
+        // hardcoded `eax` — two DISTINCT physical registers, neither
+        // left to the compiler's own choice. **Two real bugs found via
+        // QEMU** (this session's x86_64 preemption work), in order:
+        // 1. The original `va = in(reg) ...` let the compiler pick ANY
+        //    register for `{va}`, with nothing reserving `eax` (already
+        //    hardcoded as the DATA register in `add eax, 1`) against
+        //    being that same choice — it picked `rax`, so `mov eax,
+        //    [{va}]` clobbered the address with the just-loaded data
+        //    before `mov [{va}], eax` ran, writing the counter's VALUE
+        //    to whatever address that value looked like (Ring-3 `#PF`,
+        //    error_code=0x7, cr2=0x1, on this loop's very first
+        //    iteration — deterministic, not QEMU-timing luck).
+        // 2. Switching to `va = const` (substituting the address
+        //    directly as a `[disp32]` memory operand, no register at
+        //    all) traded that for a SECOND bug: x86-64's base-less
+        //    `[disp32]` addressing form SIGN-EXTENDS the 32-bit
+        //    displacement to 64 bits, and `0xC0040008`'s high bit is
+        //    set — the CPU actually faulted on `0xffffffffC0040008`
+        //    (confirmed via this session's own `cr2` exception dump).
+        //    Loading the same immediate into a register with `mov
+        //    ecx, imm32` instead ZERO-extends (every 32-bit `mov` into
+        //    a GPR clears the upper 32 bits on x86-64), giving the
+        //    correct unsigned address with no sign-extension trap.
+        core::arch::asm!(
+            "mov ecx, {va}",
+            "2:",
+            "mov eax, dword ptr [rcx]",
+            "add eax, 1",
+            "mov dword ptr [rcx], eax",
+            "jmp 2b",
+            va = const 0xC004_0008u32,
+            options(noreturn),
+        );
+    }
+}
+
+/// The SECOND user-space process (02-Microkernel-Layer.md §8.4). Linked
+/// into the same `.user_text` pages as `umode_root_x86` but run in its
+/// OWN isolated address space (space B) on its own stack by
+/// `kernel-arch-glue::setup_two_process`. Mirrors hal-riscv64's
+/// `umode_worker` steps 1-4 exactly, including the preemptive-phase
+/// counting-loop tail.
+#[cfg(target_arch = "x86_64")]
+#[link_section = ".user_text"]
+extern "C" fn umode_worker_x86() -> ! {
+    // SAFETY: `int 0x80` traps to our dedicated DPL-3 gate; the memory
+    // accesses go through `P2_VA_B_CONST` (0xC0200000), which `enter`
+    // maps `U=1 R+W` onto the SAME physical frame as A's own
+    // `P2_VA_A_CONST` mapping, at a different VA in this isolated space.
+    unsafe {
+        let seen: usize;
+        core::arch::asm!(
+            "mov {out:e}, dword ptr [{va}]",
+            va = in(reg) 0xC020_0000u64,
+            out = out(reg) seen,
+            options(nostack, readonly),
+        );
+        raw_syscall_x86(sys::P2_REPORT_B, seen, 0);
+
+        core::arch::asm!(
+            "mov dword ptr [{va}], 0xB00B",
+            va = in(reg) 0xC020_0000u64,
+            options(nostack),
+        );
+
+        // 3. Hand the core back to process A for its final §8.4 check.
+        raw_syscall_x86(sys::P2_YIELD, 0, 0);
+
+        // 4. Resumed here (either by that hand-off's partner, or — once
+        //    process A calls P2_PREEMPT_START — by a timer tick). Loop
+        //    forever bumping this process's private counter word in the
+        //    shared frame (offset +12), issuing NO further `P2_YIELD`.
+        // Hardcoded `ecx` (address) + `eax` (data) — see `umode_root_x86`'s
+        // tail loop for the two register/sign-extension bugs this avoids.
+        core::arch::asm!(
+            "mov ecx, {va}",
+            "2:",
+            "mov eax, dword ptr [rcx]",
+            "add eax, 1",
+            "mov dword ptr [rcx], eax",
+            "jmp 2b",
+            va = const 0xC020_000Cu32,
+            options(noreturn),
+        );
+    }
+}
+
+/// A THIRD user-space process, spawned via `kernel_arch_glue::
+/// spawn_process` (the generic path, not `umode_root_x86`/`umode_
+/// worker_x86`'s hand-written A/B setup) into its OWN isolated address
+/// space AND its OWN capability space — proof that process creation
+/// generalizes beyond the fixed two-process §8.4 proof. Mirrors
+/// riscv64's `umode_subsystem`/aarch64's `umode_subsystem_aarch64`
+/// exactly: bumps a private counter word at a fixed low address inside
+/// its OWN stack region (safe because this loop pushes no stack frame —
+/// pure register ops).
+#[cfg(target_arch = "x86_64")]
+#[link_section = ".user_text"]
+extern "C" fn umode_subsystem_x86() -> ! {
+    // SAFETY: the address is the low end of this process's own `U=1
+    // R+W` stack mapping (`kernel_arch_glue::spawn_process` set it up);
+    // pure register ops, no stack frame, no relocation.
+    unsafe {
+        // Hardcoded `ecx` (address) + `eax` (data) — see `umode_root_x86`'s
+        // tail loop for the two register/sign-extension bugs this avoids.
+        core::arch::asm!(
+            "mov ecx, {va}",
+            "2:",
+            "mov eax, dword ptr [rcx]",
+            "add eax, 1",
+            "mov dword ptr [rcx], eax",
+            "jmp 2b",
+            va = const 0xC030_0000u32,
+            options(noreturn),
+        );
+    }
+}
+
+/// Process A's preemptive-phase counting loop, run by a FRESH thread
+/// `kernel_arch_glue::p2_preempt_start` spawns to share root's own
+/// address space (not `umode_root_x86` continuing to run itself — see
+/// that function's doc comment on why root's own vruntime-loaded TCB is
+/// retired instead of reused). Bumps the SAME counter word `umode_
+/// root_x86` would have (`P2_VA_A_CONST + 8`), since it runs in the
+/// SAME space A. Mirrors riscv64's `umode_a_loop`/aarch64's `umode_
+/// a_loop_aarch64` exactly.
+#[cfg(target_arch = "x86_64")]
+#[link_section = ".user_text"]
+extern "C" fn umode_a_loop_x86() -> ! {
+    // SAFETY: the address is mapped `U=1 R+W` in space A by `enter`/
+    // `umode_root_x86`'s own setup; pure register ops, no stack frame.
+    unsafe {
+        // Hardcoded `ecx` (address) + `eax` (data) — see `umode_root_x86`'s
+        // tail loop for the two register/sign-extension bugs this avoids
+        // (this exact function is where the first of the two was
+        // originally found, via QEMU).
+        core::arch::asm!(
+            "mov ecx, {va}",
+            "2:",
+            "mov eax, dword ptr [rcx]",
+            "add eax, 1",
+            "mov dword ptr [rcx], eax",
+            "jmp 2b",
+            va = const 0xC004_0008u32,
+            options(noreturn),
+        );
+    }
+}
+
+/// Desktop build's idle thread body (replaces the counting loop): waits
+/// for an interrupt through `sys::IDLE_WAIT` instead of spinning, so an
+/// idle desktop no longer pins a host core at 100%. The kernel side
+/// (`kernel_arch_glue::desktop_idle_wait`) only halts when nothing else
+/// is `Ready` and always finishes with one scheduler tick, which keeps
+/// the preemption timer alive and lets a just-woken input driver run at
+/// once.
+#[cfg(all(feature = "desktop", target_arch = "x86_64"))]
+#[link_section = ".user_text"]
+extern "C" fn umode_idle_loop_x86() -> ! {
+    loop {
+        // SAFETY: plain trap into the kernel; `raw_syscall_x86` lives in
+        // `.user_text` like every other U-mode syscall wrapper.
+        unsafe { raw_syscall_x86(sys::IDLE_WAIT, 0, 0) };
+    }
+}
+
+/// Deliberately-crashing "driver" process — the 03-Kernel-Subsystems-
+/// Layer.md §5.2 acceptance-test demo: "inject a panic in a driver,
+/// prove the rest of the system is unaffected". Executes `ud2`
+/// (Invalid Opcode, `#UD`) the instant it is scheduled, taking a
+/// synchronous Ring-3 exception that `hal_x86_64`'s dedicated fault
+/// trampoline routes to the registered `FaultHandler`
+/// (`simurgh_fault_x86` -> `kernel_arch_glue::p2_fault` ->
+/// `KernelState::terminate_thread`/`terminate_thread_and_handoff`)
+/// instead of halting the system — mirrors hal-riscv64's
+/// `umode_faulty_driver` (`.word 0`) exactly, just with x86_64's own
+/// ISA-guaranteed-invalid encoding.
+#[cfg(target_arch = "x86_64")]
+#[link_section = ".user_text"]
+extern "C" fn umode_faulty_driver_x86() -> ! {
+    // SAFETY: `ud2` is not a valid instruction encoding by design —
+    // deliberately triggers `#UD`, the entire point of this process.
+    // `options(noreturn)` is honest: control never falls through (the
+    // thread is terminated by the fault handler and never resumes).
+    unsafe {
+        core::arch::asm!("ud2", options(noreturn));
+    }
+}
+
+/// The real Call/Recv/Reply demo's SERVER (02-Microkernel-Layer.md
+/// §5.1/§8.2 — see `sys::IPC_DEMO_START`'s own doc comment). Spawned by
+/// `kernel_arch_glue::p2_ipc_demo_start`, sharing `umode_root_x86`'s OWN
+/// address space. Mirrors riscv64's own `umode_ipc_server` exactly.
+#[cfg(target_arch = "x86_64")]
+#[link_section = ".user_text"]
+extern "C" fn umode_ipc_server_x86() -> ! {
+    // SAFETY: `int 0x80` traps to our dedicated DPL-3 gate; pure
+    // register ops, no stack frame, no relocation — same convention
+    // every other `.user_text` function here follows.
+    unsafe {
+        let ep = raw_syscall_x86(sys::IPC_ENDPOINT_CAP, 0, 0);
+        let (from, label) = raw_syscall2_x86(sys::IPC_RECV, ep, 0);
+        raw_syscall_x86(sys::IPC_REPLY, from, label.wrapping_add(1));
+        // `IPC_REPLY` always switches away on success (see its own doc
+        // comment) — unreachable in that case; this is the fallback for
+        // the error case, so this thread parks instead of running off
+        // the end of the function.
+        core::arch::asm!("2:", "jmp 2b", options(noreturn));
+    }
+}
+
+/// The syscall handler `hal_x86_64::cpu`'s dedicated `int 0x80`
+/// trampoline calls for a syscall from U-mode. Runs at Ring 0.
+#[cfg(target_arch = "x86_64")]
+fn simurgh_syscall_x86(a7: usize, a0: usize, a1: usize) -> hal_x86_64::cpu::TrapOutcome {
+    use hal_x86_64::cpu::TrapOutcome;
+
+    // Two-process hand-off / device-manager supervision arms resolve to
+    // a non-`Resume` outcome — mirrors `simurgh_syscall`'s (riscv64)
+    // own dispatch order exactly.
+    match a7 {
+        sys::P2_YIELD => {
+            #[cfg(feature = "desktop")]
+            let yielded = kernel_arch_glue::desktop_yield(hal_x86_64::cpu::hlt_wait_for_irq);
+            #[cfg(not(feature = "desktop"))]
+            let yielded = kernel_arch_glue::p2_yield();
+            return match yielded {
+                Some((save, into)) => TrapOutcome::SwitchTo { save, into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::P2_REPORT_A => {
+            kernel_arch_glue::p2_report_a(a0);
+            return TrapOutcome::Resume(0);
+        }
+        // Real Call/Recv/Reply demo (see `sys::IPC_DEMO_START`'s own doc
+        // comment) — mirrors `simurgh_syscall` (riscv64)'s own IPC arms
+        // exactly, including using `kstate().sched.running()` (not the
+        // hardcoded root thread every OTHER opcode here uses) since
+        // IPC_RECV/IPC_REPLY are called by the server thread too.
+        sys::IPC_DEMO_START => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate()
+                .sched
+                .running()
+                .unwrap_or(kernel_arch_glue::kstate().root_thread);
+            return match kernel_arch_glue::p2_ipc_demo_start(hal, caller, umode_ipc_server_x86 as usize) {
+                Some((ep, save, into)) => {
+                    // SAFETY: single-core; only this arm writes
+                    // G_IPC_EP_X86, before either the client or the
+                    // server can read it.
+                    unsafe { core::ptr::addr_of_mut!(G_IPC_EP_X86).write(ep) };
+                    TrapOutcome::SwitchTo { save, into }
+                }
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::IPC_ENDPOINT_CAP => {
+            // SAFETY: single-core; written once by IPC_DEMO_START before
+            // either caller of this opcode can run.
+            return TrapOutcome::Resume(unsafe { core::ptr::addr_of!(G_IPC_EP_X86).read() } as usize);
+        }
+        sys::IPC_CALL => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate()
+                .sched
+                .running()
+                .unwrap_or(kernel_arch_glue::kstate().root_thread);
+            return match kernel_arch_glue::p2_ipc_call(hal, caller, a0 as u32, a1 as u64) {
+                Some(sw) => {
+                    match sw.poke {
+                        Some((p0, p1)) => {
+                            // SAFETY: `sw.into` is a kernel-owned,
+                            // currently not-executing
+                            // `HAL_USER_CONTEXT_BYTES` blob —
+                            // `p2_ipc_call`'s own contract.
+                            unsafe { hal_x86_64::cpu::poke_saved_a0_a1(sw.into as *mut u8, p0, p1) };
+                            // A genuine `do_send` fast-path direct
+                            // delivery (`poke.is_some()` — `p2_ipc_call`'s
+                            // own doc comment) — the L4-style
+                            // register-only fast path
+                            // (02-Microkernel-Layer.md §5.3/§8.3) is safe
+                            // here. See `hal_x86_64::cpu::TrapOutcome::
+                            // SwitchToFast`'s own doc comment for exactly
+                            // which registers this skips and why.
+                            TrapOutcome::SwitchToFast { save: sw.save, into: sw.into }
+                        }
+                        // **Real bug found via QEMU** (real-IPC plan Phase
+                        // 2): `poke.is_none()` here means `do_send` did
+                        // NOT deliver directly — `n` is a general
+                        // `pick_next` fallback pick (`p2_ipc_call`'s own
+                        // doc comment on its `Reschedule{next:Some(n)}`
+                        // arm), which can be ANY `Ready` thread
+                        // system-wide, not a cooperating participant in
+                        // the fast path's own narrow register-set
+                        // convention — same bug/fix as `SBS_IPC_RECV`'s
+                        // own arm (that one's doc comment has the full
+                        // real-crash story: `SwitchToFast` zeroing `rcx`
+                        // out from under the §8.4 demo's own process C).
+                        None => TrapOutcome::SwitchTo { save: sw.save, into: sw.into },
+                    }
+                }
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::IPC_RECV => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate()
+                .sched
+                .running()
+                .unwrap_or(kernel_arch_glue::kstate().root_thread);
+            return match kernel_arch_glue::p2_ipc_recv(hal, caller, a0 as u32) {
+                Some(kernel_arch_glue::IpcRecvOutcome::Immediate { from, label }) => {
+                    TrapOutcome::Resume2(from, label)
+                }
+                Some(kernel_arch_glue::IpcRecvOutcome::Switch(sw)) => {
+                    // `poke` is always `None` here — WE are the one
+                    // blocking (nothing to poke into our own trap; the
+                    // ordinary `Resume`/`Resume2` path handles that),
+                    // not being woken via a direct hand-off.
+                    TrapOutcome::SwitchToFast { save: sw.save, into: sw.into }
+                }
+                None => TrapOutcome::Resume2(0, 0),
+            };
+        }
+        sys::SBS_IPC_RECV => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate()
+                .sched
+                .running()
+                .unwrap_or(kernel_arch_glue::kstate().root_thread);
+            // fs-native and Compositor are REAL, general multi-client
+            // `SBS_IPC_RECV` callers (`simurgh-file-manager`/`Simurgh-UI-
+            // Template01`'s own edges, this session), but EACH needs the
+            // narrow, hardcoded-root dispatch for its own Root-Task-only
+            // bootstrap phase — see `kernel_arch_glue::G_FS_ROOT_ONLY_
+            // PHASE`/`G_COMPOSITOR_ROOT_ONLY_PHASE`'s own doc comments for
+            // the real QEMU-confirmed hangs `fs_native_recv`/
+            // `compositor_native_recv` fix. Every other `SBS_IPC_RECV`
+            // caller (`security-broker`, `policy-engine`, ...) is
+            // unaffected — both checks are `false` for them.
+            let ipc_recv_outcome = if kernel_arch_glue::fs_tid() == Some(caller) {
+                kernel_arch_glue::fs_native_recv(hal, caller, a0 as u32)
+            } else if kernel_arch_glue::compositor_tid() == Some(caller) {
+                kernel_arch_glue::compositor_native_recv(hal, caller, a0 as u32)
+            } else {
+                kernel_arch_glue::p2_ipc_recv_general(hal, caller, a0 as u32)
+            };
+            return match ipc_recv_outcome {
+                Some(kernel_arch_glue::IpcRecvOutcome::Immediate { from, label }) => {
+                    TrapOutcome::Resume2(from, label)
+                }
+                Some(kernel_arch_glue::IpcRecvOutcome::Switch(sw)) => {
+                    // **Real bug found via QEMU** (real-IPC plan Phase 2):
+                    // unlike `IPC_RECV`'s own identical-LOOKING arm (whose
+                    // `p2_ipc_recv` ALWAYS switches to `root_thread`
+                    // specifically, a known participant in the L4 fast
+                    // path's own narrow register-set convention),
+                    // `p2_ipc_recv_general`'s whole POINT is a general
+                    // `pick_next` fallback that can land on ANY `Ready`
+                    // thread system-wide — confirmed via a real QEMU
+                    // crash (`#PF`, cr2=0) where `security-broker`'s own
+                    // `serve_requests` fan-in switched into the §8.4 A/B/C
+                    // fairness demo's process C mid-loop: `SwitchToFast`'s
+                    // own `restore_ipc_fast_context` deliberately ZEROES
+                    // `rcx`/`rdx`/`r8`-`r11` (real SysV caller-saved
+                    // scratch registers for the L4 IPC convention this
+                    // fast path was built for — see `TrapOutcome::
+                    // SwitchToFast`'s own doc comment: "used ONLY by...
+                    // real `IPC_CALL`/`IPC_RECV`/`IPC_REPLY`"), but process
+                    // C's own loop genuinely KEEPS its counter address
+                    // live in `rcx` across the switch — zeroing it turned
+                    // its next `mov eax, [rcx]` into a null-pointer read.
+                    // `SwitchTo` (full, unconditional register restore) is
+                    // exactly what `common_fault_entry`'s/`common_timer_
+                    // entry`'s own `SwitchToFast` arms already fall back
+                    // to for the identical reason ("no basis to assume the
+                    // fast path's narrower register set is safe").
+                    TrapOutcome::SwitchTo { save: sw.save, into: sw.into }
+                }
+                None => TrapOutcome::Resume2(0, 0),
+            };
+        }
+        sys::NOTIF_WAIT => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate()
+                .sched
+                .running()
+                .unwrap_or(kernel_arch_glue::kstate().root_thread);
+            return match kernel_arch_glue::p2_wait_general(hal, caller, a0 as u32) {
+                Some(kernel_arch_glue::WaitOutcome::Immediate(bits)) => TrapOutcome::Resume(bits as usize),
+                Some(kernel_arch_glue::WaitOutcome::Switch(sw)) => {
+                    // Same bug, same fix as `SBS_IPC_RECV`'s own identical
+                    // arm above: `p2_wait_general`'s `next` is a general
+                    // `pick_next` pick too, never the L4 fast path's own
+                    // narrow, cooperating-thread set — `SwitchTo`, not
+                    // `SwitchToFast`.
+                    TrapOutcome::SwitchTo { save: sw.save, into: sw.into }
+                }
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::NOTIF_WAIT_TIMEOUT => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate()
+                .sched
+                .running()
+                .unwrap_or(kernel_arch_glue::kstate().root_thread);
+            // The timeout path pokes (0, 0) into a woken thread's saved
+            // registers from inside the tick handler, which cannot know this
+            // architecture's context layout - so hand it the poke here.
+            kernel_arch_glue::register_saved_reg_poke(hal_x86_64::cpu::poke_saved_a0_a1);
+            return match kernel_arch_glue::p2_wait_timeout_general(hal, caller, a0 as u32, a1 as u64) {
+                Some(kernel_arch_glue::WaitOutcome::Immediate(bits)) => TrapOutcome::Resume(bits as usize),
+                Some(kernel_arch_glue::WaitOutcome::Switch(sw)) => TrapOutcome::SwitchTo { save: sw.save, into: sw.into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::NOTIF_SIGNAL => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate()
+                .sched
+                .running()
+                .unwrap_or(kernel_arch_glue::kstate().root_thread);
+            return match kernel_arch_glue::p2_signal(hal, caller, a0 as u32, a1 as u64) {
+                kernel_arch_glue::SignalOutcome::OkWithPoke { woke, value } => {
+                    if let Some(ctx) = kernel_arch_glue::kstate().thread_context_mut_ptr(woke) {
+                        // SAFETY: `woke` is blocked (not currently
+                        // `Running` — single-core), so its own saved
+                        // context is not concurrently touched by
+                        // anything else; `SignalOutcome::OkWithPoke`'s
+                        // own doc comment.
+                        unsafe { hal_x86_64::cpu::poke_saved_a0_a1(ctx, value as usize, 0) };
+                    }
+                    TrapOutcome::Resume(1)
+                }
+                kernel_arch_glue::SignalOutcome::Ok => TrapOutcome::Resume(1),
+                kernel_arch_glue::SignalOutcome::Failed => TrapOutcome::Resume(0),
+            };
+        }
+        sys::NOTIF_POLL => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate()
+                .sched
+                .running()
+                .unwrap_or(kernel_arch_glue::kstate().root_thread);
+            let bits = kernel_arch_glue::p2_poll(hal, caller, a0 as u32);
+            return TrapOutcome::Resume(bits as usize);
+        }
+        sys::PS_LIST_ENTRY => {
+            return TrapOutcome::Resume(match kernel_arch_glue::ps_list_entry(a0) {
+                Some((tid, state_code)) => ((tid as usize) << 8) | state_code as usize,
+                None => usize::MAX,
+            });
+        }
+        sys::THREAD_EXIT_POLL => {
+            let hal = kernel_arch_glue::khal();
+            // Same `running()`-with-root-fallback shape every other
+            // caller-identifying opcode in this handler uses (see
+            // `sys::NOTIF_POLL` just above). The caller's identity is
+            // load-bearing here, not incidental: it IS the access check
+            // (`kernel_core::SyscallOp::ThreadExitStatus` answers only a
+            // thread's own spawner).
+            let caller = kernel_arch_glue::kstate()
+                .sched
+                .running()
+                .unwrap_or(kernel_arch_glue::kstate().root_thread);
+            let (status, payload) = kernel_arch_glue::p2_thread_exit_status(hal, caller, a0 as u32);
+            // Two registers, not one packed value: the payload can be a
+            // full-width architecture trap cause (this opcode's own doc
+            // comment).
+            return TrapOutcome::Resume2(status, payload);
+        }
+        sys::IN_SUPERVISE_REPORT => {
+            kernel_arch_glue::log(format_args!(
+                "init (U-mode): real post-launch crash-supervision self-check {} - THREAD_EXIT_POLL on its own spawned process returned {}\r\n",
+                if a0 == 1 { "PASSED" } else { "FAILED" },
+                thread_exit_status_name(a1)
+            ));
+            // Desktop build: simurgh-init's last act; it only spins from
+            // here (`kernel_arch_glue::desktop_park_caller`'s doc comment).
+            #[cfg(feature = "desktop")]
+            if let Some((save, into)) = kernel_arch_glue::desktop_park_caller() {
+                return TrapOutcome::SwitchTo { save, into };
+            }
+            return TrapOutcome::Resume(0);
+        }
+        #[cfg(feature = "desktop")]
+        sys::IDLE_WAIT => {
+            return match kernel_arch_glue::desktop_idle_wait(hal_x86_64::cpu::hlt_wait_for_irq) {
+                Some((save, into)) => TrapOutcome::SwitchTo { save, into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::SCHED_SET_SYSTEM_POLICY => {
+            return TrapOutcome::Resume(
+                match kernel_arch_glue::set_system_scheduler_policy(a0, a1) {
+                    Some(re_moded) => {
+                        kernel_arch_glue::log(format_args!(
+                            "kernel (x86_64): real SCHED_SET_SYSTEM_POLICY syscall - system \
+                             scheduler mode now {}, aging_cap_ms now {}, {} already-running \
+                             thread(s) re-moded\r\n",
+                            if a0 == 0 { "Interactive" } else { "Throughput" },
+                            a1,
+                            re_moded
+                        ));
+                        re_moded
+                    }
+                    None => {
+                        kernel_arch_glue::log(format_args!(
+                            "kernel (x86_64): SCHED_SET_SYSTEM_POLICY rejected - {} is not a \
+                             real scheduler mode code, nothing changed\r\n",
+                            a0
+                        ));
+                        usize::MAX
+                    }
+                },
+            );
+        }
+        sys::IPC_REPLY => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate()
+                .sched
+                .running()
+                .unwrap_or(kernel_arch_glue::kstate().root_thread);
+            return match kernel_arch_glue::p2_ipc_reply(hal, caller, a0 as u32, a1 as u64) {
+                Some(sw) => {
+                    if let Some((p0, p1)) = sw.poke {
+                        // SAFETY: same contract as IPC_CALL's own poke
+                        // above.
+                        unsafe { hal_x86_64::cpu::poke_saved_a0_a1(sw.into as *mut u8, p0, p1) };
+                    }
+                    // **Investigated and deliberately left unconditional
+                    // (2026-09-17)** — do NOT "fix" this into a
+                    // conditional `SwitchTo` fallback to match
+                    // `IPC_CALL`/`SBS_IPC_RECV`/`NOTIF_WAIT`'s own arms
+                    // above; it would provably never take the slow path.
+                    // Those three fall back because their `next` comes
+                    // from a general `pick_next`, so the resumed thread
+                    // can be ANY `Ready` thread — including one a TIMER
+                    // preempted mid-loop, which never entered the L4
+                    // register convention at all (the real crash
+                    // `SBS_IPC_RECV`'s own arm documents). `Reply` cannot
+                    // reach that case: `kernel_core::syscall::do_reply`
+                    // returns `Reschedule { next: Some(to) }`
+                    // unconditionally, never `pick_next`, and refuses
+                    // (`NotBlockedOnReply`) unless `to` is
+                    // `BlockedOnReply` — a state assigned in exactly two
+                    // places kernel-wide, both inside `do_send`'s own
+                    // `is_call` arms, i.e. only ever to a thread
+                    // suspended at its own `IPC_CALL` trap. So `into` is
+                    // ALWAYS a genuine fast-path participant, by the very
+                    // criterion `IPC_CALL`'s own arm uses for this
+                    // (`poke.is_some()`, which `p2_ipc_reply` likewise
+                    // always satisfies). Checked while chasing
+                    // `simurgh-file-manager`'s own open `fm-core` Write
+                    // bug (that repo's `G_LAST_REPLY_LABEL` doc comment
+                    // has the full story); this arm was ruled OUT as its
+                    // cause. One real, separate gap DID surface and is
+                    // still open: this is the only `SwitchToFast` site
+                    // whose `save` thread is left `Ready` rather than
+                    // blocked (`do_reply` calls `note_ready` on the
+                    // replier), so it is the only one where a narrow
+                    // `save_ipc_fast_context` can later be paired with a
+                    // FULL `restore_user_and_iretq` by the general
+                    // scheduler/timer path — resuming the replier with
+                    // stale `rcx`/`rdx`/`r8`-`r11`, which
+                    // `save_ipc_fast_context`'s own doc comment
+                    // ("callers must pass a blob this function fully
+                    // owns") forbids. Not fixed here: it needs its own
+                    // real on-device test, and the x86_64 boot currently
+                    // halts before one can be run.
+                    TrapOutcome::SwitchToFast { save: sw.save, into: sw.into }
+                }
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        // fs-native: the REAL FsRequest/FsResponse wire protocol — see
+        // riscv64's own identical arms (this file's `sys::FS_DEMO_START`
+        // doc comment) for the full rationale. Always called by root in
+        // this demo, so `kstate().root_thread` is correct here, unlike
+        // the generic IPC arms above (which the SERVER thread also
+        // calls).
+        sys::FS_DEMO_START => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            return match kernel_arch_glue::fs_demo_start(hal, caller, FS_NATIVE_ELF, elf_loader::machine::EM_X86_64) {
+                Some((ep, save, into)) => {
+                    // SAFETY: single-core; only this arm writes
+                    // G_FS_EP_X86, before any later FS_OPEN/FS_STAT/
+                    // FS_CLOSE call.
+                    unsafe { core::ptr::addr_of_mut!(G_FS_EP_X86).write(ep) };
+                    TrapOutcome::SwitchTo { save, into }
+                }
+                None => TrapOutcome::Resume(usize::MAX),
+            };
+        }
+        sys::FS_OPEN => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            // SAFETY: single-core; written once by FS_DEMO_START, before
+            // any FS_OPEN call.
+            let ep = unsafe { core::ptr::addr_of!(G_FS_EP_X86).read() };
+            return match kernel_arch_glue::fs_open_call(hal, caller, ep, a0 as u32, a1 as u32) {
+                Some(sw) => TrapOutcome::SwitchToFast { save: sw.save, into: sw.into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::FS_OPEN_RESULT => {
+            return TrapOutcome::Resume(kernel_arch_glue::fs_open_result());
+        }
+        sys::FS_STAT => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            // SAFETY: same contract as FS_OPEN's own read.
+            let ep = unsafe { core::ptr::addr_of!(G_FS_EP_X86).read() };
+            return match kernel_arch_glue::fs_stat_call(hal, caller, ep, a0 as u32) {
+                Some(sw) => TrapOutcome::SwitchToFast { save: sw.save, into: sw.into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::FS_STAT_RESULT => {
+            return TrapOutcome::Resume(kernel_arch_glue::fs_stat_result());
+        }
+        sys::FS_CLOSE => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            // SAFETY: same contract as FS_OPEN's own read.
+            let ep = unsafe { core::ptr::addr_of!(G_FS_EP_X86).read() };
+            return match kernel_arch_glue::fs_close_call(hal, caller, ep, a0 as u32) {
+                Some(sw) => TrapOutcome::SwitchToFast { save: sw.save, into: sw.into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::FS_CLOSE_RESULT => {
+            return TrapOutcome::Resume(kernel_arch_glue::fs_close_result());
+        }
+        sys::FS_WRITE => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            // SAFETY: same contract as FS_OPEN's own read.
+            let ep = unsafe { core::ptr::addr_of!(G_FS_EP_X86).read() };
+            return match kernel_arch_glue::fs_write_call(hal, caller, ep, a0 as u32) {
+                Some(sw) => TrapOutcome::SwitchToFast { save: sw.save, into: sw.into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::FS_WRITE_RESULT => {
+            return TrapOutcome::Resume(kernel_arch_glue::fs_write_result());
+        }
+        sys::FS_READ => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            // SAFETY: same contract as FS_OPEN's own read.
+            let ep = unsafe { core::ptr::addr_of!(G_FS_EP_X86).read() };
+            return match kernel_arch_glue::fs_read_call(hal, caller, ep, a0 as u32, a1 as u32) {
+                Some(sw) => TrapOutcome::SwitchToFast { save: sw.save, into: sw.into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::FS_READ_RESULT => {
+            return TrapOutcome::Resume(kernel_arch_glue::fs_read_result());
+        }
+        sys::FS_READ_RESULT_QUIET => {
+            return TrapOutcome::Resume(kernel_arch_glue::fs_read_result_quiet());
+        }
+        // virtio-blk driver: mirrors aarch64's/riscv64's own identical
+        // arms (this file's `sys::DRV_BLK_DEMO_START` doc comment on
+        // riscv64's block) — same `Transport`-erased `kernel_arch_glue::
+        // spawn_virtio_blk_driver` entry point, just `EM_X86_64` and
+        // this architecture's own `G_DRV_EP_X86` slot. Discovered over
+        // ECAM PCI (`hal_x86_64::peripheral`'s own scan) and wired up
+        // with a real MSI-X interrupt rather than legacy INTx — see
+        // `hal_core::interrupt::InterruptController::msi_message`'s own
+        // doc comment for the full rationale — transparently to this
+        // dispatch code, which stays identical either way.
+        sys::DRV_BLK_DEMO_START => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            return match kernel_arch_glue::spawn_virtio_blk_driver(
+                hal,
+                caller,
+                DRIVER_VIRTIO_BLK_ELF,
+                elf_loader::machine::EM_X86_64,
+            ) {
+                Some((ep, save, into)) => {
+                    // SAFETY: single-core; only this arm writes
+                    // G_DRV_EP_X86, before any later DRV_BLK_* call.
+                    unsafe { core::ptr::addr_of_mut!(G_DRV_EP_X86).write(ep) };
+                    TrapOutcome::SwitchTo { save, into }
+                }
+                None => TrapOutcome::Resume(usize::MAX),
+            };
+        }
+        sys::DRV_BLK_PROBE => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            // SAFETY: single-core; written once by DRV_BLK_DEMO_START,
+            // before any DRV_BLK_PROBE call.
+            let ep = unsafe { core::ptr::addr_of!(G_DRV_EP_X86).read() };
+            return match kernel_arch_glue::drv_blk_probe_call(hal, caller, ep) {
+                Some(sw) => TrapOutcome::SwitchToFast { save: sw.save, into: sw.into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::DRV_BLK_PROBE_RESULT => {
+            return TrapOutcome::Resume(kernel_arch_glue::drv_blk_probe_result().0 as usize);
+        }
+        sys::DRV_BLK_WRITE => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            // SAFETY: same contract as DRV_BLK_PROBE's own read.
+            let ep = unsafe { core::ptr::addr_of!(G_DRV_EP_X86).read() };
+            return match kernel_arch_glue::drv_blk_write_call(hal, caller, ep, a0 as u64) {
+                Some(sw) => TrapOutcome::SwitchToFast { save: sw.save, into: sw.into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::DRV_BLK_WRITE_RESULT => {
+            return TrapOutcome::Resume(kernel_arch_glue::drv_blk_write_result());
+        }
+        sys::DRV_BLK_READ => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            // SAFETY: same contract as DRV_BLK_PROBE's own read.
+            let ep = unsafe { core::ptr::addr_of!(G_DRV_EP_X86).read() };
+            return match kernel_arch_glue::drv_blk_read_call(hal, caller, ep, a0 as u64) {
+                Some(sw) => TrapOutcome::SwitchToFast { save: sw.save, into: sw.into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::DRV_BLK_READ_RESULT => {
+            return TrapOutcome::Resume(kernel_arch_glue::drv_blk_read_result());
+        }
+        // virtio-net driver: mirrors riscv64's own identical arm (this
+        // file's `sys::DRV_NET_DEMO_START` doc comment) — same
+        // `Transport`-erased `kernel_arch_glue::spawn_virtio_net_driver`
+        // entry point, just `EM_X86_64`. Real interrupt-driven TX on this
+        // architecture (MSI-X, `wire_virtio_pci_transport_net`'s own doc
+        // comment) — transparent to this dispatch code. `ep` is cached
+        // in `G_DRV_NET_EP_X86`, NOT relied upon as this switching
+        // syscall's own "return value" — a `TrapOutcome::SwitchTo`
+        // (unlike `Resume`) never pokes the ORIGINAL caller's own saved
+        // `a0` (see `IpcSwitch::poke`'s own doc comment: `p2_ipc_recv`'s
+        // fallback-to-root switch that eventually resumes `caller` here
+        // always passes `poke: None`), so root's `.user_text` code only
+        // ever sees whatever `a0` already held at the moment it trapped
+        // — this cache is the ONLY reliable way `NET_DEMO_START` below
+        // learns which endpoint to grant Netstack.
+        sys::DRV_NET_DEMO_START => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            return match kernel_arch_glue::spawn_virtio_net_driver(
+                hal,
+                caller,
+                DRIVER_VIRTIO_NET_ELF,
+                elf_loader::machine::EM_X86_64,
+            ) {
+                Some((ep, save, into)) => {
+                    // SAFETY: single-core; only this arm writes
+                    // G_DRV_NET_EP_X86, before any later NET_DEMO_START call.
+                    unsafe { core::ptr::addr_of_mut!(G_DRV_NET_EP_X86).write(ep) };
+                    TrapOutcome::SwitchTo { save, into }
+                }
+                None => TrapOutcome::Resume(usize::MAX),
+            };
+        }
+        // Netstack: mirrors riscv64's own identical arm — spawns the
+        // real Netstack process (`kernel_arch_glue::spawn_netstack_
+        // service`) on top of the driver endpoint `DRV_NET_DEMO_START`
+        // cached (`G_DRV_NET_EP_X86`, NOT `a0` — this arm's own doc
+        // comment above), which immediately starts driving it over real
+        // IPC.
+        sys::NET_DEMO_START => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            // SAFETY: single-core; written once by DRV_NET_DEMO_START,
+            // before any NET_DEMO_START call.
+            let drv_ep = unsafe { core::ptr::addr_of!(G_DRV_NET_EP_X86).read() };
+            return match kernel_arch_glue::spawn_netstack_service(
+                hal,
+                caller,
+                NETSTACK_ELF,
+                elf_loader::machine::EM_X86_64,
+                drv_ep,
+            ) {
+                Some((save, into)) => TrapOutcome::SwitchTo { save, into },
+                None => TrapOutcome::Resume(usize::MAX),
+            };
+        }
+        sys::NET_STATUS_POLL => {
+            return TrapOutcome::Resume(kernel_arch_glue::netstack_status());
+        }
+        sys::COMPOSITOR_DEMO_START => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            return match kernel_arch_glue::compositor_demo_start(hal, caller, COMPOSITOR_ELF, elf_loader::machine::EM_X86_64) {
+                Some((ep, save, into)) => {
+                    // SAFETY: single-core; only this arm writes
+                    // G_COMPOSITOR_EP_X86, before any later COMPOSITOR_
+                    // CREATE_SURFACE/COMMIT_BUFFER/DESTROY_SURFACE call.
+                    unsafe { core::ptr::addr_of_mut!(G_COMPOSITOR_EP_X86).write(ep) };
+                    TrapOutcome::SwitchTo { save, into }
+                }
+                None => TrapOutcome::Resume(usize::MAX),
+            };
+        }
+        sys::COMPOSITOR_CREATE_SURFACE => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            // SAFETY: single-core; written once by COMPOSITOR_DEMO_START,
+            // before any COMPOSITOR_CREATE_SURFACE call.
+            let ep = unsafe { core::ptr::addr_of!(G_COMPOSITOR_EP_X86).read() };
+            return match kernel_arch_glue::compositor_create_surface_call(hal, caller, ep) {
+                Some(sw) => TrapOutcome::SwitchToFast { save: sw.save, into: sw.into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::COMPOSITOR_CREATE_SURFACE_RESULT => {
+            return TrapOutcome::Resume(kernel_arch_glue::compositor_create_surface_result());
+        }
+        sys::COMPOSITOR_COMMIT_BUFFER => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            // SAFETY: same contract as COMPOSITOR_CREATE_SURFACE's own read.
+            let ep = unsafe { core::ptr::addr_of!(G_COMPOSITOR_EP_X86).read() };
+            return match kernel_arch_glue::compositor_commit_call(hal, caller, ep, a0 as u32) {
+                Some(sw) => TrapOutcome::SwitchToFast { save: sw.save, into: sw.into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::COMPOSITOR_COMMIT_VERIFY => {
+            return TrapOutcome::Resume(kernel_arch_glue::compositor_commit_verify());
+        }
+        sys::COMPOSITOR_DESTROY_SURFACE => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            // SAFETY: same contract as COMPOSITOR_CREATE_SURFACE's own read.
+            let ep = unsafe { core::ptr::addr_of!(G_COMPOSITOR_EP_X86).read() };
+            return match kernel_arch_glue::compositor_destroy_call(hal, caller, ep, a0 as u32) {
+                Some(sw) => TrapOutcome::SwitchToFast { save: sw.save, into: sw.into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::COMPOSITOR_DESTROY_RESULT => {
+            return TrapOutcome::Resume(kernel_arch_glue::compositor_destroy_result());
+        }
+        sys::MM_DEMO_START => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            return match kernel_arch_glue::mm_demo_start(hal, caller, MM_SERVICE_ELF, elf_loader::machine::EM_X86_64) {
+                Some((ep, save, into)) => {
+                    // SAFETY: single-core; only this arm writes
+                    // G_MM_EP_X86, before any later MM_REGISTER/
+                    // MM_UNREGISTER/MM_QUERY_VICTIM/MM_QUERY_TOTAL_
+                    // RESIDENT call.
+                    unsafe { core::ptr::addr_of_mut!(G_MM_EP_X86).write(ep) };
+                    TrapOutcome::SwitchTo { save, into }
+                }
+                None => TrapOutcome::Resume(usize::MAX),
+            };
+        }
+        sys::MM_REGISTER => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            // SAFETY: single-core; written once by MM_DEMO_START, before
+            // any MM_REGISTER call.
+            let ep = unsafe { core::ptr::addr_of!(G_MM_EP_X86).read() };
+            return match kernel_arch_glue::mm_register_call(hal, caller, ep, a0 as u32) {
+                Some(sw) => TrapOutcome::SwitchToFast { save: sw.save, into: sw.into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::MM_REGISTER_RESULT => {
+            return TrapOutcome::Resume(kernel_arch_glue::mm_register_result());
+        }
+        sys::MM_UNREGISTER => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            // SAFETY: same contract as MM_REGISTER's own read.
+            let ep = unsafe { core::ptr::addr_of!(G_MM_EP_X86).read() };
+            return match kernel_arch_glue::mm_unregister_call(hal, caller, ep, a0 as u32) {
+                Some(sw) => TrapOutcome::SwitchToFast { save: sw.save, into: sw.into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::MM_UNREGISTER_RESULT => {
+            return TrapOutcome::Resume(kernel_arch_glue::mm_unregister_result());
+        }
+        sys::MM_QUERY_VICTIM => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            // SAFETY: same contract as MM_REGISTER's own read.
+            let ep = unsafe { core::ptr::addr_of!(G_MM_EP_X86).read() };
+            return match kernel_arch_glue::mm_query_victim_call(hal, caller, ep) {
+                Some(sw) => TrapOutcome::SwitchToFast { save: sw.save, into: sw.into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::MM_QUERY_VICTIM_RESULT => {
+            return TrapOutcome::Resume(kernel_arch_glue::mm_query_victim_result());
+        }
+        sys::MM_QUERY_TOTAL_RESIDENT => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            // SAFETY: same contract as MM_REGISTER's own read.
+            let ep = unsafe { core::ptr::addr_of!(G_MM_EP_X86).read() };
+            return match kernel_arch_glue::mm_query_total_resident_call(hal, caller, ep) {
+                Some(sw) => TrapOutcome::SwitchToFast { save: sw.save, into: sw.into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::MM_QUERY_TOTAL_RESIDENT_RESULT => {
+            return TrapOutcome::Resume(kernel_arch_glue::mm_query_total_resident_result());
+        }
+        sys::NET_BYPASS_REQUEST => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            return match kernel_arch_glue::net_bypass_request_call(hal, caller) {
+                Some(sw) => TrapOutcome::SwitchToFast { save: sw.save, into: sw.into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::NET_BYPASS_REQUEST_RESULT => {
+            return TrapOutcome::Resume(kernel_arch_glue::net_bypass_request_result());
+        }
+        sys::NET_STANDARD_SEND_REQUEST => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            return match kernel_arch_glue::net_standard_send_call(hal, caller) {
+                Some(sw) => TrapOutcome::SwitchToFast { save: sw.save, into: sw.into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::NET_STANDARD_SEND_REQUEST_RESULT => {
+            return TrapOutcome::Resume(kernel_arch_glue::net_standard_send_result());
+        }
+        sys::NET_LATENCY_SUMMARY => {
+            kernel_arch_glue::net_latency_summary(a0, a1);
+            return TrapOutcome::Resume(0);
+        }
+        sys::FS_WRITE_THROUGHPUT_SUMMARY => {
+            kernel_arch_glue::fs_write_throughput_summary(a0, a1);
+            return TrapOutcome::Resume(0);
+        }
+        sys::FS_READ_THROUGHPUT_SUMMARY => {
+            kernel_arch_glue::fs_read_throughput_summary(a0, a1);
+            return TrapOutcome::Resume(0);
+        }
+        sys::NET_BYPASS_SEND => {
+            let hal = kernel_arch_glue::khal();
+            let ns = kernel_arch_glue::net_bypass_direct_send(hal);
+            return TrapOutcome::Resume(ns.map(|v| v as usize).unwrap_or(usize::MAX));
+        }
+        sys::NOW_NS => {
+            let hal = kernel_arch_glue::khal();
+            return TrapOutcome::Resume(hal.now_ns() as usize);
+        }
+        sys::NET_LOG => {
+            return TrapOutcome::Resume(kernel_arch_glue::netstack_log(a0));
+        }
+        sys::MM_QUERY_TOTAL_RESIDENT_RESULT_QUIET => {
+            return TrapOutcome::Resume(kernel_arch_glue::mm_query_total_resident_result_quiet());
+        }
+        sys::CAP_GRANT => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate()
+                .sched
+                .running()
+                .unwrap_or(kernel_arch_glue::kstate().root_thread);
+            let target_thread = a0 as u32;
+            let cap = a1 as u32;
+            let rights_bits = (a1 >> 32) as u32;
+            return TrapOutcome::Resume(
+                match kernel_arch_glue::cap_grant(hal, caller, target_thread, cap, rights_bits) {
+                    Some(dst) => dst.as_u32() as usize,
+                    None => usize::MAX,
+                },
+            );
+        }
+        sys::CAP_REVOKE => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate()
+                .sched
+                .running()
+                .unwrap_or(kernel_arch_glue::kstate().root_thread);
+            return TrapOutcome::Resume(match kernel_arch_glue::cap_revoke(hal, caller, a0 as u32) {
+                Some(freed) => freed as usize,
+                None => usize::MAX,
+            });
+        }
+        // security-broker-intermediary (Issue #28) — see riscv64's own
+        // identical `sys::SBI_DEMO_START` arm's doc comment. Spawns
+        // security-broker itself HERE (sequentially, before `P2_PREEMPT_
+        // START`) rather than reading a global written by that handler:
+        // `P2_PREEMPT_START`'s own `int 0x80` normally never returns to
+        // `.user_text` in the success case (it switches straight into the
+        // preemption phase) — see this file's own `sys::P2_PREEMPT_START`
+        // doc comment — so any `.user_text` opcode issued sequentially
+        // AFTER it is dead code. This opcode therefore runs BEFORE
+        // `P2_PREEMPT_START`, mirroring fs-native/compositor/mm-service's
+        // own `*_DEMO_START` opcodes exactly.
+        sys::SBI_DEMO_START => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            let Some(security_broker_tid) = spawn_security_broker_x86(hal) else {
+                return TrapOutcome::Resume(usize::MAX);
+            };
+            return match kernel_arch_glue::security_broker_intermediary_demo_start(
+                hal,
+                caller,
+                SECURITY_BROKER_INTERMEDIARY_ELF,
+                elf_loader::machine::EM_X86_64,
+                security_broker_tid,
+            ) {
+                Some((ep, save, into)) => {
+                    // SAFETY: single-core; only this arm writes
+                    // G_SBI_EP_X86, before any SBI_ENDPOINT_CAP/
+                    // SBI_CAP_GRANT call.
+                    unsafe { core::ptr::addr_of_mut!(G_SBI_EP_X86).write(ep) };
+                    TrapOutcome::SwitchTo { save, into }
+                }
+                None => TrapOutcome::Resume(usize::MAX),
+            };
+        }
+        sys::SBI_ENDPOINT_CAP => {
+            // SAFETY: single-core; written once by SBI_DEMO_START.
+            return TrapOutcome::Resume(unsafe { core::ptr::addr_of!(G_SBI_EP_X86).read() } as usize);
+        }
+        sys::SBI_CAP_GRANT => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            // `cap: 2` / `rights: READ|WRITE` (`0b011`) fixed for this
+            // demo — see riscv64's own identical arm's doc comment.
+            return match kernel_arch_glue::sbi_cap_grant_call(hal, caller, a0 as u32, a1 as u32, 2, 0b011) {
+                Some(sw) => {
+                    if let Some((p0, p1)) = sw.poke {
+                        // SAFETY: `sw.into` is a kernel-owned, currently
+                        // not-executing `HAL_USER_CONTEXT_BYTES` blob —
+                        // `sbi_cap_grant_call`'s own contract.
+                        unsafe { hal_x86_64::cpu::poke_saved_a0_a1(sw.into as *mut u8, p0, p1) };
+                    }
+                    TrapOutcome::SwitchToFast { save: sw.save, into: sw.into }
+                }
+                None => TrapOutcome::Resume(usize::MAX),
+            };
+        }
+        sys::SBI_CAP_GRANT_RESULT => {
+            let dst = kernel_arch_glue::sbi_cap_grant_result();
+            if dst == usize::MAX {
+                kernel_arch_glue::log(format_args!(
+                    "root task (x86_64): security-broker-intermediary CapGrant FAILED (Issue #28)\r\n"
+                ));
+            } else {
+                kernel_arch_glue::log(format_args!(
+                    "root task (x86_64): security-broker-intermediary minted a REAL capability into security-broker's own cap space at slot {dst} (Issue #28, end-to-end proof)\r\n"
+                ));
+            }
+            return TrapOutcome::Resume(dst);
+        }
+        sys::SBI_CAP_REVOKE => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            // `cap: 2` — the SAME demo resource `SBI_CAP_GRANT` copied a
+            // derived child of into security-broker's own cap space; see
+            // `sys::SBI_CAP_REVOKE`'s own doc comment.
+            return match kernel_arch_glue::sbi_cap_revoke_call(hal, caller, a0 as u32, 2) {
+                Some(sw) => {
+                    if let Some((p0, p1)) = sw.poke {
+                        // SAFETY: `sw.into` is a kernel-owned, currently
+                        // not-executing `HAL_USER_CONTEXT_BYTES` blob —
+                        // `sbi_cap_revoke_call`'s own contract.
+                        unsafe { hal_x86_64::cpu::poke_saved_a0_a1(sw.into as *mut u8, p0, p1) };
+                    }
+                    TrapOutcome::SwitchToFast { save: sw.save, into: sw.into }
+                }
+                None => TrapOutcome::Resume(usize::MAX),
+            };
+        }
+        sys::SBI_CAP_REVOKE_RESULT => {
+            let freed = kernel_arch_glue::sbi_cap_revoke_result();
+            if freed == usize::MAX {
+                kernel_arch_glue::log(format_args!(
+                    "root task (x86_64): security-broker-intermediary CapRevoke FAILED (Issue #28)\r\n"
+                ));
+            } else {
+                kernel_arch_glue::log(format_args!(
+                    "root task (x86_64): security-broker-intermediary revoked the demo capability — {freed} slot(s) freed across BOTH capability spaces (Issue #28, cross-space revoke proof)\r\n"
+                ));
+            }
+            return TrapOutcome::Resume(freed);
+        }
+        sys::SBI_CAP_GRANT2 => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            // `cap: 5` — the SECOND demo resource/target (mm-service, see
+            // `sys::SBI_CAP_GRANT2`'s own doc comment).
+            return match kernel_arch_glue::sbi_cap_grant_call(hal, caller, a0 as u32, a1 as u32, 5, 0b011) {
+                Some(sw) => {
+                    if let Some((p0, p1)) = sw.poke {
+                        // SAFETY: `sw.into` is a kernel-owned, currently
+                        // not-executing `HAL_USER_CONTEXT_BYTES` blob —
+                        // `sbi_cap_grant_call`'s own contract.
+                        unsafe { hal_x86_64::cpu::poke_saved_a0_a1(sw.into as *mut u8, p0, p1) };
+                    }
+                    TrapOutcome::SwitchToFast { save: sw.save, into: sw.into }
+                }
+                None => TrapOutcome::Resume(usize::MAX),
+            };
+        }
+        sys::SBI_CAP_GRANT2_RESULT => {
+            let dst = kernel_arch_glue::sbi_cap_grant_result();
+            if dst == usize::MAX {
+                kernel_arch_glue::log(format_args!(
+                    "root task (x86_64): security-broker-intermediary CapGrant (2nd target, mm-service) FAILED or skipped (Issue #28)\r\n"
+                ));
+            } else {
+                kernel_arch_glue::log(format_args!(
+                    "root task (x86_64): security-broker-intermediary minted a REAL capability into mm-service's own cap space at slot {dst} (Issue #28, multi-target proof)\r\n"
+                ));
+            }
+            return TrapOutcome::Resume(dst);
+        }
+        sys::SBI_CAP_REVOKE2 => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            return match kernel_arch_glue::sbi_cap_revoke_call(hal, caller, a0 as u32, 5) {
+                Some(sw) => {
+                    if let Some((p0, p1)) = sw.poke {
+                        // SAFETY: `sw.into` is a kernel-owned, currently
+                        // not-executing `HAL_USER_CONTEXT_BYTES` blob —
+                        // `sbi_cap_revoke_call`'s own contract.
+                        unsafe { hal_x86_64::cpu::poke_saved_a0_a1(sw.into as *mut u8, p0, p1) };
+                    }
+                    TrapOutcome::SwitchToFast { save: sw.save, into: sw.into }
+                }
+                None => TrapOutcome::Resume(usize::MAX),
+            };
+        }
+        sys::SBI_CAP_REVOKE2_RESULT => {
+            let freed = kernel_arch_glue::sbi_cap_revoke_result();
+            if freed == usize::MAX {
+                kernel_arch_glue::log(format_args!(
+                    "root task (x86_64): security-broker-intermediary CapRevoke (2nd target) FAILED or skipped (Issue #28)\r\n"
+                ));
+            } else {
+                kernel_arch_glue::log(format_args!(
+                    "root task (x86_64): security-broker-intermediary revoked the 2nd demo capability — {freed} slot(s) freed (Issue #28, multi-target proof)\r\n"
+                ));
+            }
+            return TrapOutcome::Resume(freed);
+        }
+        sys::DRV_IRQ_WAIT => {
+            let hal = kernel_arch_glue::khal();
+            // Discovered ONCE, up front, and passed into BOTH calls
+            // below — see riscv64's own identical `sys::DRV_IRQ_WAIT` arm
+            // (this file) and `kernel_arch_glue::drv_irq_wait_step`'s own
+            // doc comment for why re-discovering it after a `Blocked`
+            // outcome is a real bug, not a harmless simplification:
+            // `do_wait`'s own `note_blocked` clears `sched.running()`, so
+            // a second generic re-discovery would silently fall back to
+            // `root_thread`.
+            let caller = kernel_arch_glue::kstate()
+                .sched
+                .running()
+                .unwrap_or(kernel_arch_glue::kstate().root_thread);
+            // Real interrupt-driven wait. **Real bug found via QEMU
+            // (2026-09-17)**: this arm used to loop in Ring 0 on
+            // `hal_x86_64::cpu::hlt_wait_for_irq()` (`sti; hlt; cli`)
+            // until the awaited IRQ arrived. That deterministically hung
+            // the ENTIRE boot right after `device-manager` reached
+            // `state=Running` — `driver-i8042`/`driver-mouse` wait on
+            // PS/2 keyboard/mouse IRQs that never arrive in an automated
+            // QEMU run (nobody types), so the core parked forever with
+            // ~20 other real subsystems sitting `Ready`, and the LAPIC
+            // one-shot preemption timer died the first time a tick landed
+            // at CPL 0 (`common_timer_entry` skips the `TickHandler` —
+            // the only thing that re-arms — for a Ring-0 tick). See
+            // `kernel_arch_glue::drv_irq_wait_yield`'s own doc comment for
+            // the full root-cause writeup of both interlocking halves.
+            //
+            // Correct behaviour is the same one `p2_wait_general` already
+            // uses for every OTHER blocking `Wait`: the driver thread is
+            // genuinely `Blocked`, so hand the CPU to whatever `pick_next`
+            // finds and let the IRQ trampoline's own `wake_blocked` make
+            // it runnable again. The LAPIC is already primed by
+            // `hal_x86_64_rust_entry`'s own `InterruptCtrl::bootstrap_
+            // current_core` call, and the MSI-X vector this device's own
+            // interrupt uses was programmed by `wire_virtio_pci_transport`
+            // at spawn time; U-mode threads run with `RFLAGS.IF = 1`
+            // (`init_user_context`), so switching to one keeps interrupts
+            // deliverable strictly MORE of the time than the old
+            // `sti`-`hlt`-`cli` window did.
+            return match kernel_arch_glue::drv_irq_wait_step(hal, caller, a0 as u32) {
+                kernel_arch_glue::IrqWaitOutcome::Ready(bits) => {
+                    TrapOutcome::Resume(bits as usize)
+                }
+                kernel_arch_glue::IrqWaitOutcome::Blocked => {
+                    match kernel_arch_glue::drv_irq_wait_yield(hal, caller) {
+                        Some((save, into)) => TrapOutcome::SwitchTo { save, into },
+                        // Nothing else `Ready` — `drv_irq_wait_yield` has
+                        // already undone the block, so resuming with 0 is
+                        // a harmless immediate retry (the driver re-issues
+                        // `DRV_IRQ_WAIT`), exactly as `p2_wait_general`'s
+                        // own identical fallback does.
+                        None => TrapOutcome::Resume(0),
+                    }
+                }
+                kernel_arch_glue::IrqWaitOutcome::Error => TrapOutcome::Resume(0),
+            };
+        }
+        sys::P2_PREEMPT_START => {
+            // The cooperative §8.4 round-trip is done; spawn the fault-
+            // isolation demo (03-Kernel-Subsystems-Layer.md §5.2) and
+            // arm the preemptive scheduler (02-Microkernel-Layer.md §4)
+            // together, right here — mirrors `simurgh_syscall`
+            // (riscv64)'s and `simurgh_syscall_aarch64`'s own
+            // `P2_PREEMPT_START` arms exactly: device-manager and the
+            // faulty driver simply join the SAME timer-driven round-
+            // robin `p2_preempt_start`/`p2_tick` establish for A/B/C,
+            // rather than needing an explicit hand-off — `p2_fault`'s
+            // existing unconditional hand-off-to-`DM_TID` logic
+            // (already proven on riscv64 AND aarch64) takes over the
+            // instant the driver is scheduled and faults.
+            spawn_device_manager_x86(kernel_arch_glue::khal());
+            // security-broker is now spawned earlier, sequentially, by
+            // `sys::SBI_DEMO_START` (see that arm's own doc comment for
+            // why) — NOT spawned again here.
+            kernel_arch_glue::set_init_tid(spawn_init_x86(kernel_arch_glue::khal()));
+            let account_manager_tid_x86 = spawn_account_manager_x86(kernel_arch_glue::khal());
+            let backup_manager_tid_x86 = spawn_backup_manager_x86(kernel_arch_glue::khal());
+            kernel_arch_glue::set_backup_manager_tid(backup_manager_tid_x86);
+            let diagnostics_manager_tid_x86 = spawn_diagnostics_manager_x86(kernel_arch_glue::khal());
+            kernel_arch_glue::set_diagnostics_manager_tid(diagnostics_manager_tid_x86);
+            // log-collector-native's own real peer edge — see
+            // `wire_log_collector_to_diagnostics_manager_x86`'s own doc
+            // comment for why this is x86_64-only for this first pass.
+            let log_collector_tid_x86 = spawn_log_collector_native_x86(kernel_arch_glue::khal());
+            if let (Some(lc_tid), Some(dg_tid)) = (log_collector_tid_x86, diagnostics_manager_tid_x86) {
+                wire_log_collector_to_diagnostics_manager_x86(kernel_arch_glue::khal(), kernel_arch_glue::kstate(), lc_tid, dg_tid);
+            }
+            let store_tid_x86 = spawn_store_x86(kernel_arch_glue::khal());
+            kernel_arch_glue::set_native_loader_tid(spawn_native_loader_x86(kernel_arch_glue::khal()));
+            let policy_engine_tid_x86 = spawn_policy_engine_x86(kernel_arch_glue::khal());
+            // real-IPC plan's newest edge: store <-> profile-policy,
+            // wired here (not inside either spawn function) since it
+            // needs BOTH tids, and policy-engine spawns AFTER store in
+            // this boot sequence — see `wire_store_to_policy_engine_x86`'s
+            // own doc comment.
+            if let (Some(store_tid), Some(pe_tid)) = (store_tid_x86, policy_engine_tid_x86) {
+                wire_store_to_policy_engine_x86(kernel_arch_glue::khal(), kernel_arch_glue::kstate(), store_tid, pe_tid);
+            }
+            // backup-manager's own two real IPC edges — wired here for the
+            // same reason as store<->profile-policy above. ORDER MATTERS:
+            // the account-manager edge must be wired BEFORE the store edge
+            // (both grant into backup-manager's own cap space, and its own
+            // client-side constants assume account-manager's `Endpoint`
+            // lands at slot 0, store's at slot 1 — see either wiring
+            // function's own doc comment).
+            if let (Some(am_tid), Some(bm_tid)) = (account_manager_tid_x86, backup_manager_tid_x86) {
+                wire_backup_manager_to_account_manager_x86(kernel_arch_glue::khal(), kernel_arch_glue::kstate(), am_tid, bm_tid);
+            }
+            if let (Some(store_tid), Some(bm_tid)) = (store_tid_x86, backup_manager_tid_x86) {
+                wire_backup_manager_to_store_x86(kernel_arch_glue::khal(), kernel_arch_glue::kstate(), store_tid, bm_tid);
+            }
+            // Bound to a local (rather than passed straight into
+            // `set_shell_tid`) since the real ui-core <-> shell TERMINAL
+            // edge wired further below needs this same tid — see
+            // `wire_ui_core_to_shell_x86`'s own doc comment.
+            let shell_tid_x86 = spawn_shell_x86(kernel_arch_glue::khal());
+            kernel_arch_glue::set_shell_tid(shell_tid_x86);
+            let file_manager_tid_x86 = spawn_file_manager_x86(kernel_arch_glue::khal());
+            let ui_core_tid_x86 = spawn_ui_core_x86(kernel_arch_glue::khal());
+            // ui-core <-> account-manager real login edge (2026-09-11):
+            // wired here (not inside `spawn_ui_core_x86`) since it needs
+            // BOTH tids, and follows the SAME "wire after both spawn"
+            // pattern `wire_backup_manager_to_account_manager_x86` above
+            // already uses. The hub notification fan-in must run AFTER
+            // this (it grants a THIRD capability into account-manager's
+            // own cap space, following the endpoint grant this call
+            // makes) — see `wire_account_manager_hub_notification_
+            // fanin_x86`'s own doc comment.
+            if let (Some(am_tid), Some(ui_tid)) = (account_manager_tid_x86, ui_core_tid_x86) {
+                wire_ui_core_to_account_manager_x86(kernel_arch_glue::khal(), kernel_arch_glue::kstate(), am_tid, ui_tid);
+            }
+            if let (Some(am_tid), Some(bm_tid), Some(ui_tid)) = (account_manager_tid_x86, backup_manager_tid_x86, ui_core_tid_x86) {
+                wire_account_manager_hub_notification_fanin_x86(kernel_arch_glue::khal(), kernel_arch_glue::kstate(), am_tid, bm_tid, ui_tid);
+            }
+            // ui-core <-> file-manager real browse edge (2026-09-12):
+            // same "wire after both spawn" pattern as the login edge
+            // above — see `wire_ui_core_to_file_manager_x86`'s own doc
+            // comment.
+            if let (Some(fm_tid), Some(ui_tid)) = (file_manager_tid_x86, ui_core_tid_x86) {
+                wire_ui_core_to_file_manager_x86(kernel_arch_glue::khal(), kernel_arch_glue::kstate(), fm_tid, ui_tid);
+            }
+            // ui-core <-> profile-policy real switch_profile edge
+            // (2026-09-16): same "wire after both spawn" pattern as the
+            // login/browse edges above. The Endpoint grant (`wire_ui_
+            // core_to_policy_engine_x86`) must run BEFORE the notification
+            // fan-in upgrade (`wire_policy_engine_notification_fanin_
+            // x86`) — that call's own Notification grant must land at the
+            // NEXT free slot, after this edge's own Endpoint — see either
+            // function's own doc comment.
+            if let (Some(ui_tid), Some(pe_tid)) = (ui_core_tid_x86, policy_engine_tid_x86) {
+                wire_ui_core_to_policy_engine_x86(kernel_arch_glue::khal(), kernel_arch_glue::kstate(), ui_tid, pe_tid);
+            }
+            if let (Some(pe_tid), Some(store_tid), Some(ui_tid)) = (policy_engine_tid_x86, store_tid_x86, ui_core_tid_x86) {
+                wire_policy_engine_notification_fanin_x86(kernel_arch_glue::khal(), kernel_arch_glue::kstate(), pe_tid, store_tid, ui_tid);
+            }
+            // ui-core <-> shell real TERMINAL edge (2026-09-17): same
+            // "wire after both spawn" pattern as the login/browse/profile
+            // edges above. MUST run after `wire_policy_engine_
+            // notification_fanin_x86` — that call makes the last grant
+            // into ui-core's own cap space before this one, and this
+            // edge's own client-side constants assume its `Endpoint`
+            // lands at slot 6 and its doorbell `Notification` at slot 7.
+            // See `wire_ui_core_to_shell_x86`'s own doc comment for both
+            // sides' full slot derivation.
+            if let (Some(ui_tid), Some(shell_tid)) = (ui_core_tid_x86, shell_tid_x86) {
+                wire_ui_core_to_shell_x86(kernel_arch_glue::khal(), kernel_arch_glue::kstate(), ui_tid, shell_tid);
+            }
+            // Real i8042 keyboard input, Stage B (this project's own
+            // real-input-handling plan): spawns `driver-i8042` as a real
+            // isolated process, binds it to the real IRQ1 (8259-PIC-
+            // remapped) Notification, and wires it as a new real IPC
+            // client of Compositor — see `kernel_arch_glue::spawn_i8042_
+            // driver`'s own doc comment. Must run AFTER Compositor is
+            // spawned (`spawn_ui_core_x86`'s own call, above, already
+            // requires this too) — that function's own doc comment
+            // documents the same precondition. x86_64-only call site
+            // (the function itself is architecture-generic, per `kernel-
+            // arch-glue`'s own module doc comment) since no other
+            // architecture this project targets has this device.
+            let i8042_tid_x86 = kernel_arch_glue::spawn_i8042_driver(
+                kernel_arch_glue::khal(),
+                kernel_arch_glue::kstate().root_thread,
+                DRIVER_I8042_ELF,
+                elf_loader::machine::EM_X86_64,
+            );
+            // Real mouse input, Stage 1a+1b (mouse-input plan): spawns
+            // `driver-mouse` as a real isolated process, binds it to the
+            // real IRQ12 (slave-PIC, dual-EOI cascade) Notification, and
+            // wires it as a new real IPC client of Compositor — see
+            // `kernel_arch_glue::spawn_mouse_driver`'s own doc comment.
+            // Must run after Compositor is spawned, same precondition
+            // `spawn_i8042_driver` already documents.
+            let mouse_tid_x86 = kernel_arch_glue::spawn_mouse_driver(
+                kernel_arch_glue::khal(),
+                kernel_arch_glue::kstate().root_thread,
+                DRIVER_MOUSE_ELF,
+                elf_loader::machine::EM_X86_64,
+            );
+            // Desktop build: the input path (both PS/2 drivers, the
+            // Compositor and ui-core) outranks every other process once
+            // preemption starts — see `kernel_arch_glue::desktop_apply_
+            // input_priorities` for the measurement behind it and the
+            // trade-off. The default build leaves every priority exactly
+            // as it was.
+            #[cfg(feature = "desktop")]
+            kernel_arch_glue::desktop_register_input_path([
+                i8042_tid_x86,
+                mouse_tid_x86,
+                kernel_arch_glue::compositor_tid(),
+                ui_core_tid_x86,
+            ]);
+            #[cfg(not(feature = "desktop"))]
+            let _ = (i8042_tid_x86, mouse_tid_x86);
+            // Real NVMe block driver (03-Kernel-Subsystems-Layer.md's own
+            // driver list): spawns `driver-nvme` as a real isolated
+            // process with a real, mapped BAR0 + queue pages — see
+            // `kernel_arch_glue::spawn_nvme_driver`'s own doc comment for
+            // its real, honest scope (no client wired to it yet). Only
+            // actually spawns anything on a boot with a real
+            // `-device nvme` attached (`root_mmio_nvme_cap` sentinel
+            // otherwise) — a no-op, not a failure, on every other boot.
+            let _ = kernel_arch_glue::spawn_nvme_driver(
+                kernel_arch_glue::khal(),
+                kernel_arch_glue::kstate().root_thread,
+                DRIVER_NVME_ELF,
+                elf_loader::machine::EM_X86_64,
+            );
+            // Spawned here as always (its capability wiring, its
+            // `p2_watch_driver` registration and its own log line are
+            // unchanged), but held out of `pick_next` until the general
+            // scheduler has had its designed share of the boot window —
+            // see `kernel_arch_glue::p2_gate_fault_demo`'s own doc comment
+            // for the real, QEMU-measured starvation this closes. Without
+            // it this driver got its ordinary turn ~12 ticks in, faulted,
+            // and device-manager's closing `POWER_CONTROL` powered the
+            // machine off before any other layer-4 process had run long
+            // enough to produce a single line of its own output.
+            //
+            // The `desktop` build does not spawn it at all: its only
+            // purpose is the §5.2 demo, whose last act is device-manager's
+            // POWER_CONTROL shutdown. device-manager itself is still
+            // spawned (above) and simply stays blocked in `DM_WAIT_CRASH`.
+            #[cfg(not(feature = "desktop"))]
+            kernel_arch_glue::p2_gate_fault_demo(spawn_faulty_driver_x86(kernel_arch_glue::khal()));
+            #[cfg(feature = "desktop")]
+            kernel_arch_glue::log(format_args!(
+                "desktop mode: fault-isolation demo not started (no faulty driver, no automatic shutdown) - preemptive scheduler runs until SHUTDOWN is chosen in the UI\r\n"
+            ));
+            return match kernel_arch_glue::p2_preempt_start() {
+                Some((save, into)) => TrapOutcome::SwitchTo { save, into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::P2_REPORT_B => {
+            kernel_arch_glue::p2_report_b(a0);
+            return TrapOutcome::Resume(0);
+        }
+        sys::DM_REPORT => {
+            let name = match a0 {
+                0 => "Starting",
+                1 => "Running",
+                2 => "Restarting",
+                3 => "Failed",
+                _ => "?",
+            };
+            kernel_arch_glue::log(format_args!(
+                "device-manager (U-mode, isolated subsystem process, x86_64): state={name} restarts_in_window={a1}\r\n"
+            ));
+            if a0 == 3 {
+                // Additive cross-check of the GENERAL thread-exit query
+                // against this demo's own real crash (that function's own
+                // doc comment explains why this is the one point on a real
+                // boot where that is possible). Must run BEFORE
+                // `p2_dm_supervision_done`, purely for log ordering — it
+                // changes no state either way.
+                kernel_arch_glue::p2_verify_watched_driver_exit_query(kernel_arch_glue::khal());
+                kernel_arch_glue::p2_dm_supervision_done();
+            }
+            return TrapOutcome::Resume(0);
+        }
+        sys::NL_REPORT => {
+            if a0 == 1 {
+                kernel_arch_glue::log(format_args!(
+                    "native-loader (U-mode, x86_64): real request_capability round trip to security-broker succeeded, object_ref={a1:#x}\r\n"
+                ));
+            } else {
+                kernel_arch_glue::log(format_args!(
+                    "native-loader (U-mode, x86_64): real request_capability round trip to security-broker returned Err\r\n"
+                ));
+            }
+            return TrapOutcome::Resume(0);
+        }
+        sys::IN_REPORT => {
+            kernel_arch_glue::log(format_args!(
+                "init (U-mode, x86_64): self_check started {a0} unit(s), real_spawn_demo succeeded={}, real_manifest_read_demo succeeded={}\r\n",
+                a1 & 1 == 1,
+                a1 & 2 == 2
+            ));
+            return TrapOutcome::Resume(0);
+        }
+        sys::SB_REPORT => {
+            kernel_arch_glue::log(format_args!(
+                "security-broker (U-mode, x86_64): served a real service call from requester#{a0}, granted={}\r\n",
+                a1 == 1
+            ));
+            return TrapOutcome::Resume(0);
+        }
+        sys::ST_REPORT => {
+            kernel_arch_glue::log(format_args!(
+                "store (U-mode, x86_64): real install self-check - {a0}/{a1} packages passed both the security-broker signature check and profile-policy's own compatibility check\r\n"
+            ));
+            return TrapOutcome::Resume(0);
+        }
+        sys::PP_REPORT => {
+            kernel_arch_glue::log(format_args!(
+                "profile-policy (U-mode, x86_64): served a real compatibility-check call from tid#{a0}, granted={}\r\n",
+                a1 == 1
+            ));
+            return TrapOutcome::Resume(0);
+        }
+        sys::AM_REPORT => {
+            kernel_arch_glue::log(format_args!(
+                "account-manager (U-mode, x86_64): served a real backup-manager data-query call from tid#{a0}\r\n"
+            ));
+            return TrapOutcome::Resume(0);
+        }
+        sys::STR_REPORT => {
+            kernel_arch_glue::log(format_args!(
+                "store (U-mode, x86_64): served a real backup-manager reinstall call from tid#{a0}, accepted={}\r\n",
+                a1 == 1
+            ));
+            return TrapOutcome::Resume(0);
+        }
+        sys::DG_REPORT => {
+            kernel_arch_glue::log(format_args!(
+                "diagnostics-manager (U-mode, x86_64): simulated POST http://localhost:1366 (batch size {a0}), simulated response status={a1}\r\n"
+            ));
+            return TrapOutcome::Resume(0);
+        }
+        sys::DG_LC_REPORT => {
+            kernel_arch_glue::log(format_args!(
+                "diagnostics-manager (U-mode, x86_64): real log-collector-native round trip (report then retrieve one real event) succeeded={}\r\n",
+                a0 == 1
+            ));
+            return TrapOutcome::Resume(0);
+        }
+        sys::NL_DISPLAY_REPORT => {
+            kernel_arch_glue::log(format_args!(
+                "native-loader (U-mode, x86_64): real de-framework DisplayClient round trip to Compositor (CreateSurface->CommitBuffer->QueryOutputs->DestroySurface) succeeded={}, failed_step={a1}\r\n",
+                a0 == 1
+            ));
+            // Desktop build: native-loader's last act; it only spins from
+            // here (`kernel_arch_glue::desktop_park_caller`'s doc comment).
+            #[cfg(feature = "desktop")]
+            if let Some((save, into)) = kernel_arch_glue::desktop_park_caller() {
+                return TrapOutcome::SwitchTo { save, into };
+            }
+            return TrapOutcome::Resume(0);
+        }
+        sys::DRV_NVME_PROBE_REPORT => {
+            kernel_arch_glue::log(format_args!(
+                "driver-nvme (U-mode, x86_64): real Nvme::probe() (BAR0/queue MMIO handshake) succeeded={}, sector_count={a1}\r\n",
+                a0 == 1
+            ));
+            return TrapOutcome::Resume(0);
+        }
+        sys::DRV_VBLK_PROBE_REPORT => {
+            kernel_arch_glue::log(format_args!(
+                "driver-virtio-blk (U-mode, x86_64): real VirtioBlk::probe() succeeded={}, sector_count={a1}\r\n",
+                a0 == 1
+            ));
+            return TrapOutcome::Resume(0);
+        }
+        sys::DRV_VNET_PROBE_REPORT => {
+            kernel_arch_glue::log(format_args!(
+                "driver-virtio-net (U-mode, x86_64): real VirtioNet::probe() succeeded={}\r\n",
+                a0 == 1
+            ));
+            return TrapOutcome::Resume(0);
+        }
+        sys::ST_CATALOG_REPORT => {
+            kernel_arch_glue::log(format_args!(
+                "store (U-mode, x86_64): real (simulated) catalog lookup round trip succeeded={}, packages_resolved={a1}\r\n",
+                a0 == 1
+            ));
+            return TrapOutcome::Resume(0);
+        }
+        sys::DG_FLUSH_REPORT => {
+            kernel_arch_glue::log(format_args!(
+                "diagnostics-manager (U-mode, x86_64): real periodic-flush scheduler tick queued {a0} report(s), flush attempted={}\r\n",
+                a1 == 1
+            ));
+            return TrapOutcome::Resume(0);
+        }
+        sys::SPAWN_KNOWN_ELF => {
+            let k = kernel_arch_glue::kstate();
+            let caller = k.sched.running().unwrap_or(k.root_thread);
+            if Some(caller) != kernel_arch_glue::init_tid() && Some(caller) != kernel_arch_glue::shell_tid() {
+                kernel_arch_glue::log(format_args!(
+                    "root task (x86_64): SPAWN_KNOWN_ELF denied - caller tid#{} is neither simurgh-init nor simurgh-shell\r\n",
+                    caller.as_u32()
+                ));
+                return TrapOutcome::Resume(usize::MAX);
+            }
+            match spawn_known_elf_x86(kernel_arch_glue::khal(), a0 as u32) {
+                Some(tid) => {
+                    kernel_arch_glue::log(format_args!(
+                        "root task (x86_64): tid#{} spawned elf_id={a0} as tid {} via SPAWN_KNOWN_ELF\r\n",
+                        caller.as_u32(),
+                        tid.as_u32()
+                    ));
+                    return TrapOutcome::Resume(tid.as_u32() as usize);
+                }
+                None => {
+                    kernel_arch_glue::log(format_args!(
+                        "root task (x86_64): SPAWN_KNOWN_ELF failed for elf_id={a0} (unknown id, denied target, or out of resources)\r\n"
+                    ));
+                    return TrapOutcome::Resume(usize::MAX);
+                }
+            }
+        }
+        sys::SERIAL_TRY_READ => {
+            return match backend::try_read_byte() {
+                Some(b) => TrapOutcome::Resume(b as usize),
+                None => TrapOutcome::Resume(usize::MAX),
+            };
+        }
+        sys::SERIAL_PRINT => {
+            let len = a0.min(4096);
+            // SAFETY: `int 0x80` never changes `cr3` (only privilege
+            // level) — this dispatch code runs under whatever page
+            // table the CALLING process already had active, the same
+            // reason every other real-IPC edge's own dispatch code in
+            // this file safely touches a caller-mapped shared VA
+            // directly with no addr_space/root_pt lookup of its own.
+            // `SHELL_OUT_VA` is `simurgh-shell`'s own dedicated shared
+            // page, mapped at process entry onward
+            // (`kernel_arch_glue::wire_debug_print_page`, called from
+            // `spawn_shell_x86`).
+            let bytes = unsafe { core::slice::from_raw_parts(SHELL_OUT_VA as *const u8, len) };
+            let text = core::str::from_utf8(bytes).unwrap_or("<non-utf8>");
+            kernel_arch_glue::log(format_args!("{text}"));
+            return TrapOutcome::Resume(0);
+        }
+        sys::BM_REPORT => {
+            kernel_arch_glue::log(format_args!(
+                "backup-manager (U-mode, x86_64): real scheduled-backup trigger fired for uid#{a0}, ok={}\r\n",
+                a1 == 1
+            ));
+            return TrapOutcome::Resume(0);
+        }
+        sys::SPAWN_FROM_BUFFER => {
+            let k = kernel_arch_glue::kstate();
+            let caller = k.sched.running().unwrap_or(k.root_thread);
+            if Some(caller) != kernel_arch_glue::native_loader_tid() {
+                kernel_arch_glue::log(format_args!(
+                    "root task (x86_64): SPAWN_FROM_BUFFER denied - caller tid#{} is not simurgh-native-sdk\r\n",
+                    caller.as_u32()
+                ));
+                return TrapOutcome::Resume(usize::MAX);
+            }
+            let len = a0.min(APP_BUFFER_LEN);
+            const APP_STACK_VMA: usize = 0xC060_0000;
+            const APP_STACK_LEN: usize = 4096 * 16;
+            // SAFETY: `int 0x80` never changes `cr3` — this dispatch code
+            // runs under native-loader's own already-active page table,
+            // where `APP_BUFFER_VA` is mapped `U=1 R+W` from process
+            // entry onward (`spawn_native_loader_x86`'s own `kernel_
+            // arch_glue::wire_shared_pages` call) — same reasoning
+            // `sys::SERIAL_PRINT`'s own doc comment gives.
+            let elf_bytes = unsafe { core::slice::from_raw_parts(APP_BUFFER_VA as *const u8, len) };
+            match kernel_arch_glue::spawn_process_from_elf(
+                kernel_arch_glue::khal(),
+                k,
+                elf_bytes,
+                elf_loader::machine::EM_X86_64,
+                APP_STACK_VMA,
+                APP_STACK_LEN,
+            ) {
+                Some((tid, _cap_space, _stack_phys)) => {
+                    kernel_arch_glue::log(format_args!(
+                        "root task (x86_64): simurgh-native-sdk spawned a real process from a caller-supplied buffer (tid {}) via SPAWN_FROM_BUFFER\r\n",
+                        tid.as_u32()
+                    ));
+                    return TrapOutcome::Resume(tid.as_u32() as usize);
+                }
+                None => {
+                    kernel_arch_glue::log(format_args!(
+                        "root task (x86_64): SPAWN_FROM_BUFFER failed (malformed ELF or out of resources)\r\n"
+                    ));
+                    return TrapOutcome::Resume(usize::MAX);
+                }
+            }
+        }
+        sys::NL_SPAWN_REPORT => {
+            kernel_arch_glue::log(format_args!(
+                "native-loader (U-mode, x86_64): real Loader::spawn round trip - ok={}, tid={a1}\r\n",
+                a0 == 1
+            ));
+            return TrapOutcome::Resume(0);
+        }
+        sys::FM_REPORT => {
+            kernel_arch_glue::log(format_args!(
+                "file-manager (U-mode, x86_64): real fs-native self_check round trip - ok={} step={a1}\r\n",
+                a0 == 1
+            ));
+            return TrapOutcome::Resume(0);
+        }
+        sys::UI_REPORT => {
+            kernel_arch_glue::log(format_args!(
+                "ui-core (U-mode, x86_64): real Compositor self_check round trip - ok={} step={a1}\r\n",
+                a0 == 1
+            ));
+            return TrapOutcome::Resume(0);
+        }
+        sys::POWER_CONTROL => {
+            let hal = kernel_arch_glue::khal();
+            kernel_arch_glue::log(format_args!(
+                "root task (x86_64): real POWER_CONTROL syscall - {}\r\n",
+                if a0 == 0 { "reboot" } else { "shutdown" }
+            ));
+            if a0 == 0 {
+                hal.reboot();
+            } else {
+                hal.shutdown();
+            }
+        }
+        sys::DM_WAIT_CRASH => {
+            return match kernel_arch_glue::p2_dm_wait_crash() {
+                Some((save, into)) => TrapOutcome::SwitchTo { save, into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::DM_POLL_CRASH => {
+            return TrapOutcome::Resume(kernel_arch_glue::p2_poll_crash());
+        }
+        sys::DM_RESPAWN_DRIVER => {
+            return match spawn_faulty_driver_x86(kernel_arch_glue::khal()) {
+                Some(new_tid) => match kernel_arch_glue::p2_dm_handoff_to_driver(new_tid) {
+                    Some((save, into)) => TrapOutcome::SwitchTo { save, into },
+                    None => TrapOutcome::Resume(0),
+                },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::ALIVE => {
+            kernel_arch_glue::log(format_args!(
+                "root task (U-mode, x86_64, Ring 3): alive, made an int 0x80 syscall from U=1 pages\r\n"
+            ));
+        }
+        sys::REPORT => {
+            kernel_arch_glue::log(format_args!(
+                "root task (U-mode, x86_64): syscall result = {:#x}\r\n",
+                a0
+            ));
+        }
+        _ => {}
+    }
+    TrapOutcome::Resume(0)
+}
+
+/// The per-process fault-isolation handler `hal_x86_64::cpu`'s
+/// dedicated `#UD` trampoline calls for a Ring-3 exception (registered
+/// via `hal_x86_64::cpu::set_fault_handler`) — 03-Kernel-Subsystems-
+/// Layer.md §2.1/§5.2. Mirrors riscv64's own `simurgh_fault` exactly:
+/// delegates to `kernel-arch-glue`, which terminates the faulting
+/// thread (or hands off directly to device-manager if it was the
+/// watched driver) and picks whatever else is runnable.
+#[cfg(target_arch = "x86_64")]
+fn simurgh_fault_x86(vector: usize, rip: usize, _reserved: usize) -> hal_x86_64::cpu::TrapOutcome {
+    use hal_x86_64::cpu::TrapOutcome;
+    match kernel_arch_glue::p2_fault(vector, rip, 0) {
+        Some(into) => TrapOutcome::Terminate { into },
+        None => TrapOutcome::Resume(0),
+    }
+}
+
+/// The preemptive-scheduler tick handler `hal_x86_64::cpu`'s dedicated
+/// LAPIC-timer trampoline calls for the timer interrupt landing on a
+/// running Ring-3 thread (registered via `hal_x86_64::cpu::
+/// set_tick_handler`) — 02-Microkernel-Layer.md §4. Delegates the
+/// round-robin decision to `kernel-arch-glue`; `Some((save, into))`
+/// preempts, `None` lets the current thread keep running. Mirrors
+/// `simurgh_tick` (riscv64) / `simurgh_tick_aarch64` exactly.
+#[cfg(target_arch = "x86_64")]
+fn simurgh_tick_x86() -> hal_x86_64::cpu::TrapOutcome {
+    use hal_x86_64::cpu::TrapOutcome;
+    match kernel_arch_glue::p2_tick() {
+        Some((save, into)) => TrapOutcome::SwitchTo { save, into },
+        None => TrapOutcome::Resume(0),
+    }
+}
+
+// Linker symbols for the x86_64 user (layer-3) Root Task image — see
+// hal-x86_64/src/linker.ld's `.user_text` / `.user_stack` sections.
+#[cfg(target_arch = "x86_64")]
+unsafe extern "C" {
+    static __user_text_start: u8;
+    static __user_text_end: u8;
+    static __user_text_lma: u8;
+    static __user_stack_start: u8;
+    static __user_stack_end: u8;
+    static __user_stack_lma: u8;
+}
+
+/// Reads the `.user_*` linker symbols into the descriptor `enter` needs to
+/// map the Root Task's pages `U=1` before dropping to Ring 3.
+#[cfg(target_arch = "x86_64")]
+fn user_image() -> kernel_arch_glue::UserImage {
+    let sym = |s: &u8| s as *const u8 as usize;
+    // SAFETY: these are linker-defined addresses, taken by reference only,
+    // never dereferenced — the standard idiom for consuming linker script
+    // symbols.
+    unsafe {
+        kernel_arch_glue::UserImage {
+            text_vma: sym(&__user_text_start),
+            text_lma: sym(&__user_text_lma),
+            text_len: sym(&__user_text_end) - sym(&__user_text_start),
+            stack_vma: sym(&__user_stack_start),
+            stack_lma: sym(&__user_stack_lma),
+            stack_len: sym(&__user_stack_end) - sym(&__user_stack_start),
+            entry_vma: umode_root_x86 as usize,
+            worker_entry_vma: umode_worker_x86 as usize,
+            subsystem_entry_vma: umode_subsystem_x86 as usize,
+            a_loop_entry_vma: {
+                #[cfg(feature = "desktop")]
+                { umode_idle_loop_x86 as usize }
+                #[cfg(not(feature = "desktop"))]
+                { umode_a_loop_x86 as usize }
+            },
+        }
+    }
+}
+
+/// Mirrors riscv64's own `spawn_device_manager` exactly (see its doc
+/// comment), minus the `root_task::plan_boot` narration, which is
+/// architecture-independent and already exercised there — no need to
+/// duplicate proving the SAME in-kernel logic runs correctly twice.
+/// Launches Device Manager — `Service::BOOT_ORDER[0]` — as a genuinely
+/// isolated process from its OWN separately-built ELF image
+/// (`kernel_arch_glue::spawn_process_from_elf` — see that function's
+/// and `device-manager-bin`'s own doc comments), the SAME mechanism
+/// riscv64 uses. Called once, right after the cooperative §8.4
+/// round-trip completes (`sys::P2_REPORT_A`) — there is no preemption
+/// loop for it to "join" yet on this architecture, so the caller must
+/// explicitly hand off to it (or to the faulty driver) afterward.
+#[cfg(target_arch = "x86_64")]
+/// See riscv64's own `spawn_device_manager`'s doc comment for why this
+/// now returns the spawned thread's id.
+fn spawn_device_manager_x86(hal: &hal_core::HalInterface) -> Option<kernel_cap::ThreadId> {
+    let k = kernel_arch_glue::kstate();
+    let total = k.total_untyped_bytes();
+    match root_task::plan_boot(total) {
+        Ok(plan) => {
+            kernel_arch_glue::log(format_args!(
+                "root task (x86_64): plan_boot({} bytes) - root reserve {} bytes, {} service grant(s), {} bytes free\r\n",
+                total, plan.root_reserve_bytes, plan.grants.len(), plan.free_bytes
+            ));
+        }
+        Err(e) => {
+            kernel_arch_glue::log(format_args!(
+                "root task (x86_64): plan_boot failed: {:?} - device-manager not spawned\r\n",
+                e
+            ));
+            return None;
+        }
+    }
+
+    const DM_STACK_VMA: usize = 0xC040_0000;
+    const DM_STACK_LEN: usize = 4096 * 16;
+    match kernel_arch_glue::spawn_process_from_elf(
+        hal,
+        k,
+        DEVICE_MANAGER_ELF,
+        elf_loader::machine::EM_X86_64,
+        DM_STACK_VMA,
+        DM_STACK_LEN,
+    ) {
+        Some((tid, _cap_space, _stack_phys)) => {
+            kernel_arch_glue::p2_register_device_manager(tid);
+            kernel_arch_glue::log(format_args!(
+                "root task (x86_64): spawned device-manager (tid {}) from its OWN separately-built ELF image\r\n",
+                tid.as_u32()
+            ));
+            Some(tid)
+        }
+        None => {
+            kernel_arch_glue::log(format_args!(
+                "root task (x86_64): device-manager spawn skipped (out of resources)\r\n"
+            ));
+            None
+        }
+    }
+}
+
+/// x86_64 counterpart of `spawn_security_broker` — see that function's
+/// own doc comment for the full rationale.
+/// See riscv64's own `spawn_security_broker`'s doc comment for why this
+/// now returns the spawned thread's id.
+#[cfg(target_arch = "x86_64")]
+fn spawn_security_broker_x86(hal: &hal_core::HalInterface) -> Option<kernel_cap::ThreadId> {
+    let k = kernel_arch_glue::kstate();
+
+    const SB_STACK_VMA: usize = 0xC041_0000;
+    /// **Real capacity bug found via QEMU** (real-IPC plan Phase 2): the
+    /// original `4096 * 16` (64 KiB, shared by every other subsystem
+    /// process spawned this way) was sized back when this process ran
+    /// Phase 1's own single, simple `serve_capability_requests` loop.
+    /// Phase 2's `serve_requests` fan-in now calls through 3 separate
+    /// handler paths (`serve_one_capability_request`/`_elevation_
+    /// request`/`_signature_request`), each with its own wire encode/
+    /// decode and (for `_signature_request`) a `StorePackage` built with
+    /// several `String`/`Vec` fields — real stack depth this process
+    /// never exercised before, compiled at `-O0` (larger per-frame stack
+    /// use than a release build). Confirmed via a real QEMU crash: `RIP`
+    /// landed INSIDE this process's own bump-allocator heap region (data,
+    /// never meant to be executed) — the unmistakable signature of a
+    /// stack overflow silently overwriting adjacent memory. Raised to
+    /// `4096 * 64` (256 KiB, 4x) for real headroom, matching this
+    /// project's own established precedent (`Simurgh-OS::kernel_core::
+    /// config::MAX_CAP_SPACES`/`CAP_SLOTS_PER_SPACE`'s own doc comments) —
+    /// left at the shared 64 KiB for every OTHER process spawned here,
+    /// none of which grew this way.
+    const SB_STACK_LEN: usize = 4096 * 64;
+    match kernel_arch_glue::spawn_process_from_elf(
+        hal,
+        k,
+        SECURITY_BROKER_ELF,
+        elf_loader::machine::EM_X86_64,
+        SB_STACK_VMA,
+        SB_STACK_LEN,
+    ) {
+        Some((tid, _cap_space, _stack_phys)) => {
+            // SAFETY: single-core; written once here, before
+            // `spawn_native_loader_x86` (which reads it) can run.
+            unsafe { core::ptr::addr_of_mut!(G_SECURITY_BROKER_TID_X86).write(Some(tid)) };
+            kernel_arch_glue::log(format_args!(
+                "root task (x86_64): spawned security-broker (tid {}) from its OWN separately-built ELF image (simurgh-security-broker repo)\r\n",
+                tid.as_u32()
+            ));
+            Some(tid)
+        }
+        None => {
+            kernel_arch_glue::log(format_args!(
+                "root task (x86_64): security-broker spawn skipped (out of resources)\r\n"
+            ));
+            None
+        }
+    }
+}
+
+/// x86_64 counterpart of `spawn_init` (riscv64) — see that function's own
+/// doc comment for the full rationale. Same shape as
+/// `spawn_security_broker_x86`, the first layer-4 process this project
+/// spawned this way. Now also wires the real `init` <-> `fs-native` IPC
+/// edge right after spawning (2026-09-12) — same real reasoning `spawn_
+/// file_manager_x86`'s own doc comment gives for the identical edge:
+/// closes `simurgh-init`'s own "no VFS access" gap (REPO-simurgh-init.md
+/// §3 permits IPC to `Simurgh-OS`'s own services; it forbids seeing their
+/// code, which this real client does not do). Reuses `kernel_arch_glue::
+/// wire_file_manager_to_fs_native` as-is rather than duplicating an
+/// identical kernel-side function — every one of its parameters is a
+/// plain value, nothing file-manager-specific is baked into its body
+/// (that function's own doc comment).
+#[cfg(target_arch = "x86_64")]
+fn spawn_init_x86(hal: &hal_core::HalInterface) -> Option<kernel_cap::ThreadId> {
+    let k = kernel_arch_glue::kstate();
+
+    const INIT_STACK_VMA: usize = 0xC042_0000;
+    const INIT_STACK_LEN: usize = 4096 * 16;
+    match kernel_arch_glue::spawn_process_from_elf(
+        hal,
+        k,
+        INIT_ELF,
+        elf_loader::machine::EM_X86_64,
+        INIT_STACK_VMA,
+        INIT_STACK_LEN,
+    ) {
+        Some((tid, cap_space, _stack_phys)) => {
+            kernel_arch_glue::log(format_args!(
+                "root task (x86_64): spawned init (tid {}) from its OWN separately-built ELF image (simurgh-init repo)\r\n",
+                tid.as_u32()
+            ));
+            let root_pt = k
+                .tcb(tid)
+                .map(|t| t.addr_space)
+                .and_then(|addr_space| k.addr_space_mut(addr_space).map(|a| a.root_phys().as_usize()));
+            match root_pt {
+                Some(root_pt) => {
+                    match kernel_arch_glue::wire_file_manager_to_fs_native(
+                        hal,
+                        tid,
+                        cap_space,
+                        root_pt,
+                        INIT_FS_SHARED_VA,
+                        INIT_FS_DATA_VA,
+                    ) {
+                        Some(()) => kernel_arch_glue::log(format_args!(
+                            "root task (x86_64): wired init <-> fs-native real IPC edge\r\n"
+                        )),
+                        None => kernel_arch_glue::log(format_args!(
+                            "root task (x86_64): init<->fs-native wiring skipped (fs-native not ready or out of resources)\r\n"
+                        )),
+                    }
+                }
+                None => kernel_arch_glue::log(format_args!(
+                    "root task (x86_64): init<->fs-native wiring skipped (could not resolve init's own address space)\r\n"
+                )),
+            }
+            Some(tid)
+        }
+        None => {
+            kernel_arch_glue::log(format_args!(
+                "root task (x86_64): init spawn skipped (out of resources)\r\n"
+            ));
+            None
+        }
+    }
+}
+
+/// x86_64 counterpart of `spawn_account_manager` (riscv64) — see that
+/// function's own doc comment for the full rationale. Same shape as
+/// `spawn_init_x86`.
+#[cfg(target_arch = "x86_64")]
+fn spawn_account_manager_x86(hal: &hal_core::HalInterface) -> Option<kernel_cap::ThreadId> {
+    let k = kernel_arch_glue::kstate();
+
+    const ACCOUNT_MANAGER_STACK_VMA: usize = 0xC043_0000;
+    // Bumped alongside `SB_STACK_LEN`/`NATIVE_LOADER_STACK_LEN`'s own
+    // identical fix (`SB_STACK_LEN`'s own doc comment has the full
+    // story) — real headroom for this process's own real-IPC plan
+    // Phase 2 additions.
+    const ACCOUNT_MANAGER_STACK_LEN: usize = 4096 * 64;
+    match kernel_arch_glue::spawn_process_from_elf(
+        hal,
+        k,
+        ACCOUNT_MANAGER_ELF,
+        elf_loader::machine::EM_X86_64,
+        ACCOUNT_MANAGER_STACK_VMA,
+        ACCOUNT_MANAGER_STACK_LEN,
+    ) {
+        Some((tid, _cap_space, _stack_phys)) => {
+            kernel_arch_glue::log(format_args!(
+                "root task (x86_64): spawned account-manager (tid {}) from its OWN separately-built ELF image (simurgh-account-manager repo)\r\n",
+                tid.as_u32()
+            ));
+            const SBS_VA_AM: usize = 0xD8F0_0000;
+            const AM_VA: usize = 0xD900_0000;
+            let cs = wire_client_to_security_broker_x86(hal, k, tid, "account-manager", AM_VA, SBS_VA_AM);
+            // SAFETY: single-core; written once here, read once by
+            // whichever client is wired LAST in this arm's own sequence.
+            unsafe { core::ptr::addr_of_mut!(G_ACCOUNT_MANAGER_CS_X86).write(cs) };
+            Some(tid)
+        }
+        None => {
+            kernel_arch_glue::log(format_args!(
+                "root task (x86_64): account-manager spawn skipped (out of resources)\r\n"
+            ));
+            None
+        }
+    }
+}
+
+/// x86_64 counterpart of `spawn_backup_manager` (riscv64) — see that
+/// function's own doc comment for the full rationale. Same shape as
+/// `spawn_account_manager_x86`.
+#[cfg(target_arch = "x86_64")]
+fn spawn_backup_manager_x86(hal: &hal_core::HalInterface) -> Option<kernel_cap::ThreadId> {
+    let k = kernel_arch_glue::kstate();
+
+    const BACKUP_MANAGER_STACK_VMA: usize = 0xC044_0000;
+    const BACKUP_MANAGER_STACK_LEN: usize = 4096 * 16;
+    match kernel_arch_glue::spawn_process_from_elf(
+        hal,
+        k,
+        BACKUP_MANAGER_ELF,
+        elf_loader::machine::EM_X86_64,
+        BACKUP_MANAGER_STACK_VMA,
+        BACKUP_MANAGER_STACK_LEN,
+    ) {
+        Some((tid, _cap_space, _stack_phys)) => {
+            kernel_arch_glue::log(format_args!(
+                "root task (x86_64): spawned backup-manager (tid {}) from its OWN separately-built ELF image (simurgh-backup-manager repo)\r\n",
+                tid.as_u32()
+            ));
+            Some(tid)
+        }
+        None => {
+            kernel_arch_glue::log(format_args!(
+                "root task (x86_64): backup-manager spawn skipped (out of resources)\r\n"
+            ));
+            None
+        }
+    }
+}
+
+/// x86_64 counterpart of `spawn_diagnostics_manager` (riscv64) — see
+/// that function's own doc comment for the full rationale. Same shape as
+/// `spawn_backup_manager_x86`.
+#[cfg(target_arch = "x86_64")]
+fn spawn_diagnostics_manager_x86(hal: &hal_core::HalInterface) -> Option<kernel_cap::ThreadId> {
+    let k = kernel_arch_glue::kstate();
+
+    const DIAGNOSTICS_MANAGER_STACK_VMA: usize = 0xC045_0000;
+    const DIAGNOSTICS_MANAGER_STACK_LEN: usize = 4096 * 16;
+    match kernel_arch_glue::spawn_process_from_elf(
+        hal,
+        k,
+        DIAGNOSTICS_MANAGER_ELF,
+        elf_loader::machine::EM_X86_64,
+        DIAGNOSTICS_MANAGER_STACK_VMA,
+        DIAGNOSTICS_MANAGER_STACK_LEN,
+    ) {
+        Some((tid, _cap_space, _stack_phys)) => {
+            kernel_arch_glue::log(format_args!(
+                "root task (x86_64): spawned diagnostics-manager (tid {}) from its OWN separately-built ELF image (simurgh-diagnostics repo)\r\n",
+                tid.as_u32()
+            ));
+            Some(tid)
+        }
+        None => {
+            kernel_arch_glue::log(format_args!(
+                "root task (x86_64): diagnostics-manager spawn skipped (out of resources)\r\n"
+            ));
+            None
+        }
+    }
+}
+
+/// Spawns `log-collector-native-bin` — the real, kernel-side Log
+/// Collector service (`LOG_COLLECTOR_ELF`'s own doc comment). Same shape
+/// as `spawn_diagnostics_manager_x86`, x86_64-only for this first pass
+/// (`wire_log_collector_to_diagnostics_manager_x86`'s own doc comment).
+#[cfg(target_arch = "x86_64")]
+fn spawn_log_collector_native_x86(hal: &hal_core::HalInterface) -> Option<kernel_cap::ThreadId> {
+    let k = kernel_arch_glue::kstate();
+
+    const LOG_COLLECTOR_STACK_VMA: usize = 0xC04B_0000;
+    const LOG_COLLECTOR_STACK_LEN: usize = 4096 * 16;
+    match kernel_arch_glue::spawn_process_from_elf(
+        hal,
+        k,
+        LOG_COLLECTOR_ELF,
+        elf_loader::machine::EM_X86_64,
+        LOG_COLLECTOR_STACK_VMA,
+        LOG_COLLECTOR_STACK_LEN,
+    ) {
+        Some((tid, _cap_space, _stack_phys)) => {
+            kernel_arch_glue::log(format_args!(
+                "root task (x86_64): spawned log-collector-native (tid {}) from its OWN separately-built ELF image (in-tree, Simurgh-OS repo)\r\n",
+                tid.as_u32()
+            ));
+            Some(tid)
+        }
+        None => {
+            kernel_arch_glue::log(format_args!(
+                "root task (x86_64): log-collector-native spawn skipped (out of resources)\r\n"
+            ));
+            None
+        }
+    }
+}
+
+/// x86_64 counterpart of `spawn_store` (riscv64) — see that function's
+/// own doc comment for the full rationale. Same shape as
+/// `spawn_diagnostics_manager_x86`.
+#[cfg(target_arch = "x86_64")]
+fn spawn_store_x86(hal: &hal_core::HalInterface) -> Option<kernel_cap::ThreadId> {
+    let k = kernel_arch_glue::kstate();
+
+    const STORE_STACK_VMA: usize = 0xC046_0000;
+    // Bumped alongside `SB_STACK_LEN`/`NATIVE_LOADER_STACK_LEN`'s own
+    // identical fix (`SB_STACK_LEN`'s own doc comment has the full
+    // story) — real headroom for this process's own real-IPC plan
+    // Phase 2 additions.
+    const STORE_STACK_LEN: usize = 4096 * 64;
+    match kernel_arch_glue::spawn_process_from_elf(
+        hal,
+        k,
+        STORE_ELF,
+        elf_loader::machine::EM_X86_64,
+        STORE_STACK_VMA,
+        STORE_STACK_LEN,
+    ) {
+        Some((tid, _cap_space, _stack_phys)) => {
+            kernel_arch_glue::log(format_args!(
+                "root task (x86_64): spawned store (tid {}) from its OWN separately-built ELF image (simurgh-store repo)\r\n",
+                tid.as_u32()
+            ));
+            const SBS_VA_STORE: usize = 0xD910_0000;
+            const STORE_VA: usize = 0xD920_0000;
+            let cs = wire_client_to_security_broker_x86(hal, k, tid, "store", STORE_VA, SBS_VA_STORE);
+            // SAFETY: single-core; written once here, read once by
+            // whichever client is wired LAST in this arm's own sequence.
+            unsafe { core::ptr::addr_of_mut!(G_STORE_CS_X86).write(cs) };
+            Some(tid)
+        }
+        None => {
+            kernel_arch_glue::log(format_args!(
+                "root task (x86_64): store spawn skipped (out of resources)\r\n"
+            ));
+            None
+        }
+    }
+}
+
+/// x86_64 counterpart of `spawn_native_loader` (riscv64) — see that
+/// function's own doc comment for the full rationale. Same shape as
+/// `spawn_store_x86`.
+#[cfg(target_arch = "x86_64")]
+fn spawn_native_loader_x86(hal: &hal_core::HalInterface) -> Option<kernel_cap::ThreadId> {
+    let k = kernel_arch_glue::kstate();
+
+    const NATIVE_LOADER_STACK_VMA: usize = 0xC047_0000;
+    // Bumped alongside `SB_STACK_LEN`'s own identical fix (that
+    // constant's own doc comment has the full story — a real QEMU-traced
+    // crash bisected into this process's own bump-allocator code,
+    // consistent with a stack overflow corrupting nearby state) — this
+    // process's own real-IPC plan Phase 2 additions (`NOTIF_SIGNAL` +
+    // wire encode/decode) are new stack depth Phase 1 never exercised.
+    const NATIVE_LOADER_STACK_LEN: usize = 4096 * 64;
+    match kernel_arch_glue::spawn_process_from_elf(
+        hal,
+        k,
+        NATIVE_LOADER_ELF,
+        elf_loader::machine::EM_X86_64,
+        NATIVE_LOADER_STACK_VMA,
+        NATIVE_LOADER_STACK_LEN,
+    ) {
+        Some((tid, cap_space, _stack_phys)) => {
+            kernel_arch_glue::log(format_args!(
+                "root task (x86_64): spawned native-loader (tid {}) from its OWN separately-built ELF image (simurgh-native-sdk repo)\r\n",
+                tid.as_u32()
+            ));
+            wire_native_loader_to_security_broker_x86(hal, k, tid, cap_space);
+            wire_security_broker_notification_fanin_x86(hal, k, cap_space);
+            // Called AFTER the notification fan-in above, not before: that
+            // call's own grant must land at the ALREADY-ESTABLISHED slot 1
+            // (`SB_NOTIF_CAP` in `simurgh-native-sdk::native-loader::
+            // subsystem_entry`, a fixed constant real code already relies
+            // on) — each cap-space grant is a deterministic, sequential
+            // free-list allocation (this file's own `wire_security_broker_
+            // notification_fanin_x86` doc comment), so inserting a THIRD
+            // grant ahead of the notification's own would silently shift
+            // it to slot 2 and break that already-working edge.
+            wire_native_loader_to_compositor_x86(hal, k, tid, cap_space);
+            // `sys::SPAWN_FROM_BUFFER`'s own real app-upload buffer
+            // (`APP_BUFFER_VA`'s own doc comment) — real-IPC plan style
+            // wiring, but no capability at all (`kernel_arch_glue::
+            // wire_shared_pages`'s own doc comment for why).
+            if let Some(addr_space) = k.tcb(tid).map(|t| t.addr_space) {
+                if let Some(root_pt) = k.addr_space_mut(addr_space).map(|a| a.root_phys().as_usize()) {
+                    if kernel_arch_glue::wire_shared_pages(hal, root_pt, APP_BUFFER_VA, APP_BUFFER_LEN).is_none() {
+                        kernel_arch_glue::log(format_args!(
+                            "root task (x86_64): native-loader app-buffer wiring failed (out of resources) - SPAWN_FROM_BUFFER calls will fault\r\n"
+                        ));
+                    }
+                }
+            }
+            Some(tid)
+        }
+        None => {
+            kernel_arch_glue::log(format_args!(
+                "root task (x86_64): native-loader spawn skipped (out of resources)\r\n"
+            ));
+            None
+        }
+    }
+}
+
+/// Wires the real `native-loader` -> `security-broker` IPC edge (this
+/// session's real-IPC plan, Phase 1) — a shared `Endpoint` plus one
+/// shared physical page, granted/mapped into both processes' own address
+/// spaces via `kernel_arch_glue::wire_service_endpoint`. Called right
+/// after `native-loader` itself spawns successfully; does nothing (and
+/// logs why) if security-broker was not spawned or either address space
+/// cannot be resolved — native-loader still boots and runs its own
+/// `self_check` either way, just without a working real transport (same
+/// "gap flagged, not hidden" posture every other still-open IPC seam in
+/// this project has).
+#[cfg(target_arch = "x86_64")]
+fn wire_native_loader_to_security_broker_x86(
+    hal: &hal_core::HalInterface,
+    k: &mut kernel_core::KernelState,
+    native_loader_tid: kernel_cap::ThreadId,
+    native_loader_cs: kernel_cap::CapSpaceId,
+) {
+    // SAFETY: single-core; only ever read after `spawn_security_broker_x86`
+    // (which runs strictly earlier in boot, see that static's own doc
+    // comment) has written it.
+    let Some(security_broker_tid) = (unsafe { core::ptr::addr_of!(G_SECURITY_BROKER_TID_X86).read() }) else {
+        kernel_arch_glue::log(format_args!(
+            "root task (x86_64): native-loader<->security-broker wiring skipped (security-broker was not spawned)\r\n"
+        ));
+        return;
+    };
+    let Some(sb_tcb) = k.tcb(security_broker_tid) else {
+        kernel_arch_glue::log(format_args!(
+            "root task (x86_64): native-loader<->security-broker wiring skipped (could not resolve security-broker's own TCB)\r\n"
+        ));
+        return;
+    };
+    let (sb_cs, sb_addr_space) = (sb_tcb.cap_space, sb_tcb.addr_space);
+    let Some(nl_tcb) = k.tcb(native_loader_tid) else {
+        kernel_arch_glue::log(format_args!(
+            "root task (x86_64): native-loader<->security-broker wiring skipped (could not resolve native-loader's own TCB)\r\n"
+        ));
+        return;
+    };
+    let nl_addr_space = nl_tcb.addr_space;
+    let Some(sb_root_pt) = k.addr_space_mut(sb_addr_space).map(|a| a.root_phys().as_usize()) else {
+        kernel_arch_glue::log(format_args!(
+            "root task (x86_64): native-loader<->security-broker wiring skipped (could not resolve security-broker's own address space)\r\n"
+        ));
+        return;
+    };
+    let Some(nl_root_pt) = k.addr_space_mut(nl_addr_space).map(|a| a.root_phys().as_usize()) else {
+        kernel_arch_glue::log(format_args!(
+            "root task (x86_64): native-loader<->security-broker wiring skipped (could not resolve native-loader's own address space)\r\n"
+        ));
+        return;
+    };
+    const SBS_SHARED_VA: usize = 0xD8D0_0000;
+    const SB_SHARED_VA: usize = 0xD8E0_0000;
+    match kernel_arch_glue::wire_service_endpoint(
+        hal,
+        k.root_thread,
+        sb_cs,
+        sb_root_pt,
+        SBS_SHARED_VA,
+        native_loader_cs,
+        nl_root_pt,
+        SB_SHARED_VA,
+        kernel_cap::CapabilityRights::READ | kernel_cap::CapabilityRights::WRITE,
+    ) {
+        Some(_) => kernel_arch_glue::log(format_args!(
+            "root task (x86_64): wired native-loader <-> security-broker real IPC edge (request_capability)\r\n"
+        )),
+        None => kernel_arch_glue::log(format_args!(
+            "root task (x86_64): native-loader<->security-broker wiring skipped (out of resources)\r\n"
+        )),
+    }
+}
+
+/// Wires a THIRD, independent real client to Compositor —
+/// `simurgh-native-sdk`'s own `native-loader`, proving `de-framework::
+/// display::DisplayClient` has a real transport (this repo's own README
+/// used to flag this as "still library-only... no IPC transport to the
+/// Compositor Service yet"). Reuses `kernel_arch_glue::wire_ui_core_to_
+/// compositor` as-is — that function is already generic over the target
+/// cap space/address space/VAs despite its name (it just derives another
+/// grant of Compositor's own Endpoint, this project's own established
+/// "second/third independent client" pattern `wire_file_manager_to_fs_
+/// native` set the precedent for). Safe to call here because Compositor's
+/// own root-task demo (`compositor_demo_start`) always completes earlier
+/// in this same boot sequence, well before `spawn_native_loader_x86`
+/// itself runs — the same "never concurrent callers" reasoning `spawn_
+/// ui_core_x86`'s own call to this function already relies on. Reuses
+/// `UI_CORE_COMPOSITOR_SHARED_VA`/`UI_CORE_COMPOSITOR_FB_VA` — safe to
+/// reuse the exact same VAs `ui-core` maps them at, since every process
+/// has its own independent address space (no collision possible between
+/// two different processes' own page tables).
+#[cfg(target_arch = "x86_64")]
+fn wire_native_loader_to_compositor_x86(
+    hal: &hal_core::HalInterface,
+    k: &mut kernel_core::KernelState,
+    native_loader_tid: kernel_cap::ThreadId,
+    native_loader_cs: kernel_cap::CapSpaceId,
+) {
+    let Some(nl_tcb) = k.tcb(native_loader_tid) else {
+        kernel_arch_glue::log(format_args!(
+            "root task (x86_64): native-loader<->Compositor wiring skipped (could not resolve native-loader's own TCB)\r\n"
+        ));
+        return;
+    };
+    let nl_addr_space = nl_tcb.addr_space;
+    let Some(nl_root_pt) = k.addr_space_mut(nl_addr_space).map(|a| a.root_phys().as_usize()) else {
+        kernel_arch_glue::log(format_args!(
+            "root task (x86_64): native-loader<->Compositor wiring skipped (could not resolve native-loader's own address space)\r\n"
+        ));
+        return;
+    };
+    // `desktop` build: ui-core is the Compositor's ONLY client. The
+    // Compositor serves every client through ONE message page and ONE
+    // frame region (`wire_ui_core_to_compositor` maps the same physical
+    // pages into each client — see compositor's `subsystem_entry` module
+    // doc comment), so with a preemptive scheduler running for real, two
+    // clients mid-`Call` overwrite each other's request/reply: on a real
+    // desktop boot (2026-09-24) native-loader's one-shot display
+    // self-check running concurrently with ui-core's startup made
+    // ui-core's own `CommitBuffer` fail (`ok=false step=2`) and
+    // native-loader's fail too. native-loader gets private scratch pages
+    // at the same VAs instead of the live ones and no Compositor
+    // capability, so its self-check runs to a clean `succeeded=false`
+    // and can never touch ui-core's traffic. The demo build keeps the
+    // real edge (there, nothing else is drawing).
+    #[cfg(feature = "desktop")]
+    {
+        let _ = native_loader_cs;
+        let ok = kernel_arch_glue::map_private_scratch(hal, nl_root_pt, UI_CORE_COMPOSITOR_SHARED_VA, 1).is_some()
+            && kernel_arch_glue::map_private_scratch(hal, nl_root_pt, UI_CORE_COMPOSITOR_FB_VA, 1).is_some();
+        kernel_arch_glue::log(format_args!(
+            "desktop mode: native-loader NOT wired to Compositor (ui-core is its only client); private scratch pages mapped: {ok}\r\n"
+        ));
+        return;
+    }
+    #[cfg(not(feature = "desktop"))]
+    match kernel_arch_glue::wire_ui_core_to_compositor(
+        hal,
+        native_loader_cs,
+        nl_root_pt,
+        UI_CORE_COMPOSITOR_SHARED_VA,
+        UI_CORE_COMPOSITOR_FB_VA,
+    ) {
+        Some(()) => kernel_arch_glue::log(format_args!(
+            "root task (x86_64): wired native-loader <-> Compositor real IPC edge (de-framework DisplayClient)\r\n"
+        )),
+        None => kernel_arch_glue::log(format_args!(
+            "root task (x86_64): native-loader<->Compositor wiring skipped (Compositor not ready or out of resources)\r\n"
+        )),
+    }
+}
+
+/// Wires the shared `Notification` fan-in (real-IPC plan, Phase 2) across
+/// security-broker and its 3 real clients — called once, from `spawn_
+/// native_loader_x86`, since native-loader is the LAST of the 3 clients
+/// spawned in this architecture's own `P2_PREEMPT_START` sequence
+/// (account-manager, then store, then native-loader) — by this point
+/// `G_ACCOUNT_MANAGER_CS_X86`/`G_STORE_CS_X86` are already `Some` (each
+/// written by its own `wire_client_to_security_broker_x86` call, right
+/// after its own spawn succeeds).
+///
+/// Bit assignment (a plain caller-defined `u64` OR-mask — the kernel
+/// never interprets it, `kernel_core::syscall`'s own `Signal` doc
+/// comment): `NATIVE_LOADER_BIT = 1`, `ACCOUNT_MANAGER_BIT = 2`,
+/// `STORE_BIT = 4`. Each client's own `subsystem_entry.rs` hardcodes its
+/// own bit and the resulting notification `CapId` slot (a fixed compile-
+/// time constant, same convention every other capability grant in this
+/// project already uses) — see `simurgh-security-broker`'s own
+/// `serve_capability_requests`'s module doc comment for the exact,
+/// verified slot numbers this grant sequence produces.
+#[cfg(target_arch = "x86_64")]
+fn wire_security_broker_notification_fanin_x86(hal: &hal_core::HalInterface, k: &mut kernel_core::KernelState, native_loader_cs: kernel_cap::CapSpaceId) {
+    let Some(security_broker_tid) = (unsafe { core::ptr::addr_of!(G_SECURITY_BROKER_TID_X86).read() }) else {
+        kernel_arch_glue::log(format_args!(
+            "root task (x86_64): security-broker notification fan-in skipped (security-broker was not spawned)\r\n"
+        ));
+        return;
+    };
+    let Some(sb_cs) = k.tcb(security_broker_tid).map(|t| t.cap_space) else {
+        kernel_arch_glue::log(format_args!(
+            "root task (x86_64): security-broker notification fan-in skipped (could not resolve security-broker's own TCB)\r\n"
+        ));
+        return;
+    };
+    // SAFETY: single-core; both written by this arm's own earlier spawn
+    // calls, strictly before native-loader's own spawn runs.
+    let (am_cs, store_cs) = unsafe {
+        (
+            core::ptr::addr_of!(G_ACCOUNT_MANAGER_CS_X86).read(),
+            core::ptr::addr_of!(G_STORE_CS_X86).read(),
+        )
+    };
+    let (Some(am_cs), Some(store_cs)) = (am_cs, store_cs) else {
+        kernel_arch_glue::log(format_args!(
+            "root task (x86_64): security-broker notification fan-in skipped (account-manager or store was not wired)\r\n"
+        ));
+        return;
+    };
+    let targets = [sb_cs, native_loader_cs, am_cs, store_cs];
+    match kernel_arch_glue::wire_notification(hal, k.root_thread, &targets, kernel_cap::CapabilityRights::READ | kernel_cap::CapabilityRights::WRITE) {
+        Some(_) => kernel_arch_glue::log(format_args!(
+            "root task (x86_64): wired security-broker notification fan-in (native-loader, account-manager, store)\r\n"
+        )),
+        None => kernel_arch_glue::log(format_args!(
+            "root task (x86_64): security-broker notification fan-in skipped (out of resources)\r\n"
+        )),
+    }
+}
+
+/// x86_64 counterpart of `spawn_native_loader` (riscv64) — see that
+/// function's own doc comment for the full rationale. Same shape as
+/// `spawn_native_loader_x86`; the TENTH layer-4 process this project
+/// spawns (`simurgh-file-manager`, a separate git repo). `fm-core` had
+/// never been ported to a real bootable subsystem at all before this
+/// (2026-09-10) — its VFS operations were blocked on `fs-native` having
+/// no way to register an arbitrary path string (`ipc_protocol::fs::
+/// FsRequest::RegisterPath`, added the same day). Wires the real `fm-
+/// core` <-> `fs-native` IPC edge right after spawning (`wire_file_
+/// manager_to_fs_native`'s own doc comment): unlike `native-loader`'s own
+/// edge to security-broker, this one needs no `Notification` fan-in —
+/// Root Task's own `fs-native` usage (`fs_demo_start`) happens once,
+/// early in boot, and completes before this process is ever spawned, so
+/// the two are never concurrent callers of fs-native's shared `Endpoint`.
+#[cfg(target_arch = "x86_64")]
+fn spawn_file_manager_x86(hal: &hal_core::HalInterface) -> Option<kernel_cap::ThreadId> {
+    let k = kernel_arch_glue::kstate();
+
+    const FILE_MANAGER_STACK_VMA: usize = 0xC049_0000;
+    const FILE_MANAGER_STACK_LEN: usize = 4096 * 64;
+    match kernel_arch_glue::spawn_process_from_elf(
+        hal,
+        k,
+        FILE_MANAGER_ELF,
+        elf_loader::machine::EM_X86_64,
+        FILE_MANAGER_STACK_VMA,
+        FILE_MANAGER_STACK_LEN,
+    ) {
+        Some((tid, cap_space, _stack_phys)) => {
+            kernel_arch_glue::log(format_args!(
+                "root task (x86_64): spawned file-manager (tid {}) from its OWN separately-built ELF image (simurgh-file-manager repo)\r\n",
+                tid.as_u32()
+            ));
+            let root_pt = k
+                .tcb(tid)
+                .map(|t| t.addr_space)
+                .and_then(|addr_space| k.addr_space_mut(addr_space).map(|a| a.root_phys().as_usize()));
+            match root_pt {
+                Some(root_pt) => {
+                    match kernel_arch_glue::wire_file_manager_to_fs_native(
+                        hal,
+                        tid,
+                        cap_space,
+                        root_pt,
+                        FILE_MANAGER_FS_SHARED_VA,
+                        FILE_MANAGER_FS_DATA_VA,
+                    ) {
+                        Some(()) => kernel_arch_glue::log(format_args!(
+                            "root task (x86_64): wired file-manager <-> fs-native real IPC edge\r\n"
+                        )),
+                        None => kernel_arch_glue::log(format_args!(
+                            "root task (x86_64): file-manager<->fs-native wiring skipped (fs-native not ready or out of resources)\r\n"
+                        )),
+                    }
+                }
+                None => kernel_arch_glue::log(format_args!(
+                    "root task (x86_64): file-manager<->fs-native wiring skipped (could not resolve file-manager's own address space)\r\n"
+                )),
+            }
+            Some(tid)
+        }
+        None => {
+            kernel_arch_glue::log(format_args!(
+                "root task (x86_64): file-manager spawn skipped (out of resources)\r\n"
+            ));
+            None
+        }
+    }
+}
+
+/// Adds the x86_64-only device facts (CPU brand, full PCI inventory) to the
+/// device-list page before it is mapped into ui-core.
+#[cfg(target_arch = "x86_64")]
+fn add_x86_device_info() {
+    use core::fmt::Write;
+    let ident = hal_x86_64::cpu::cpu_identity(&hal_x86_64::cpu::RealCpuid);
+    let brand = core::str::from_utf8(&ident.brand).unwrap_or("").trim_matches(|c: char| c == '\0' || c == ' ');
+    let vendor = core::str::from_utf8(&ident.vendor).unwrap_or("");
+    let mut id = [0u8; 44];
+    let mut cur = 0usize;
+    struct W<'a>(&'a mut [u8], &'a mut usize);
+    impl core::fmt::Write for W<'_> {
+        fn write_str(&mut self, s: &str) -> core::fmt::Result {
+            for &b in s.as_bytes() {
+                if *self.1 < self.0.len() {
+                    self.0[*self.1] = b;
+                    *self.1 += 1;
+                }
+            }
+            Ok(())
+        }
+    }
+    let _ = write!(W(&mut id, &mut cur), "{} family {} model {} step {}", vendor, ident.family, ident.model, ident.stepping);
+    let id_s = core::str::from_utf8(&id[..cur]).unwrap_or("");
+    if brand.is_empty() {
+        kernel_arch_glue::devlist_set_cpu(vendor, id_s);
+    } else {
+        kernel_arch_glue::devlist_set_cpu(brand, id_s);
+    }
+    for f in hal_x86_64::peripheral::pci_functions() {
+        let mac = if f.has_mac { Some(f.mac) } else { None };
+        kernel_arch_glue::devlist_add_pci(f.bus, f.device, f.function, f.vendor_id, f.device_id, f.class_code, f.subclass, f.prog_if, mac);
+    }
+}
+
+/// x86_64 counterpart of `spawn_native_loader` (riscv64) — see that
+/// function's own doc comment for the full rationale. Same shape as
+/// `spawn_file_manager_x86`; the ELEVENTH layer-4/5/6 process this
+/// project spawns (`Simurgh-UI-Template01`, a separate git repo — the
+/// base graphical desktop environment, Omid's own 2026-09-11 direction).
+/// Wires the real `ui-core` <-> Compositor IPC edge right after spawning
+/// (`wire_ui_core_to_compositor`'s own doc comment): same "never
+/// concurrent callers" reasoning `spawn_file_manager_x86`'s own doc
+/// comment gives for the identical fs-native precedent — Root Task's own
+/// Compositor usage (`compositor_demo_start`) happens once, early in
+/// boot, and completes before this process is ever spawned.
+#[cfg(target_arch = "x86_64")]
+fn spawn_ui_core_x86(hal: &hal_core::HalInterface) -> Option<kernel_cap::ThreadId> {
+    let k = kernel_arch_glue::kstate();
+
+    const UI_CORE_STACK_VMA: usize = 0xC04A_0000;
+    const UI_CORE_STACK_LEN: usize = 4096 * 64;
+    match kernel_arch_glue::spawn_process_from_elf(
+        hal,
+        k,
+        UI_CORE_ELF,
+        elf_loader::machine::EM_X86_64,
+        UI_CORE_STACK_VMA,
+        UI_CORE_STACK_LEN,
+    ) {
+        Some((tid, cap_space, _stack_phys)) => {
+            kernel_arch_glue::log(format_args!(
+                "root task (x86_64): spawned ui-core (tid {}) from its OWN separately-built ELF image (Simurgh-UI-Template01 repo)\r\n",
+                tid.as_u32()
+            ));
+            let root_pt = k
+                .tcb(tid)
+                .map(|t| t.addr_space)
+                .and_then(|addr_space| k.addr_space_mut(addr_space).map(|a| a.root_phys().as_usize()));
+            match root_pt {
+                Some(root_pt) => {
+                    match kernel_arch_glue::wire_ui_core_to_compositor(
+                        hal,
+                        cap_space,
+                        root_pt,
+                        UI_CORE_COMPOSITOR_SHARED_VA,
+                        UI_CORE_COMPOSITOR_FB_VA,
+                    ) {
+                        Some(()) => kernel_arch_glue::log(format_args!(
+                            "root task (x86_64): wired ui-core <-> Compositor real IPC edge\r\n"
+                        )),
+                        None => kernel_arch_glue::log(format_args!(
+                            "root task (x86_64): ui-core<->Compositor wiring skipped (Compositor not ready or out of resources)\r\n"
+                        )),
+                    }
+                }
+                None => kernel_arch_glue::log(format_args!(
+                    "root task (x86_64): ui-core<->Compositor wiring skipped (could not resolve ui-core's own address space)\r\n"
+                )),
+            }
+            // The machine id, read-only, for the USERS window: ui-core is the
+            // ONLY process this page is ever mapped into (docs/machine-id.md
+            // section 10, TODO-5 records the open access-control question).
+            if let Some(root_pt) = root_pt {
+                match kernel_arch_glue::map_machine_id_info(hal, root_pt, UI_CORE_MACHINE_ID_VA) {
+                    Some(()) => kernel_arch_glue::log(format_args!(
+                        "root task (x86_64): mapped the machine-id info page read-only into ui-core at {:#x}\r\n",
+                        UI_CORE_MACHINE_ID_VA
+                    )),
+                    None => kernel_arch_glue::log(format_args!(
+                        "root task (x86_64): machine-id info page NOT mapped into ui-core (out of resources)\r\n"
+                    )),
+                }
+                add_x86_device_info();
+                match kernel_arch_glue::map_net_info(hal, root_pt, UI_CORE_NET_INFO_VA) {
+                    Some(()) => kernel_arch_glue::log(format_args!(
+                        "root task (x86_64): mapped the network status page read-only into ui-core at {:#x}\r\n",
+                        UI_CORE_NET_INFO_VA
+                    )),
+                    None => kernel_arch_glue::log(format_args!(
+                        "root task (x86_64): network status page NOT mapped into ui-core (out of resources)\r\n"
+                    )),
+                }
+                match kernel_arch_glue::map_device_list_info(hal, root_pt, UI_CORE_DEVICE_LIST_VA) {
+                    Some(()) => kernel_arch_glue::log(format_args!(
+                        "root task (x86_64): mapped the device-list info page read-only into ui-core at {:#x}\r\n",
+                        UI_CORE_DEVICE_LIST_VA
+                    )),
+                    None => kernel_arch_glue::log(format_args!(
+                        "root task (x86_64): device-list info page NOT mapped into ui-core (out of resources)\r\n"
+                    )),
+                }
+            }
+            Some(tid)
+        }
+        None => {
+            kernel_arch_glue::log(format_args!(
+                "root task (x86_64): ui-core spawn skipped (out of resources)\r\n"
+            ));
+            None
+        }
+    }
+}
+
+/// Shared helper for `account-manager`'s and `store`'s own edges to
+/// security-broker (real-IPC plan, Phase 2) — both are a plain repeat of
+/// `wire_native_loader_to_security_broker_x86`'s own shape (Phase 1),
+/// generalized once here rather than copy-pasted a second and third
+/// time, since the ONLY thing that differs per edge is which client and
+/// which pair of VAs. `wire_native_loader_to_security_broker_x86` itself
+/// is left exactly as committed — already proven working via real QEMU,
+/// not worth the regression risk of routing it through this too.
+///
+/// Returns the client's own `CapSpaceId` on success (needed afterward to
+/// wire the shared `Notification`, real-IPC plan Phase 2's own fan-in
+/// step) — `None` (and logs why) on any failure, same posture every
+/// other wiring helper in this file has.
+#[cfg(target_arch = "x86_64")]
+fn wire_client_to_security_broker_x86(
+    hal: &hal_core::HalInterface,
+    k: &mut kernel_core::KernelState,
+    client_tid: kernel_cap::ThreadId,
+    client_label: &str,
+    client_shared_va: usize,
+    sb_shared_va: usize,
+) -> Option<kernel_cap::CapSpaceId> {
+    let Some(security_broker_tid) = (unsafe { core::ptr::addr_of!(G_SECURITY_BROKER_TID_X86).read() }) else {
+        kernel_arch_glue::log(format_args!(
+            "root task (x86_64): {client_label}<->security-broker wiring skipped (security-broker was not spawned)\r\n"
+        ));
+        return None;
+    };
+    let Some(sb_tcb) = k.tcb(security_broker_tid) else {
+        kernel_arch_glue::log(format_args!(
+            "root task (x86_64): {client_label}<->security-broker wiring skipped (could not resolve security-broker's own TCB)\r\n"
+        ));
+        return None;
+    };
+    let (sb_cs, sb_addr_space) = (sb_tcb.cap_space, sb_tcb.addr_space);
+    let Some(client_tcb) = k.tcb(client_tid) else {
+        kernel_arch_glue::log(format_args!(
+            "root task (x86_64): {client_label}<->security-broker wiring skipped (could not resolve {client_label}'s own TCB)\r\n"
+        ));
+        return None;
+    };
+    let client_cs = client_tcb.cap_space;
+    let client_addr_space = client_tcb.addr_space;
+    let Some(sb_root_pt) = k.addr_space_mut(sb_addr_space).map(|a| a.root_phys().as_usize()) else {
+        kernel_arch_glue::log(format_args!(
+            "root task (x86_64): {client_label}<->security-broker wiring skipped (could not resolve security-broker's own address space)\r\n"
+        ));
+        return None;
+    };
+    let Some(client_root_pt) = k.addr_space_mut(client_addr_space).map(|a| a.root_phys().as_usize()) else {
+        kernel_arch_glue::log(format_args!(
+            "root task (x86_64): {client_label}<->security-broker wiring skipped (could not resolve {client_label}'s own address space)\r\n"
+        ));
+        return None;
+    };
+    match kernel_arch_glue::wire_service_endpoint(
+        hal,
+        k.root_thread,
+        sb_cs,
+        sb_root_pt,
+        sb_shared_va,
+        client_cs,
+        client_root_pt,
+        client_shared_va,
+        kernel_cap::CapabilityRights::READ | kernel_cap::CapabilityRights::WRITE,
+    ) {
+        Some(_) => {
+            kernel_arch_glue::log(format_args!(
+                "root task (x86_64): wired {client_label} <-> security-broker real IPC edge\r\n"
+            ));
+            Some(client_cs)
+        }
+        None => {
+            kernel_arch_glue::log(format_args!(
+                "root task (x86_64): {client_label}<->security-broker wiring skipped (out of resources)\r\n"
+            ));
+            None
+        }
+    }
+}
+
+/// Wires the `simurgh-store` <-> `simurgh-profile-policy` real IPC edge
+/// (real-IPC plan's newest edge — `store`'s own install-time
+/// compatibility check). Unlike [`wire_client_to_security_broker_x86`],
+/// this takes BOTH tids as explicit parameters rather than resolving the
+/// server side through a `G_*_TID_X86`-style global: policy-engine has no
+/// such global (nothing else in this boot sequence needs its tid), and
+/// this is the ONLY call site that ever wires it, so a parameter is
+/// simpler than adding a new global purely for this one read. Single
+/// client, so — unlike security-broker's own 3-way fan-in — this needs no
+/// shared `Notification`, just one `Endpoint`+page pair from
+/// `kernel_arch_glue::wire_service_endpoint`. `policy_engine_va`/
+/// `store_va` must stay numerically equal to `simurgh-profile-policy::
+/// subsystem_entry::PP_SHARED_VA` (`0xD920_0000`, that repo's own first
+/// and only shared page) and `simurgh-store::manifest-installer::
+/// subsystem_entry::PP_SHARED_VA` (`0xD930_0000`, distinct from that same
+/// process's own `STORE_VA` = `0xD920_0000` used for its EXISTING
+/// security-broker edge — same address space, so these two must not
+/// collide) respectively.
+#[cfg(target_arch = "x86_64")]
+fn wire_store_to_policy_engine_x86(
+    hal: &hal_core::HalInterface,
+    k: &mut kernel_core::KernelState,
+    store_tid: kernel_cap::ThreadId,
+    policy_engine_tid: kernel_cap::ThreadId,
+) {
+    const POLICY_ENGINE_VA: usize = 0xD920_0000;
+    const STORE_PP_VA: usize = 0xD930_0000;
+    let Some(pe_tcb) = k.tcb(policy_engine_tid) else {
+        kernel_arch_glue::log(format_args!(
+            "root task (x86_64): store<->profile-policy wiring skipped (could not resolve policy-engine's own TCB)\r\n"
+        ));
+        return;
+    };
+    let (pe_cs, pe_addr_space) = (pe_tcb.cap_space, pe_tcb.addr_space);
+    let Some(store_tcb) = k.tcb(store_tid) else {
+        kernel_arch_glue::log(format_args!(
+            "root task (x86_64): store<->profile-policy wiring skipped (could not resolve store's own TCB)\r\n"
+        ));
+        return;
+    };
+    let (store_cs, store_addr_space) = (store_tcb.cap_space, store_tcb.addr_space);
+    let Some(pe_root_pt) = k.addr_space_mut(pe_addr_space).map(|a| a.root_phys().as_usize()) else {
+        kernel_arch_glue::log(format_args!(
+            "root task (x86_64): store<->profile-policy wiring skipped (could not resolve policy-engine's own address space)\r\n"
+        ));
+        return;
+    };
+    let Some(store_root_pt) = k.addr_space_mut(store_addr_space).map(|a| a.root_phys().as_usize()) else {
+        kernel_arch_glue::log(format_args!(
+            "root task (x86_64): store<->profile-policy wiring skipped (could not resolve store's own address space)\r\n"
+        ));
+        return;
+    };
+    match kernel_arch_glue::wire_service_endpoint(
+        hal,
+        k.root_thread,
+        pe_cs,
+        pe_root_pt,
+        POLICY_ENGINE_VA,
+        store_cs,
+        store_root_pt,
+        STORE_PP_VA,
+        kernel_cap::CapabilityRights::READ | kernel_cap::CapabilityRights::WRITE,
+    ) {
+        Some(_) => {
+            kernel_arch_glue::log(format_args!(
+                "root task (x86_64): wired store <-> profile-policy real IPC edge\r\n"
+            ));
+        }
+        None => {
+            kernel_arch_glue::log(format_args!(
+                "root task (x86_64): store<->profile-policy wiring skipped (out of resources)\r\n"
+            ));
+        }
+    }
+}
+
+/// Wires the `Simurgh-UI-Template01::ui-core` <-> `simurgh-profile-policy`
+/// real `switch_profile` IPC edge (Omid's own 2026-09-16 direction: a
+/// PROFILE submenu in `ui-core`, one entry per real `ProfileKind`) — a
+/// SECOND real `Endpoint` into policy-engine's own cap space, lands at
+/// slot 1 (slot 0 already holds `store`'s own compatibility-check
+/// `Endpoint`, `wire_store_to_policy_engine_x86`'s own doc comment).
+/// Same "takes both tids as explicit parameters" shape as that function
+/// for the identical reason — policy-engine has no `G_*_TID_X86` global.
+/// Must run AFTER `wire_store_to_policy_engine_x86` (slot ordering) and
+/// BEFORE `wire_policy_engine_notification_fanin_x86` (that function's
+/// own Notification grant must land at slot 2, after this edge's own
+/// Endpoint).
+#[cfg(target_arch = "x86_64")]
+fn wire_ui_core_to_policy_engine_x86(
+    hal: &hal_core::HalInterface,
+    k: &mut kernel_core::KernelState,
+    ui_core_tid: kernel_cap::ThreadId,
+    policy_engine_tid: kernel_cap::ThreadId,
+) {
+    const POLICY_ENGINE_UI_VA: usize = 0xD960_0000;
+    const UI_CORE_PP_VA: usize = 0xD890_0000;
+    let Some(pe_tcb) = k.tcb(policy_engine_tid) else {
+        kernel_arch_glue::log(format_args!(
+            "root task (x86_64): ui-core<->profile-policy wiring skipped (could not resolve policy-engine's own TCB)\r\n"
+        ));
+        return;
+    };
+    let (pe_cs, pe_addr_space) = (pe_tcb.cap_space, pe_tcb.addr_space);
+    let Some(ui_tcb) = k.tcb(ui_core_tid) else {
+        kernel_arch_glue::log(format_args!(
+            "root task (x86_64): ui-core<->profile-policy wiring skipped (could not resolve ui-core's own TCB)\r\n"
+        ));
+        return;
+    };
+    let (ui_cs, ui_addr_space) = (ui_tcb.cap_space, ui_tcb.addr_space);
+    let Some(pe_root_pt) = k.addr_space_mut(pe_addr_space).map(|a| a.root_phys().as_usize()) else {
+        kernel_arch_glue::log(format_args!(
+            "root task (x86_64): ui-core<->profile-policy wiring skipped (could not resolve policy-engine's own address space)\r\n"
+        ));
+        return;
+    };
+    let Some(ui_root_pt) = k.addr_space_mut(ui_addr_space).map(|a| a.root_phys().as_usize()) else {
+        kernel_arch_glue::log(format_args!(
+            "root task (x86_64): ui-core<->profile-policy wiring skipped (could not resolve ui-core's own address space)\r\n"
+        ));
+        return;
+    };
+    match kernel_arch_glue::wire_service_endpoint(
+        hal,
+        k.root_thread,
+        pe_cs,
+        pe_root_pt,
+        POLICY_ENGINE_UI_VA,
+        ui_cs,
+        ui_root_pt,
+        UI_CORE_PP_VA,
+        kernel_cap::CapabilityRights::READ | kernel_cap::CapabilityRights::WRITE,
+    ) {
+        Some(_) => {
+            kernel_arch_glue::log(format_args!(
+                "root task (x86_64): wired ui-core <-> profile-policy real IPC edge (switch_profile)\r\n"
+            ));
+        }
+        None => {
+            kernel_arch_glue::log(format_args!(
+                "root task (x86_64): ui-core<->profile-policy wiring skipped (out of resources)\r\n"
+            ));
+        }
+    }
+}
+
+/// Wires the `Simurgh-UI-Template01::ui-core` <-> `simurgh-shell` real
+/// terminal IPC edge (Omid's own 2026-09-17 direction: `ui-core`'s start
+/// menu has long carried a `"TERMINAL"` entry with NO handler behind it
+/// at all, while `simurgh-shell` is a genuinely complete interactive
+/// shell reachable only over the serial console — that window becomes a
+/// real front-end onto the real shell, rather than a second, weaker
+/// interpreter built inside `ui-core`). Same "takes both tids as explicit
+/// parameters" shape as `wire_ui_core_to_policy_engine_x86` just above,
+/// for the identical reason: neither side has a `G_*_TID_X86` global
+/// usable here (`simurgh-shell`'s own `G_SHELL_TID` lives in
+/// `kernel-arch-glue` for the `SPAWN_KNOWN_ELF` caller check, is
+/// write-only from this file's perspective, and is set from the very
+/// call whose result this edge needs), and this is the only call site
+/// that ever wires it.
+///
+/// **Capability slots on BOTH sides, assigned strictly by boot-time grant
+/// order** (the same determinism every other wiring function in this file
+/// documents):
+///
+/// - **`simurgh-shell`**: the `Endpoint` lands at slot **0** and the
+///   `Notification` at slot **1** — this process's capability space is
+///   completely EMPTY beforehand. `spawn_shell_x86` wires it one shared
+///   page (`kernel_arch_glue::wire_shared_pages`, its debug-print
+///   channel) and no capability at all, since that page is shared only
+///   with the kernel's own dispatch code, never another process. This
+///   call is therefore the first and only grant `shell` ever receives.
+/// - **`ui-core`**: the `Endpoint` lands at slot **6** and the
+///   `Notification` at slot **7** — slot 0 Compositor
+///   (`spawn_ui_core_x86`), slot 1 account-manager's `Endpoint`, slot 2
+///   its hub `Notification`, slot 3 file-manager's `Endpoint`, slot 4
+///   policy-engine's `Endpoint`, slot 5 policy-engine's `Notification`.
+///   This call must therefore run AFTER
+///   `wire_policy_engine_notification_fanin_x86`, the last grant into
+///   `ui-core`'s own cap space before it.
+///
+/// Both sides' constants are mirrored in the two client/server crates:
+/// `simurgh-shell::shell_core::subsystem_entry::TERM_ENDPOINT_CAP`/
+/// `TERM_NOTIF_CAP`/`TERM_SHARED_VA` and `Simurgh-UI-Template01::ui-core::
+/// subsystem_entry::SHELL_ENDPOINT_CAP`/`SHELL_NOTIF_CAP`/
+/// `SHELL_SHARED_VA`.
+///
+/// `shell_va`/`ui_core_client_va` are each that process's own next free
+/// region: `0xD910_0000` for shell (past its own debug-print page's end,
+/// `0xD900_0000 + 4096`) and `0xD8A0_0000` for ui-core (past its own
+/// profile-policy page's end, `0xD890_0000 + 4096`). The two need not
+/// match each other — they are separate address spaces — only their own
+/// side of this wiring call.
+///
+/// Unlike every other single-client edge in this file, this one ALSO
+/// wires a shared `Notification`. That is not a fan-in across clients
+/// (there is exactly one client): `simurgh-shell` already owns a real,
+/// long-running serial REPL, so it cannot park in a blocking `Recv` the
+/// way `fm-core` does without freezing the serial console it exists to
+/// serve. It instead polls this `Notification` with the NON-blocking
+/// `sys::NOTIF_POLL` once per REPL iteration — the same shape Compositor
+/// already uses for its own i8042 signal. See `simurgh-shell::shell_core::
+/// subsystem_entry`'s own "Real terminal SERVICE role" section doc
+/// comment for the full reasoning.
+#[cfg(target_arch = "x86_64")]
+fn wire_ui_core_to_shell_x86(
+    hal: &hal_core::HalInterface,
+    k: &mut kernel_core::KernelState,
+    ui_core_tid: kernel_cap::ThreadId,
+    shell_tid: kernel_cap::ThreadId,
+) {
+    const SHELL_VA: usize = 0xD910_0000;
+    const UI_CORE_SHELL_VA: usize = 0xD8A0_0000;
+    let Some(shell_tcb) = k.tcb(shell_tid) else {
+        kernel_arch_glue::log(format_args!(
+            "root task (x86_64): ui-core<->shell wiring skipped (could not resolve shell's own TCB)\r\n"
+        ));
+        return;
+    };
+    let (shell_cs, shell_addr_space) = (shell_tcb.cap_space, shell_tcb.addr_space);
+    let Some(ui_tcb) = k.tcb(ui_core_tid) else {
+        kernel_arch_glue::log(format_args!(
+            "root task (x86_64): ui-core<->shell wiring skipped (could not resolve ui-core's own TCB)\r\n"
+        ));
+        return;
+    };
+    let (ui_cs, ui_addr_space) = (ui_tcb.cap_space, ui_tcb.addr_space);
+    let Some(shell_root_pt) = k.addr_space_mut(shell_addr_space).map(|a| a.root_phys().as_usize()) else {
+        kernel_arch_glue::log(format_args!(
+            "root task (x86_64): ui-core<->shell wiring skipped (could not resolve shell's own address space)\r\n"
+        ));
+        return;
+    };
+    let Some(ui_root_pt) = k.addr_space_mut(ui_addr_space).map(|a| a.root_phys().as_usize()) else {
+        kernel_arch_glue::log(format_args!(
+            "root task (x86_64): ui-core<->shell wiring skipped (could not resolve ui-core's own address space)\r\n"
+        ));
+        return;
+    };
+    if kernel_arch_glue::wire_service_endpoint(
+        hal,
+        k.root_thread,
+        shell_cs,
+        shell_root_pt,
+        SHELL_VA,
+        ui_cs,
+        ui_root_pt,
+        UI_CORE_SHELL_VA,
+        kernel_cap::CapabilityRights::READ | kernel_cap::CapabilityRights::WRITE,
+    )
+    .is_none()
+    {
+        kernel_arch_glue::log(format_args!(
+            "root task (x86_64): ui-core<->shell wiring skipped (out of resources)\r\n"
+        ));
+        return;
+    }
+    // The non-blocking doorbell half — must be granted AFTER the
+    // `Endpoint` above, on both sides, for the slot numbers in this
+    // function's own doc comment to hold. `shell` is listed first so its
+    // own grant order (Endpoint slot 0, Notification slot 1) is the same
+    // statement read top to bottom here and there.
+    let targets = [shell_cs, ui_cs];
+    match kernel_arch_glue::wire_notification(
+        hal,
+        k.root_thread,
+        &targets,
+        kernel_cap::CapabilityRights::READ | kernel_cap::CapabilityRights::WRITE,
+    ) {
+        Some(_) => {
+            kernel_arch_glue::log(format_args!(
+                "root task (x86_64): wired ui-core <-> shell real IPC edge (TERMINAL window)\r\n"
+            ));
+        }
+        None => {
+            kernel_arch_glue::log(format_args!(
+                "root task (x86_64): ui-core<->shell doorbell Notification skipped (out of resources) - the TERMINAL window will not reach the real shell\r\n"
+            ));
+        }
+    }
+}
+
+/// Wires the shared `Notification` fan-in (real-IPC plan Phase 2) across
+/// `simurgh-profile-policy` and its now-TWO real clients (`store`'s own
+/// compatibility-check edge, `ui-core`'s own new `switch_profile` edge
+/// above) — policy-engine went from one direct-`Call` client (no fan-in
+/// needed, `wire_store_to_policy_engine_x86`'s own doc comment) to two,
+/// the same upgrade `simurgh-security-broker`'s own fan-in already went
+/// through for an identical reason. Lands at slot 2 in policy-engine's
+/// own cap space (slots 0/1 already hold the two `Endpoint`s above).
+///
+/// Bit assignment (a plain caller-defined `u64` OR-mask — the kernel
+/// never interprets it, same convention every other fan-in in this
+/// project already uses): `STORE_BIT = 1`, `UI_CORE_BIT = 2`.
+#[cfg(target_arch = "x86_64")]
+fn wire_policy_engine_notification_fanin_x86(
+    hal: &hal_core::HalInterface,
+    k: &mut kernel_core::KernelState,
+    policy_engine_tid: kernel_cap::ThreadId,
+    store_tid: kernel_cap::ThreadId,
+    ui_core_tid: kernel_cap::ThreadId,
+) {
+    let Some(pe_cs) = k.tcb(policy_engine_tid).map(|t| t.cap_space) else {
+        kernel_arch_glue::log(format_args!(
+            "root task (x86_64): profile-policy notification fan-in skipped (could not resolve policy-engine's own TCB)\r\n"
+        ));
+        return;
+    };
+    let Some(store_cs) = k.tcb(store_tid).map(|t| t.cap_space) else {
+        kernel_arch_glue::log(format_args!(
+            "root task (x86_64): profile-policy notification fan-in skipped (could not resolve store's own TCB)\r\n"
+        ));
+        return;
+    };
+    let Some(ui_cs) = k.tcb(ui_core_tid).map(|t| t.cap_space) else {
+        kernel_arch_glue::log(format_args!(
+            "root task (x86_64): profile-policy notification fan-in skipped (could not resolve ui-core's own TCB)\r\n"
+        ));
+        return;
+    };
+    let targets = [pe_cs, store_cs, ui_cs];
+    match kernel_arch_glue::wire_notification(hal, k.root_thread, &targets, kernel_cap::CapabilityRights::READ | kernel_cap::CapabilityRights::WRITE) {
+        Some(_) => kernel_arch_glue::log(format_args!(
+            "root task (x86_64): wired profile-policy notification fan-in (store, ui-core)\r\n"
+        )),
+        None => kernel_arch_glue::log(format_args!(
+            "root task (x86_64): profile-policy notification fan-in skipped (out of resources)\r\n"
+        )),
+    }
+}
+
+/// Wires the `simurgh-backup-manager` <-> `simurgh-account-manager` real
+/// IPC edge (`backup_core::UserDataSource`). Takes both tids as explicit
+/// parameters — same reasoning `wire_store_to_policy_engine_x86`'s own doc
+/// comment gives for its identical shape: neither side has a `G_*_TID_X86`
+/// global, and this is the only call site that ever wires it. Single
+/// client (backup-manager), so no shared `Notification` is needed, just
+/// one `Endpoint`+page pair from `kernel_arch_glue::wire_service_endpoint`.
+/// `am_va`/`bm_client_va` must stay numerically equal to `simurgh-account-
+/// manager::session-manager::subsystem_entry::BM_SHARED_VA` (`0xD910_
+/// 0000`, the next free slot after that process's own EXISTING security-
+/// broker edge at `0xD900_0000`) and `simurgh-backup-manager::backup-
+/// core::subsystem_entry::AM_SHARED_VA` (`0xD940_0000`, backup-manager's
+/// own first shared page) respectively. Must be called BEFORE
+/// `wire_backup_manager_to_store_x86` — both grant into backup-manager's
+/// own, until-then-empty cap space, and this edge's own client-side
+/// constant (`AM_ENDPOINT_CAP` = 0) assumes it lands first.
+#[cfg(target_arch = "x86_64")]
+fn wire_backup_manager_to_account_manager_x86(
+    hal: &hal_core::HalInterface,
+    k: &mut kernel_core::KernelState,
+    account_manager_tid: kernel_cap::ThreadId,
+    backup_manager_tid: kernel_cap::ThreadId,
+) {
+    const AM_VA: usize = 0xD910_0000;
+    const BM_CLIENT_VA: usize = 0xD940_0000;
+    let Some(am_tcb) = k.tcb(account_manager_tid) else {
+        kernel_arch_glue::log(format_args!(
+            "root task (x86_64): backup-manager<->account-manager wiring skipped (could not resolve account-manager's own TCB)\r\n"
+        ));
+        return;
+    };
+    let (am_cs, am_addr_space) = (am_tcb.cap_space, am_tcb.addr_space);
+    let Some(bm_tcb) = k.tcb(backup_manager_tid) else {
+        kernel_arch_glue::log(format_args!(
+            "root task (x86_64): backup-manager<->account-manager wiring skipped (could not resolve backup-manager's own TCB)\r\n"
+        ));
+        return;
+    };
+    let (bm_cs, bm_addr_space) = (bm_tcb.cap_space, bm_tcb.addr_space);
+    let Some(am_root_pt) = k.addr_space_mut(am_addr_space).map(|a| a.root_phys().as_usize()) else {
+        kernel_arch_glue::log(format_args!(
+            "root task (x86_64): backup-manager<->account-manager wiring skipped (could not resolve account-manager's own address space)\r\n"
+        ));
+        return;
+    };
+    let Some(bm_root_pt) = k.addr_space_mut(bm_addr_space).map(|a| a.root_phys().as_usize()) else {
+        kernel_arch_glue::log(format_args!(
+            "root task (x86_64): backup-manager<->account-manager wiring skipped (could not resolve backup-manager's own address space)\r\n"
+        ));
+        return;
+    };
+    match kernel_arch_glue::wire_service_endpoint(
+        hal,
+        k.root_thread,
+        am_cs,
+        am_root_pt,
+        AM_VA,
+        bm_cs,
+        bm_root_pt,
+        BM_CLIENT_VA,
+        kernel_cap::CapabilityRights::READ | kernel_cap::CapabilityRights::WRITE,
+    ) {
+        Some(_) => {
+            kernel_arch_glue::log(format_args!(
+                "root task (x86_64): wired backup-manager <-> account-manager real IPC edge\r\n"
+            ));
+        }
+        None => {
+            kernel_arch_glue::log(format_args!(
+                "root task (x86_64): backup-manager<->account-manager wiring skipped (out of resources)\r\n"
+            ));
+        }
+    }
+}
+
+/// Wires the `Simurgh-UI-Template01::ui-core` <-> `simurgh-account-manager`
+/// real IPC edge for a real login request (`session_manager::
+/// SessionManager::login`) — same shape as `wire_backup_manager_to_
+/// account_manager_x86` (one dedicated `Endpoint`+page via `kernel_arch_
+/// glue::wire_service_endpoint`), except account-manager now serves TWO
+/// real clients (backup-manager AND ui-core) over two SEPARATE dedicated
+/// `Endpoint`s, which needs the shared-`Notification` fan-in — see
+/// `wire_account_manager_hub_notification_fanin_x86`'s own doc comment,
+/// always called right after this one. `am_va`/`ui_core_client_va` must
+/// stay numerically equal to `simurgh-account-manager::session-manager::
+/// subsystem_entry::UI_CORE_SHARED_VA` (`0xD920_0000`, the next free slot
+/// after that process's own existing backup-manager edge at
+/// `0xD910_0000`) and `Simurgh-UI-Template01::ui-core::subsystem_entry::
+/// AM_SHARED_VA` (`0xD870_0000`, comfortably past ui-core's own frame-
+/// buffer region's own end) respectively.
+#[cfg(target_arch = "x86_64")]
+fn wire_ui_core_to_account_manager_x86(
+    hal: &hal_core::HalInterface,
+    k: &mut kernel_core::KernelState,
+    account_manager_tid: kernel_cap::ThreadId,
+    ui_core_tid: kernel_cap::ThreadId,
+) {
+    const AM_VA: usize = 0xD920_0000;
+    const UI_CORE_CLIENT_VA: usize = 0xD870_0000;
+    let Some(am_tcb) = k.tcb(account_manager_tid) else {
+        kernel_arch_glue::log(format_args!(
+            "root task (x86_64): ui-core<->account-manager wiring skipped (could not resolve account-manager's own TCB)\r\n"
+        ));
+        return;
+    };
+    let (am_cs, am_addr_space) = (am_tcb.cap_space, am_tcb.addr_space);
+    let Some(ui_tcb) = k.tcb(ui_core_tid) else {
+        kernel_arch_glue::log(format_args!(
+            "root task (x86_64): ui-core<->account-manager wiring skipped (could not resolve ui-core's own TCB)\r\n"
+        ));
+        return;
+    };
+    let (ui_cs, ui_addr_space) = (ui_tcb.cap_space, ui_tcb.addr_space);
+    let Some(am_root_pt) = k.addr_space_mut(am_addr_space).map(|a| a.root_phys().as_usize()) else {
+        kernel_arch_glue::log(format_args!(
+            "root task (x86_64): ui-core<->account-manager wiring skipped (could not resolve account-manager's own address space)\r\n"
+        ));
+        return;
+    };
+    let Some(ui_root_pt) = k.addr_space_mut(ui_addr_space).map(|a| a.root_phys().as_usize()) else {
+        kernel_arch_glue::log(format_args!(
+            "root task (x86_64): ui-core<->account-manager wiring skipped (could not resolve ui-core's own address space)\r\n"
+        ));
+        return;
+    };
+    match kernel_arch_glue::wire_service_endpoint(
+        hal,
+        k.root_thread,
+        am_cs,
+        am_root_pt,
+        AM_VA,
+        ui_cs,
+        ui_root_pt,
+        UI_CORE_CLIENT_VA,
+        kernel_cap::CapabilityRights::READ | kernel_cap::CapabilityRights::WRITE,
+    ) {
+        Some(_) => {
+            kernel_arch_glue::log(format_args!(
+                "root task (x86_64): wired ui-core <-> account-manager real IPC edge (login)\r\n"
+            ));
+        }
+        None => {
+            kernel_arch_glue::log(format_args!(
+                "root task (x86_64): ui-core<->account-manager wiring skipped (out of resources)\r\n"
+            ));
+        }
+    }
+}
+
+/// Wires `ui-core`'s own new file-browser edge into `file-manager`'s own
+/// new receiving `Endpoint` (`simurgh-file-manager::fm_core::
+/// subsystem_entry::BROWSE_ENDPOINT_CAP`, slot 1 — `fm-core`'s own
+/// FIRST server role; every earlier edge had `fm-core` as a client
+/// only). Same shape as `wire_ui_core_to_account_manager_x86` just
+/// above (a single `wire_service_endpoint` call, no `Notification`
+/// fan-in needed — `file-manager` has exactly one real caller into this
+/// new `Endpoint` today, `ui-core`), and the same "wire after both
+/// spawn" ordering `spawn_file_manager_x86`/`spawn_ui_core_x86`'s own
+/// call sites already establish.
+#[cfg(target_arch = "x86_64")]
+fn wire_ui_core_to_file_manager_x86(
+    hal: &hal_core::HalInterface,
+    k: &mut kernel_core::KernelState,
+    file_manager_tid: kernel_cap::ThreadId,
+    ui_core_tid: kernel_cap::ThreadId,
+) {
+    // Confirmed match to `simurgh-file-manager::fm_core::subsystem_
+    // entry::BROWSE_VA`.
+    const FM_VA: usize = 0xD820_0000;
+    // Next free slot in `ui-core`'s own VA space, after `UI_CORE_CLIENT_
+    // VA` (`0xD870_0000`, the account-manager login edge above).
+    const UI_CORE_FM_CLIENT_VA: usize = 0xD880_0000;
+    let Some(fm_tcb) = k.tcb(file_manager_tid) else {
+        kernel_arch_glue::log(format_args!(
+            "root task (x86_64): ui-core<->file-manager wiring skipped (could not resolve file-manager's own TCB)\r\n"
+        ));
+        return;
+    };
+    let (fm_cs, fm_addr_space) = (fm_tcb.cap_space, fm_tcb.addr_space);
+    let Some(ui_tcb) = k.tcb(ui_core_tid) else {
+        kernel_arch_glue::log(format_args!(
+            "root task (x86_64): ui-core<->file-manager wiring skipped (could not resolve ui-core's own TCB)\r\n"
+        ));
+        return;
+    };
+    let (ui_cs, ui_addr_space) = (ui_tcb.cap_space, ui_tcb.addr_space);
+    let Some(fm_root_pt) = k.addr_space_mut(fm_addr_space).map(|a| a.root_phys().as_usize()) else {
+        kernel_arch_glue::log(format_args!(
+            "root task (x86_64): ui-core<->file-manager wiring skipped (could not resolve file-manager's own address space)\r\n"
+        ));
+        return;
+    };
+    let Some(ui_root_pt) = k.addr_space_mut(ui_addr_space).map(|a| a.root_phys().as_usize()) else {
+        kernel_arch_glue::log(format_args!(
+            "root task (x86_64): ui-core<->file-manager wiring skipped (could not resolve ui-core's own address space)\r\n"
+        ));
+        return;
+    };
+    match kernel_arch_glue::wire_service_endpoint(
+        hal,
+        k.root_thread,
+        fm_cs,
+        fm_root_pt,
+        FM_VA,
+        ui_cs,
+        ui_root_pt,
+        UI_CORE_FM_CLIENT_VA,
+        kernel_cap::CapabilityRights::READ | kernel_cap::CapabilityRights::WRITE,
+    ) {
+        Some(_) => {
+            kernel_arch_glue::log(format_args!(
+                "root task (x86_64): wired ui-core <-> file-manager real IPC edge (browse)\r\n"
+            ));
+        }
+        None => {
+            kernel_arch_glue::log(format_args!(
+                "root task (x86_64): ui-core<->file-manager wiring skipped (out of resources)\r\n"
+            ));
+        }
+    }
+}
+
+/// Wires log-collector-native's real `Endpoint` into diagnostics-
+/// manager's own capability space, plus one shared message+bulk page
+/// into both — `simurgh-diagnostics::diagnostics-manager::subsystem_
+/// entry`'s own already-fixed client constants (`LC_ENDPOINT_CAP = 0`,
+/// `LC_SHARED_VA = 0xD940_0000`) chose these values before this server
+/// existed; `log-collector-native::subsystem_entry`'s own `SHARED_VA`
+/// confirms the same VA on the server's own side (this function's own
+/// `server_va` argument below).
+///
+/// **x86_64-only for this first pass** — same conservative convention
+/// `wire_ui_core_to_file_manager_x86`/`wire_file_manager_to_fs_native`
+/// established for every OTHER brand-new real IPC edge in this project:
+/// prove one architecture end-to-end via real QEMU verification before
+/// wiring the other two (`simurgh-init`'s own VFS read client is the
+/// most recent precedent for this exact reasoning).
+///
+/// Only ONE real client is wired (`wire_service_endpoint`'s own doc
+/// comment: "Not yet multi-client-safe"): diagnostics-manager exercises
+/// BOTH of log-collector-native's real opcodes itself (`ReportEvent`
+/// then `NextEvent`, a real push-then-pull round trip — see that repo's
+/// own README for why this is the deliberately narrower v1 scope, not a
+/// live device-manager crash feed).
+#[cfg(target_arch = "x86_64")]
+fn wire_log_collector_to_diagnostics_manager_x86(
+    hal: &hal_core::HalInterface,
+    k: &mut kernel_core::KernelState,
+    log_collector_tid: kernel_cap::ThreadId,
+    diagnostics_manager_tid: kernel_cap::ThreadId,
+) {
+    const LOG_COLLECTOR_SHARED_VA: usize = 0xD940_0000;
+    let Some(lc_tcb) = k.tcb(log_collector_tid) else {
+        kernel_arch_glue::log(format_args!(
+            "root task (x86_64): log-collector<->diagnostics-manager wiring skipped (could not resolve log-collector's own TCB)\r\n"
+        ));
+        return;
+    };
+    let (lc_cs, lc_addr_space) = (lc_tcb.cap_space, lc_tcb.addr_space);
+    let Some(dg_tcb) = k.tcb(diagnostics_manager_tid) else {
+        kernel_arch_glue::log(format_args!(
+            "root task (x86_64): log-collector<->diagnostics-manager wiring skipped (could not resolve diagnostics-manager's own TCB)\r\n"
+        ));
+        return;
+    };
+    let (dg_cs, dg_addr_space) = (dg_tcb.cap_space, dg_tcb.addr_space);
+    let Some(lc_root_pt) = k.addr_space_mut(lc_addr_space).map(|a| a.root_phys().as_usize()) else {
+        kernel_arch_glue::log(format_args!(
+            "root task (x86_64): log-collector<->diagnostics-manager wiring skipped (could not resolve log-collector's own address space)\r\n"
+        ));
+        return;
+    };
+    let Some(dg_root_pt) = k.addr_space_mut(dg_addr_space).map(|a| a.root_phys().as_usize()) else {
+        kernel_arch_glue::log(format_args!(
+            "root task (x86_64): log-collector<->diagnostics-manager wiring skipped (could not resolve diagnostics-manager's own address space)\r\n"
+        ));
+        return;
+    };
+    match kernel_arch_glue::wire_service_endpoint(
+        hal,
+        k.root_thread,
+        lc_cs,
+        lc_root_pt,
+        LOG_COLLECTOR_SHARED_VA,
+        dg_cs,
+        dg_root_pt,
+        LOG_COLLECTOR_SHARED_VA,
+        kernel_cap::CapabilityRights::READ | kernel_cap::CapabilityRights::WRITE,
+    ) {
+        Some(_) => {
+            kernel_arch_glue::log(format_args!(
+                "root task (x86_64): wired log-collector-native <-> diagnostics-manager real IPC edge\r\n"
+            ));
+        }
+        None => {
+            kernel_arch_glue::log(format_args!(
+                "root task (x86_64): log-collector<->diagnostics-manager wiring skipped (out of resources)\r\n"
+            ));
+        }
+    }
+}
+
+/// Wires the shared `Notification` fan-in for account-manager's own hub
+/// role: it now serves TWO real clients (`simurgh-backup-manager`'s
+/// existing data-query edge, `Simurgh-UI-Template01::ui-core`'s new login
+/// edge) over two SEPARATE dedicated `Endpoint`s — same "`Recv` only
+/// waits on one `Endpoint` at a time" reasoning `wire_security_broker_
+/// notification_fanin_x86`'s own doc comment gives for security-broker's
+/// own, separate fan-in (a DIFFERENT `Notification` object — this one has
+/// account-manager as the HUB, not a client). Bit assignment (a plain
+/// caller-defined `u64` OR-mask, never interpreted by the kernel):
+/// `HUB_BM_BIT = 1`, `HUB_UI_CORE_BIT = 2`. Called once, right after
+/// `wire_ui_core_to_account_manager_x86` (the LAST of account-manager's
+/// own two real clients to be wired) — grants a Notification into all
+/// three of account-manager's/backup-manager's/ui-core's own cap spaces.
+#[cfg(target_arch = "x86_64")]
+fn wire_account_manager_hub_notification_fanin_x86(
+    hal: &hal_core::HalInterface,
+    k: &mut kernel_core::KernelState,
+    account_manager_tid: kernel_cap::ThreadId,
+    backup_manager_tid: kernel_cap::ThreadId,
+    ui_core_tid: kernel_cap::ThreadId,
+) {
+    let Some(am_cs) = k.tcb(account_manager_tid).map(|t| t.cap_space) else {
+        kernel_arch_glue::log(format_args!(
+            "root task (x86_64): account-manager hub notification fan-in skipped (could not resolve account-manager's own TCB)\r\n"
+        ));
+        return;
+    };
+    let Some(bm_cs) = k.tcb(backup_manager_tid).map(|t| t.cap_space) else {
+        kernel_arch_glue::log(format_args!(
+            "root task (x86_64): account-manager hub notification fan-in skipped (could not resolve backup-manager's own TCB)\r\n"
+        ));
+        return;
+    };
+    let Some(ui_cs) = k.tcb(ui_core_tid).map(|t| t.cap_space) else {
+        kernel_arch_glue::log(format_args!(
+            "root task (x86_64): account-manager hub notification fan-in skipped (could not resolve ui-core's own TCB)\r\n"
+        ));
+        return;
+    };
+    let targets = [am_cs, bm_cs, ui_cs];
+    match kernel_arch_glue::wire_notification(hal, k.root_thread, &targets, kernel_cap::CapabilityRights::READ | kernel_cap::CapabilityRights::WRITE) {
+        Some(_) => kernel_arch_glue::log(format_args!(
+            "root task (x86_64): wired account-manager hub notification fan-in (backup-manager, ui-core)\r\n"
+        )),
+        None => kernel_arch_glue::log(format_args!(
+            "root task (x86_64): account-manager hub notification fan-in skipped (out of resources)\r\n"
+        )),
+    }
+}
+
+/// Wires the `simurgh-backup-manager` <-> `simurgh-store` real IPC edge
+/// (`backup_core::AppInstaller` — reinstall on restore). Same shape as
+/// `wire_backup_manager_to_account_manager_x86` — see that function's own
+/// doc comment. `store_va`/`bm_client_va` must stay numerically equal to
+/// `simurgh-store::manifest-installer::subsystem_entry::BM_SHARED_VA`
+/// (`0xD940_0000`, the next free slot in store's own address space after
+/// its EXISTING profile-policy edge at `0xD930_0000`) and `simurgh-
+/// backup-manager::backup-core::subsystem_entry::STORE_SHARED_VA`
+/// (`0xD950_0000`, backup-manager's own SECOND shared page) respectively.
+/// Must be called AFTER `wire_backup_manager_to_account_manager_x86` —
+/// this edge's own client-side constant (`STORE_ENDPOINT_CAP` = 1) assumes
+/// the account-manager edge already occupies slot 0 in backup-manager's
+/// own cap space.
+#[cfg(target_arch = "x86_64")]
+fn wire_backup_manager_to_store_x86(
+    hal: &hal_core::HalInterface,
+    k: &mut kernel_core::KernelState,
+    store_tid: kernel_cap::ThreadId,
+    backup_manager_tid: kernel_cap::ThreadId,
+) {
+    const STORE_VA: usize = 0xD940_0000;
+    const BM_CLIENT_VA: usize = 0xD950_0000;
+    let Some(store_tcb) = k.tcb(store_tid) else {
+        kernel_arch_glue::log(format_args!(
+            "root task (x86_64): backup-manager<->store wiring skipped (could not resolve store's own TCB)\r\n"
+        ));
+        return;
+    };
+    let (store_cs, store_addr_space) = (store_tcb.cap_space, store_tcb.addr_space);
+    let Some(bm_tcb) = k.tcb(backup_manager_tid) else {
+        kernel_arch_glue::log(format_args!(
+            "root task (x86_64): backup-manager<->store wiring skipped (could not resolve backup-manager's own TCB)\r\n"
+        ));
+        return;
+    };
+    let (bm_cs, bm_addr_space) = (bm_tcb.cap_space, bm_tcb.addr_space);
+    let Some(store_root_pt) = k.addr_space_mut(store_addr_space).map(|a| a.root_phys().as_usize()) else {
+        kernel_arch_glue::log(format_args!(
+            "root task (x86_64): backup-manager<->store wiring skipped (could not resolve store's own address space)\r\n"
+        ));
+        return;
+    };
+    let Some(bm_root_pt) = k.addr_space_mut(bm_addr_space).map(|a| a.root_phys().as_usize()) else {
+        kernel_arch_glue::log(format_args!(
+            "root task (x86_64): backup-manager<->store wiring skipped (could not resolve backup-manager's own address space)\r\n"
+        ));
+        return;
+    };
+    match kernel_arch_glue::wire_service_endpoint(
+        hal,
+        k.root_thread,
+        store_cs,
+        store_root_pt,
+        STORE_VA,
+        bm_cs,
+        bm_root_pt,
+        BM_CLIENT_VA,
+        kernel_cap::CapabilityRights::READ | kernel_cap::CapabilityRights::WRITE,
+    ) {
+        Some(_) => {
+            kernel_arch_glue::log(format_args!(
+                "root task (x86_64): wired backup-manager <-> store real IPC edge\r\n"
+            ));
+        }
+        None => {
+            kernel_arch_glue::log(format_args!(
+                "root task (x86_64): backup-manager<->store wiring skipped (out of resources)\r\n"
+            ));
+        }
+    }
+}
+
+/// Implements `sys::SPAWN_KNOWN_ELF` — see that opcode's own doc comment
+/// for the full design (v1 scope, allow-list, and what it deliberately
+/// defers). Reuses the SAME already-embedded ELF byte arrays and the SAME
+/// `kernel_arch_glue::spawn_process_from_elf` helper every boot-time spawn
+/// in this file already calls — this is not a new ELF-loading
+/// implementation, only a new, syscall-reachable caller of the existing
+/// one. `elf_id` values match `simurgh-init::init-core::wire::KnownElfId`'s
+/// own numeric layout exactly. A single fixed stack VMA/length is reused
+/// across every target: each spawn gets a brand-new, empty address space,
+/// so nothing else in that space could ever collide with it.
+///
+/// `elf_id` 16 (`simurgh-shell`) is deliberately NOT in this match, even
+/// though `SHELL_ELF` is embedded and `simurgh-shell` may itself now call
+/// this syscall (`sys::SPAWN_KNOWN_ELF`'s own doc comment): an on-demand
+/// second `shell-bin` instance spawned this way would have a completely
+/// empty capability space, same as every other on-demand spawn — but
+/// UNLIKE every other target here, `shell-bin`'s own `run_forever` calls
+/// `sys::SERIAL_PRINT` unconditionally right after `self_check` returns,
+/// which reads `SHELL_OUT_VA` as a FIXED, directly-dereferenced address
+/// with no capability check at all (that opcode's own doc comment) —
+/// only `spawn_shell_x86`'s own ONE boot-time call to `kernel_arch_glue::
+/// wire_debug_print_page` ever maps that page. A second, on-demand
+/// instance would hit an unmapped page on its very first print and fault.
+/// Denying `elf_id` 16 here (falling through to `_ => return None`, the
+/// same clean failure every other denied id already gets) avoids that
+/// real crash risk; `simurgh-shell`'s own `KNOWN_TARGETS` does not offer
+/// `"shell"` as a `spawn` target for the identical reason.
+#[cfg(target_arch = "x86_64")]
+fn spawn_known_elf_x86(hal: &hal_core::HalInterface, elf_id: u32) -> Option<kernel_cap::ThreadId> {
+    const SPAWN_STACK_VMA: usize = 0xC042_0000;
+    const SPAWN_STACK_LEN: usize = 4096 * 16;
+    let (elf_bytes, label): (&[u8], &str) = match elf_id {
+        7 => (SECURITY_BROKER_ELF, "security-broker"),
+        9 => (INIT_ELF, "init"),
+        10 => (ACCOUNT_MANAGER_ELF, "account-manager"),
+        11 => (BACKUP_MANAGER_ELF, "backup-manager"),
+        12 => (DIAGNOSTICS_MANAGER_ELF, "diagnostics-manager"),
+        13 => (STORE_ELF, "store"),
+        14 => (NATIVE_LOADER_ELF, "native-loader"),
+        15 => (POLICY_ENGINE_ELF, "policy-engine"),
+        _ => return None,
+    };
+    let k = kernel_arch_glue::kstate();
+    let (tid, _cap_space, _stack_phys) = kernel_arch_glue::spawn_process_from_elf(
+        hal,
+        k,
+        elf_bytes,
+        elf_loader::machine::EM_X86_64,
+        SPAWN_STACK_VMA,
+        SPAWN_STACK_LEN,
+    )?;
+    kernel_arch_glue::log(format_args!(
+        "root task (x86_64): SPAWN_KNOWN_ELF spawned a real, on-demand `{label}` process (tid {})\r\n",
+        tid.as_u32()
+    ));
+    Some(tid)
+}
+
+/// Spawns `shell-bin` (`simurgh-shell`, a separate git repo, no `MD/
+/// REPO-Simurgh-OS/` charter — Omid's own 2026-09-10 direction) and, on
+/// success, wires its own dedicated debug-print page
+/// (`kernel_arch_glue::wire_debug_print_page`, [`SHELL_OUT_VA`]'s own
+/// doc comment) — unlike every other spawn function in this file, this
+/// one HAS to wire something right after spawning, since `shell-bin`'s
+/// own `run_forever` calls `sys::SERIAL_PRINT` unconditionally the
+/// moment `self_check` returns (no live peer/round-trip to wait for the
+/// way every real-IPC edge's own two-sided wiring does).
+#[cfg(target_arch = "x86_64")]
+fn spawn_shell_x86(hal: &hal_core::HalInterface) -> Option<kernel_cap::ThreadId> {
+    const SHELL_STACK_VMA: usize = 0xC058_0000;
+    const SHELL_STACK_LEN: usize = 4096 * 16;
+    let k = kernel_arch_glue::kstate();
+    let (tid, _cap_space, _stack_phys) = kernel_arch_glue::spawn_process_from_elf(
+        hal,
+        k,
+        SHELL_ELF,
+        elf_loader::machine::EM_X86_64,
+        SHELL_STACK_VMA,
+        SHELL_STACK_LEN,
+    )?;
+    let Some(addr_space) = k.tcb(tid).map(|t| t.addr_space) else {
+        kernel_arch_glue::log(format_args!(
+            "root task (x86_64): shell debug-print page wiring skipped (could not resolve shell's own TCB)\r\n"
+        ));
+        return None;
+    };
+    let Some(root_pt) = k.addr_space_mut(addr_space).map(|a| a.root_phys().as_usize()) else {
+        kernel_arch_glue::log(format_args!(
+            "root task (x86_64): shell debug-print page wiring skipped (could not resolve shell's own address space)\r\n"
+        ));
+        return None;
+    };
+    if kernel_arch_glue::wire_shared_pages(hal, root_pt, SHELL_OUT_VA, 4096).is_none() {
+        kernel_arch_glue::log(format_args!(
+            "root task (x86_64): shell debug-print page wiring failed (out of resources) - shell's own SERIAL_PRINT calls will fault\r\n"
+        ));
+        return None;
+    }
+    kernel_arch_glue::log(format_args!(
+        "root task (x86_64): spawned shell (tid {}) from its OWN separately-built ELF image (simurgh-shell repo)\r\n",
+        tid.as_u32()
+    ));
+    Some(tid)
+}
+
+/// x86_64 counterpart of `spawn_policy_engine` (riscv64) — see that
+/// function's own doc comment for the full rationale. Same shape as
+/// `spawn_native_loader_x86`.
+#[cfg(target_arch = "x86_64")]
+fn spawn_policy_engine_x86(hal: &hal_core::HalInterface) -> Option<kernel_cap::ThreadId> {
+    let k = kernel_arch_glue::kstate();
+
+    const POLICY_ENGINE_STACK_VMA: usize = 0xC048_0000;
+    const POLICY_ENGINE_STACK_LEN: usize = 4096 * 16;
+    match kernel_arch_glue::spawn_process_from_elf(
+        hal,
+        k,
+        POLICY_ENGINE_ELF,
+        elf_loader::machine::EM_X86_64,
+        POLICY_ENGINE_STACK_VMA,
+        POLICY_ENGINE_STACK_LEN,
+    ) {
+        Some((tid, _cap_space, _stack_phys)) => {
+            kernel_arch_glue::log(format_args!(
+                "root task (x86_64): spawned policy-engine (tid {}) from its OWN separately-built ELF image (simurgh-profile-policy repo)\r\n",
+                tid.as_u32()
+            ));
+            Some(tid)
+        }
+        None => {
+            kernel_arch_glue::log(format_args!(
+                "root task (x86_64): policy-engine spawn skipped (out of resources)\r\n"
+            ));
+            None
+        }
+    }
+}
+
+/// Spawns `umode_faulty_driver_x86` (see its doc comment) via the SAME
+/// generic `kernel_arch_glue::spawn_process` path as device-manager.
+/// Mirrors riscv64's own `spawn_faulty_driver` exactly.
+#[cfg(target_arch = "x86_64")]
+fn spawn_faulty_driver_x86(hal: &hal_core::HalInterface) -> Option<kernel_cap::ThreadId> {
+    let k = kernel_arch_glue::kstate();
+    let user = user_image();
+    const FAULTY_STACK_VMA: usize = 0xC050_0000;
+    const FAULTY_STACK_LEN: usize = 4096 * 4;
+    match kernel_arch_glue::spawn_process(
+        hal,
+        k,
+        user.text_vma,
+        user.text_lma,
+        user.text_len,
+        FAULTY_STACK_VMA,
+        FAULTY_STACK_LEN,
+        umode_faulty_driver_x86 as usize,
+    ) {
+        Some((tid, _cap_space, _stack_phys)) => {
+            kernel_arch_glue::p2_watch_driver(tid);
+            kernel_arch_glue::log(format_args!(
+                "root task (x86_64): spawned faulty-driver (tid {}) - it will fault on its first instruction (fault-isolation demo, 03 5.2)\r\n",
+                tid.as_u32()
+            ));
+            Some(tid)
+        }
+        None => {
+            kernel_arch_glue::log(format_args!(
+                "root task (x86_64): faulty-driver spawn skipped (out of resources)\r\n"
+            ));
+            None
+        }
+    }
+}
+
+/// # Safety
+/// `svc #0` from EL0 traps to the shared EL0-synchronous vector
+/// (`hal_arm64::cpu`'s `sync_el0_entry`), which preserves every register
+/// except `x0` (the return value) — this project's own convention (see
+/// `hal_arm64::cpu::SyscallHandler`'s doc comment): `x8` = opcode,
+/// `x0`/`x1` = a0/a1.
+///
+/// `#[inline(never)]` (+ mandatory `#[link_section = ".user_text"]`):
+/// see riscv64's own `raw_syscall`'s extensive doc comment for the
+/// real, QEMU-found miscompilation this avoids (not independently
+/// exercised/observed broken on aarch64, but gets the identical
+/// preventive fix for consistency).
+#[cfg(target_arch = "aarch64")]
+#[inline(never)]
+#[link_section = ".user_text"]
+unsafe fn raw_syscall_aarch64(opcode: usize, a0: usize, a1: usize) -> usize {
+    let ret: usize;
+    // SAFETY: forwarded from this function's own contract.
+    unsafe {
+        core::arch::asm!(
+            "svc #0",
+            in("x8") opcode,
+            inlateout("x0") a0 => ret,
+            in("x1") a1,
+        );
+    }
+    ret
+}
+
+/// Like `raw_syscall_aarch64`, but also reads back `x1` — for
+/// `IPC_RECV`, the ONE opcode whose result genuinely does not fit in a
+/// single register (see `hal_arm64::cpu::TrapOutcome::Resume2`'s own
+/// doc comment). Mirrors riscv64's `raw_syscall2`/x86_64's
+/// `raw_syscall2_x86` exactly, just with `x1` (this project's own `a1`
+/// register on aarch64) in place of `a1`.
+///
+/// # Safety
+/// Same contract as `raw_syscall_aarch64` — `svc #0` preserves every
+/// register except `x0`/`x1` for this opcode specifically.
+///
+/// `#[inline(never)]` — see `raw_syscall_aarch64`'s own doc comment.
+#[cfg(target_arch = "aarch64")]
+#[inline(never)]
+#[link_section = ".user_text"]
+unsafe fn raw_syscall2_aarch64(opcode: usize, a0: usize, a1: usize) -> (usize, usize) {
+    let (r0, r1): (usize, usize);
+    // SAFETY: forwarded from this function's own contract.
+    unsafe {
+        core::arch::asm!(
+            "svc #0",
+            in("x8") opcode,
+            inlateout("x0") a0 => r0,
+            inlateout("x1") a1 => r1,
+        );
+    }
+    (r0, r1)
+}
+
+/// The real Call/Recv/Reply demo's endpoint capability slot, set once by
+/// `IPC_DEMO_START`'s handler and read by `IPC_ENDPOINT_CAP` — both the
+/// client (`umode_root_aarch64`) and the server
+/// (`umode_ipc_server_aarch64`) call the latter to learn it
+/// independently. Mirrors riscv64's `G_IPC_EP`/x86_64's `G_IPC_EP_X86`
+/// exactly.
+#[cfg(target_arch = "aarch64")]
+static mut G_IPC_EP_AARCH64: u32 = 0;
+
+/// fs-native's endpoint capability slot in the caller's (root's) own
+/// capability space — mirrors riscv64's own `G_FS_EP`/x86_64's
+/// `G_FS_EP_X86` exactly (see `G_FS_EP`'s own doc comment).
+#[cfg(target_arch = "aarch64")]
+static mut G_FS_EP_AARCH64: u32 = 0;
+
+/// See the riscv64 `G_COMPOSITOR_EP`'s own doc comment.
+#[cfg(target_arch = "aarch64")]
+static mut G_COMPOSITOR_EP_AARCH64: u32 = 0;
+
+/// See the riscv64 `G_MM_EP`'s own doc comment.
+#[cfg(target_arch = "aarch64")]
+static mut G_MM_EP_AARCH64: u32 = 0;
+
+/// The virtio-blk driver's endpoint capability slot in the caller's
+/// (root's) own capability space — mirrors riscv64's own `G_DRV_EP`
+/// exactly (see that static's own doc comment).
+#[cfg(target_arch = "aarch64")]
+static mut G_DRV_EP_AARCH64: u32 = 0;
+
+/// See the riscv64 `G_SBI_EP`'s own doc comment.
+#[cfg(target_arch = "aarch64")]
+static mut G_SBI_EP_AARCH64: u32 = 0;
+
+/// The virtio-net driver's endpoint capability slot in the caller's
+/// (root's) own capability space — written once by `DRV_NET_DEMO_START`,
+/// read once by `NET_DEMO_START` (x86_64's own `sys::DRV_NET_DEMO_START`
+/// doc comment on why a kernel-side cache, not this switching syscall's
+/// own "return value", is what carries it across).
+#[cfg(target_arch = "aarch64")]
+static mut G_DRV_NET_EP_AARCH64: u32 = 0;
+
+/// aarch64 counterpart of `net_demo_riscv64` — same sequence, same
+/// `usize::MAX`-means-"no Network-kind peripheral" convention, just
+/// `raw_syscall_aarch64` instead of `raw_syscall`. See `net_demo_
+/// riscv64`'s own doc comment for the full rationale.
+#[cfg(target_arch = "aarch64")]
+#[inline(never)]
+#[link_section = ".user_text"]
+fn net_demo_aarch64() {
+    // SAFETY: same contract as every other `raw_syscall_aarch64` call
+    // site in this file's own `.user_text` code.
+    unsafe {
+        macro_rules! zero {
+            () => {{
+                let mut v: usize = 0;
+                core::arch::asm!("/* {0} */", inout(reg) v, options(nomem, nostack, preserves_flags));
+                v
+            }};
+        }
+        let drv_ep = raw_syscall_aarch64(sys::DRV_NET_DEMO_START, zero!(), zero!());
+        raw_syscall_aarch64(sys::REPORT, drv_ep, zero!());
+        if drv_ep != usize::MAX {
+            let started = raw_syscall_aarch64(sys::NET_DEMO_START, drv_ep, zero!());
+            raw_syscall_aarch64(sys::REPORT, started, zero!());
+            if started != usize::MAX {
+                const MAX_STATUS_POLL_ATTEMPTS: usize = 5_000;
+                let mut verdict = 0usize;
+                for _ in 0..MAX_STATUS_POLL_ATTEMPTS {
+                    verdict = raw_syscall_aarch64(sys::NET_STATUS_POLL, zero!(), zero!());
+                    if verdict != 0 {
+                        break;
+                    }
+                }
+                raw_syscall_aarch64(sys::REPORT, verdict, zero!());
+            }
+        }
+    }
+}
+
+/// See the riscv64 `compositor_demo_riscv64`'s own doc comment.
+#[cfg(target_arch = "aarch64")]
+#[inline(never)]
+#[link_section = ".user_text"]
+fn compositor_demo_aarch64() {
+    // SAFETY: same contract as every other `raw_syscall_aarch64` call
+    // site in this file's own `.user_text` code.
+    unsafe {
+        macro_rules! zero {
+            () => {{
+                let mut v: usize = 0;
+                core::arch::asm!("/* {0} */", inout(reg) v, options(nomem, nostack, preserves_flags));
+                v
+            }};
+        }
+        let ep = raw_syscall_aarch64(sys::COMPOSITOR_DEMO_START, zero!(), zero!());
+        raw_syscall_aarch64(sys::REPORT, ep, zero!());
+        if ep != usize::MAX {
+            raw_syscall_aarch64(sys::COMPOSITOR_CREATE_SURFACE, zero!(), zero!());
+            let surface = raw_syscall_aarch64(sys::COMPOSITOR_CREATE_SURFACE_RESULT, zero!(), zero!());
+            raw_syscall_aarch64(sys::REPORT, surface, zero!());
+            if surface != usize::MAX {
+                raw_syscall_aarch64(sys::COMPOSITOR_COMMIT_BUFFER, surface, zero!());
+                let committed = raw_syscall_aarch64(sys::COMPOSITOR_COMMIT_VERIFY, zero!(), zero!());
+                raw_syscall_aarch64(sys::REPORT, committed, zero!());
+                raw_syscall_aarch64(sys::COMPOSITOR_DESTROY_SURFACE, surface, zero!());
+                let destroyed = raw_syscall_aarch64(sys::COMPOSITOR_DESTROY_RESULT, zero!(), zero!());
+                raw_syscall_aarch64(sys::REPORT, destroyed, zero!());
+            }
+        }
+    }
+}
+
+/// See the riscv64 `mm_demo_riscv64`'s own doc comment.
+#[cfg(target_arch = "aarch64")]
+#[inline(never)]
+#[link_section = ".user_text"]
+fn mm_demo_aarch64() {
+    // SAFETY: same contract as every other `raw_syscall_aarch64` call
+    // site in this file's own `.user_text` code.
+    unsafe {
+        macro_rules! zero {
+            () => {{
+                let mut v: usize = 0;
+                core::arch::asm!("/* {0} */", inout(reg) v, options(nomem, nostack, preserves_flags));
+                v
+            }};
+        }
+        let ep = raw_syscall_aarch64(sys::MM_DEMO_START, zero!(), zero!());
+        raw_syscall_aarch64(sys::REPORT, ep, zero!());
+        if ep != usize::MAX {
+            raw_syscall_aarch64(sys::MM_REGISTER, zero!(), zero!()); // MM_DEMO_PROCS[0]: thread 100, Normal
+            let reg0 = raw_syscall_aarch64(sys::MM_REGISTER_RESULT, zero!(), zero!());
+            raw_syscall_aarch64(sys::REPORT, reg0, zero!());
+            raw_syscall_aarch64(sys::MM_REGISTER, 1, zero!()); // MM_DEMO_PROCS[1]: thread 200, Sacrificial
+            let reg1 = raw_syscall_aarch64(sys::MM_REGISTER_RESULT, zero!(), zero!());
+            raw_syscall_aarch64(sys::REPORT, reg1, zero!());
+            raw_syscall_aarch64(sys::MM_QUERY_TOTAL_RESIDENT, zero!(), zero!());
+            let total = raw_syscall_aarch64(sys::MM_QUERY_TOTAL_RESIDENT_RESULT, zero!(), zero!());
+            raw_syscall_aarch64(sys::REPORT, total, zero!());
+            raw_syscall_aarch64(sys::MM_QUERY_VICTIM, zero!(), zero!());
+            let victim = raw_syscall_aarch64(sys::MM_QUERY_VICTIM_RESULT, zero!(), zero!());
+            raw_syscall_aarch64(sys::REPORT, victim, zero!());
+            // The REAL §8.3 IPC fast-path benchmark - see the riscv64
+            // `mm_bench_riscv64`'s own doc comment for why this runs
+            // BEFORE unregistering below.
+            mm_bench_aarch64();
+            raw_syscall_aarch64(sys::MM_UNREGISTER, 100, zero!());
+            let unreg0 = raw_syscall_aarch64(sys::MM_UNREGISTER_RESULT, zero!(), zero!());
+            raw_syscall_aarch64(sys::REPORT, unreg0, zero!());
+            raw_syscall_aarch64(sys::MM_UNREGISTER, 200, zero!());
+            let unreg1 = raw_syscall_aarch64(sys::MM_UNREGISTER_RESULT, zero!(), zero!());
+            raw_syscall_aarch64(sys::REPORT, unreg1, zero!());
+        }
+    }
+}
+
+/// See the riscv64 `mm_bench_riscv64`'s own doc comment.
+#[cfg(target_arch = "aarch64")]
+#[inline(never)]
+#[link_section = ".user_text"]
+fn mm_bench_aarch64() {
+    // SAFETY: same contract as every other `raw_syscall_aarch64` call
+    // site in this file's own `.user_text` code.
+    unsafe {
+        macro_rules! zero {
+            () => {{
+                let mut v: usize = 0;
+                core::arch::asm!("/* {0} */", inout(reg) v, options(nomem, nostack, preserves_flags));
+                v
+            }};
+        }
+        const ITERS: usize = 200;
+        let (mut min_ns, mut max_ns, mut sum_ns) = (usize::MAX, 0usize, 0usize);
+        for _ in 0..ITERS {
+            let t0 = raw_syscall_aarch64(sys::NOW_NS, zero!(), zero!());
+            raw_syscall_aarch64(sys::MM_QUERY_TOTAL_RESIDENT, zero!(), zero!());
+            raw_syscall_aarch64(sys::MM_QUERY_TOTAL_RESIDENT_RESULT_QUIET, zero!(), zero!());
+            let t1 = raw_syscall_aarch64(sys::NOW_NS, zero!(), zero!());
+            let dt = t1.saturating_sub(t0);
+            if dt < min_ns {
+                min_ns = dt;
+            }
+            if dt > max_ns {
+                max_ns = dt;
+            }
+            sum_ns += dt;
+        }
+        raw_syscall_aarch64(sys::REPORT, min_ns, zero!());
+        raw_syscall_aarch64(sys::REPORT, sum_ns / ITERS, zero!());
+        raw_syscall_aarch64(sys::REPORT, max_ns, zero!());
+    }
+}
+
+/// See the riscv64 `net_bypass_demo_riscv64`'s own doc comment.
+#[cfg(target_arch = "aarch64")]
+#[inline(never)]
+#[link_section = ".user_text"]
+fn net_bypass_demo_aarch64() {
+    // SAFETY: same contract as every other `raw_syscall_aarch64` call
+    // site in this file's own `.user_text` code.
+    unsafe {
+        macro_rules! zero {
+            () => {{
+                let mut v: usize = 0;
+                core::arch::asm!("/* {0} */", inout(reg) v, options(nomem, nostack, preserves_flags));
+                v
+            }};
+        }
+        raw_syscall_aarch64(sys::NET_BYPASS_REQUEST, zero!(), zero!());
+        let granted = raw_syscall_aarch64(sys::NET_BYPASS_REQUEST_RESULT, zero!(), zero!());
+        raw_syscall_aarch64(sys::REPORT, granted, zero!());
+        if granted != 0 {
+            // §5.4.1's own latency comparison - see the riscv64
+            // `net_bypass_demo_riscv64`'s own doc comment (standard path
+            // FIRST, bypass SECOND - deliberate order, not incidental).
+            const SAMPLES: usize = 10;
+
+            let (mut s_min, mut s_max, mut s_sum, mut s_ok) = (usize::MAX, 0usize, 0usize, 0usize);
+            for _ in 0..SAMPLES {
+                let t0 = raw_syscall_aarch64(sys::NOW_NS, zero!(), zero!());
+                raw_syscall_aarch64(sys::NET_STANDARD_SEND_REQUEST, zero!(), zero!());
+                let relayed = raw_syscall_aarch64(sys::NET_STANDARD_SEND_REQUEST_RESULT, zero!(), zero!());
+                let t1 = raw_syscall_aarch64(sys::NOW_NS, zero!(), zero!());
+                if relayed != 0 {
+                    let dt = t1.saturating_sub(t0);
+                    s_ok += 1;
+                    if dt < s_min {
+                        s_min = dt;
+                    }
+                    if dt > s_max {
+                        s_max = dt;
+                    }
+                    s_sum += dt;
+                }
+            }
+            raw_syscall_aarch64(sys::REPORT, s_ok, zero!());
+            let s_avg = if s_ok > 0 { s_sum / s_ok } else { 0 };
+            if s_ok > 0 {
+                raw_syscall_aarch64(sys::REPORT, s_min, zero!());
+                raw_syscall_aarch64(sys::REPORT, s_avg, zero!());
+                raw_syscall_aarch64(sys::REPORT, s_max, zero!());
+            }
+
+            let (mut b_min, mut b_max, mut b_sum, mut b_ok) = (usize::MAX, 0usize, 0usize, 0usize);
+            for _ in 0..SAMPLES {
+                let ns = raw_syscall_aarch64(sys::NET_BYPASS_SEND, zero!(), zero!());
+                if ns != usize::MAX {
+                    b_ok += 1;
+                    if ns < b_min {
+                        b_min = ns;
+                    }
+                    if ns > b_max {
+                        b_max = ns;
+                    }
+                    b_sum += ns;
+                }
+            }
+            raw_syscall_aarch64(sys::REPORT, b_ok, zero!());
+            let b_avg = if b_ok > 0 { b_sum / b_ok } else { 0 };
+            if b_ok > 0 {
+                raw_syscall_aarch64(sys::REPORT, b_min, zero!());
+                raw_syscall_aarch64(sys::REPORT, b_avg, zero!());
+                raw_syscall_aarch64(sys::REPORT, b_max, zero!());
+            }
+
+            raw_syscall_aarch64(sys::NET_LATENCY_SUMMARY, b_avg, s_avg);
+        }
+    }
+}
+
+/// The aarch64 Root Task entry. Linked into `.user_text` (its own
+/// `AP_USER` `R+X` pages at the linked VMA, per hal-arm64's linker.ld)
+/// and run at EL0 by `kernel-arch-glue::enter`. Extends the original
+/// minimal ALIVE/REPORT proof with the cooperative two-process §8.4
+/// round-trip — mirrors `umode_root_x86`'s own steps 5-6 exactly (see
+/// its doc comment for why riscv64's steps 1-4, MAP_PAGE/MAP_ALIAS/
+/// XCHECK, are skipped here too: real paging correctness was already
+/// proven independently by the aarch64 paging milestone).
+#[cfg(target_arch = "aarch64")]
+#[link_section = ".user_text"]
+extern "C" fn umode_root_aarch64() -> ! {
+    // SAFETY: see `raw_syscall_aarch64`'s own contract. The memory
+    // accesses below go through `P2_VA_A_CONST` (0xC0040000, a
+    // `kernel-arch-glue`-owned constant — see `setup_two_process`),
+    // which `enter` maps `AP_USER R+W` onto the frame shared with
+    // process B.
+    unsafe {
+        raw_syscall_aarch64(sys::ALIVE, 0, 0);
+        raw_syscall_aarch64(sys::REPORT, 0x5eed_5eed, 0);
+
+        // 1. Write a sentinel through OUR mapping of the shared frame,
+        //    then `P2_YIELD` — the kernel snapshots this thread and
+        //    resumes process B in its own isolated space.
+        core::arch::asm!(
+            "str {val:w}, [{va}]",
+            va = in(reg) 0xC004_0000u64,
+            val = in(reg) 0xC0DEu32,
+            options(nostack),
+        );
+        raw_syscall_aarch64(sys::P2_YIELD, 0, 0);
+
+        // 2. Resumed here after process B ran. Re-read our VA: process B
+        //    wrote 0xB00B through ITS OWN mapping of the same frame, in
+        //    a different address space, with no copy.
+        let after: usize;
+        core::arch::asm!(
+            "ldr {out:w}, [{va}]",
+            va = in(reg) 0xC004_0000u64,
+            out = out(reg) after,
+            options(nostack, readonly),
+        );
+        raw_syscall_aarch64(sys::P2_REPORT_A, after, 0);
+
+        // 3. Real Call/Recv/Reply demo (02-Microkernel-Layer.md
+        //    §5.1/§8.2) — unlike everything above (all ad-hoc raw
+        //    opcodes), this exercises the REAL `kernel_core::SyscallOp`
+        //    IPC surface through a genuine trap boundary. Mirrors
+        //    `umode_root`'s (riscv64) own step 7 / `umode_root_x86`'s
+        //    own step 3 exactly: `IPC_DEMO_START` spawns the server
+        //    (`umode_ipc_server_aarch64`) and switches straight to it;
+        //    we resume here once the server's own first `IPC_RECV`
+        //    finds nothing queued yet and switches back.
+        raw_syscall_aarch64(sys::IPC_DEMO_START, 0, 0);
+        let ipc_ep = raw_syscall_aarch64(sys::IPC_ENDPOINT_CAP, 0, 0);
+        let ipc_reply = raw_syscall_aarch64(sys::IPC_CALL, ipc_ep, 0xC0FFEE);
+        raw_syscall_aarch64(sys::REPORT, ipc_reply, 0);
+
+        // 7b. fs-native: the REAL FsRequest/FsResponse wire protocol,
+        //     over the SAME real Call/Recv/Reply mechanism, driving a
+        //     REAL isolated process's REAL MemFs (03-Kernel-Subsystems-
+        //     Layer.md §2.2/§5.3) — mirrors riscv64's own `umode_root`
+        //     step 7b / x86_64's own step 7b exactly (see their doc
+        //     comments). `zero!()`: same stack-slot-reuse miscompilation
+        //     those doc comments document in full — not independently
+        //     observed broken on this arch, but applied for the
+        //     identical preventive reason `#[inline(never)]` was applied
+        //     to `raw_syscall_aarch64` itself.
+        macro_rules! zero {
+            () => {{
+                let mut v: usize = 0;
+                // SAFETY: a no-op asm block — see riscv64's own
+                // `umode_root`'s identical macro for the full rationale.
+                core::arch::asm!("/* {0} */", inout(reg) v, options(nomem, nostack, preserves_flags));
+                v
+            }};
+        }
+        raw_syscall_aarch64(sys::FS_DEMO_START, zero!(), zero!());
+        raw_syscall_aarch64(sys::FS_OPEN, zero!(), zero!() | 2); // path=0 ("/greeting"), flags=WRITE (real Write demo below needs it)
+        let fs_handle = raw_syscall_aarch64(sys::FS_OPEN_RESULT, zero!(), zero!());
+        raw_syscall_aarch64(sys::REPORT, fs_handle, zero!());
+        raw_syscall_aarch64(sys::FS_STAT, zero!(), zero!()); // path=0
+        let fs_size = raw_syscall_aarch64(sys::FS_STAT_RESULT, zero!(), zero!());
+        raw_syscall_aarch64(sys::REPORT, fs_size, zero!());
+        raw_syscall_aarch64(sys::FS_WRITE, fs_handle, zero!());
+        let fs_written = raw_syscall_aarch64(sys::FS_WRITE_RESULT, zero!(), zero!());
+        raw_syscall_aarch64(sys::REPORT, fs_written, zero!());
+        raw_syscall_aarch64(sys::FS_READ, fs_handle, fs_written);
+        let fs_read = raw_syscall_aarch64(sys::FS_READ_RESULT, zero!(), zero!());
+        raw_syscall_aarch64(sys::REPORT, fs_read, zero!());
+
+        // VFS read/write throughput benchmark (03-Kernel-Subsystems-
+        // Layer.md §5, item 5) — aarch64's own copy of x86_64's
+        // `umode_root_x86` benchmark loop (see that one's own doc
+        // comment for the full rationale); identical shape, just this
+        // architecture's own `raw_syscall_aarch64`.
+        const FS_BENCH_ITERS: usize = 100;
+        let mut w_total_bytes: usize = 0;
+        let mut w_total_ns: usize = 0;
+        for _ in 0..FS_BENCH_ITERS {
+            let t0 = raw_syscall_aarch64(sys::NOW_NS, zero!(), zero!());
+            raw_syscall_aarch64(sys::FS_WRITE, fs_handle, zero!());
+            let written = raw_syscall_aarch64(sys::FS_WRITE_RESULT, zero!(), zero!());
+            let t1 = raw_syscall_aarch64(sys::NOW_NS, zero!(), zero!());
+            if written != usize::MAX {
+                w_total_bytes += written;
+                w_total_ns += t1.saturating_sub(t0);
+            }
+        }
+        raw_syscall_aarch64(sys::FS_WRITE_THROUGHPUT_SUMMARY, w_total_bytes, w_total_ns);
+
+        let mut r_total_bytes: usize = 0;
+        let mut r_total_ns: usize = 0;
+        for _ in 0..FS_BENCH_ITERS {
+            let t0 = raw_syscall_aarch64(sys::NOW_NS, zero!(), zero!());
+            raw_syscall_aarch64(sys::FS_READ, fs_handle, 4096);
+            let bytes_read = raw_syscall_aarch64(sys::FS_READ_RESULT_QUIET, zero!(), zero!());
+            let t1 = raw_syscall_aarch64(sys::NOW_NS, zero!(), zero!());
+            if bytes_read != usize::MAX {
+                r_total_bytes += bytes_read;
+                r_total_ns += t1.saturating_sub(t0);
+            }
+        }
+        raw_syscall_aarch64(sys::FS_READ_THROUGHPUT_SUMMARY, r_total_bytes, r_total_ns);
+
+        raw_syscall_aarch64(sys::FS_CLOSE, fs_handle, zero!());
+        let fs_closed = raw_syscall_aarch64(sys::FS_CLOSE_RESULT, zero!(), zero!());
+        raw_syscall_aarch64(sys::REPORT, fs_closed, zero!());
+
+        // 7c. virtio-blk demo (03-Kernel-Subsystems-Layer.md §5.1) —
+        // mirrors riscv64's own `umode_root` step 7b exactly (see its
+        // own doc comment), except the device here was discovered over
+        // PCI (`hal_arm64::peripheral`'s own scan — see `kernel_arch_
+        // glue::spawn_virtio_blk_driver`'s own `is_pci` branch), not
+        // Device Tree, so this exercises virtio-pci "modern" transport
+        // end to end rather than virtio-mmio. `DRV_BLK_DEMO_START`
+        // reports `usize::MAX` (mirroring `FS_DEMO_START`'s own
+        // convention) if no Block-kind peripheral was discovered at
+        // boot — the rest of this sequence is skipped in that case
+        // rather than driving IPC against a driver that was never
+        // spawned.
+        let drv_ep = raw_syscall_aarch64(sys::DRV_BLK_DEMO_START, zero!(), zero!());
+        raw_syscall_aarch64(sys::REPORT, drv_ep, zero!());
+        if drv_ep != usize::MAX {
+            raw_syscall_aarch64(sys::DRV_BLK_PROBE, zero!(), zero!());
+            let drv_sector_size = raw_syscall_aarch64(sys::DRV_BLK_PROBE_RESULT, zero!(), zero!());
+            raw_syscall_aarch64(sys::REPORT, drv_sector_size, zero!());
+            raw_syscall_aarch64(sys::DRV_BLK_WRITE, zero!(), zero!()); // lba=0
+            let drv_written = raw_syscall_aarch64(sys::DRV_BLK_WRITE_RESULT, zero!(), zero!());
+            raw_syscall_aarch64(sys::REPORT, drv_written, zero!());
+            raw_syscall_aarch64(sys::DRV_BLK_READ, zero!(), zero!()); // lba=0
+            let drv_read = raw_syscall_aarch64(sys::DRV_BLK_READ_RESULT, zero!(), zero!());
+            raw_syscall_aarch64(sys::REPORT, drv_read, zero!());
+        }
+
+        // 7d. virtio-net demo (03-Kernel-Subsystems-Layer.md §2.3/§5.4) —
+        // see `net_demo_aarch64`'s own doc comment for what it does and
+        // why it is a SEPARATE `.user_text` function rather than inlined
+        // here (mirrors riscv64's own `net_demo_riscv64` call site).
+        net_demo_aarch64();
+
+        // 7e. Compositor demo (03-Kernel-Subsystems-Layer.md §2.4/§5.4.2)
+        // — see `compositor_demo_aarch64`'s own doc comment.
+        compositor_demo_aarch64();
+
+        // 7f. mm-service demo (03-Kernel-Subsystems-Layer.md §2.5) — see
+        // `mm_demo_aarch64`'s own doc comment. Also runs the REAL §8.3
+        // IPC fast-path benchmark internally (see `mm_bench_aarch64`'s
+        // own doc comment).
+        mm_demo_aarch64();
+
+        // 7g. Kernel-bypass networking demo (03-Kernel-Subsystems-
+        // Layer.md §2.3/§5.4.1) — see `net_bypass_demo_aarch64`'s own
+        // doc comment. Runs LAST among the subsystem demos, same
+        // ordering reason as riscv64's own identical call site.
+        net_bypass_demo_aarch64();
+
+        // 7h. security-broker-intermediary demo (Issue #28) — see the
+        //     x86_64 call site's own doc comment.
+        raw_syscall_aarch64(sys::SBI_DEMO_START, 0, 0);
+        let sbi_ep = raw_syscall_aarch64(sys::SBI_ENDPOINT_CAP, 0, 0);
+        raw_syscall_aarch64(sys::SBI_CAP_GRANT, sbi_ep, 0);
+        let sbi_dst = raw_syscall_aarch64(sys::SBI_CAP_GRANT_RESULT, 0, 0);
+        raw_syscall_aarch64(sys::REPORT, sbi_dst, 0);
+        raw_syscall_aarch64(sys::SBI_CAP_REVOKE, sbi_ep, 0);
+        let sbi_freed = raw_syscall_aarch64(sys::SBI_CAP_REVOKE_RESULT, 0, 0);
+        raw_syscall_aarch64(sys::REPORT, sbi_freed, 0);
+        raw_syscall_aarch64(sys::SBI_CAP_GRANT2, sbi_ep, 1);
+        let sbi_dst2 = raw_syscall_aarch64(sys::SBI_CAP_GRANT2_RESULT, 0, 0);
+        raw_syscall_aarch64(sys::REPORT, sbi_dst2, 0);
+        raw_syscall_aarch64(sys::SBI_CAP_REVOKE2, sbi_ep, 0);
+        let sbi_freed2 = raw_syscall_aarch64(sys::SBI_CAP_REVOKE2_RESULT, 0, 0);
+        raw_syscall_aarch64(sys::REPORT, sbi_freed2, 0);
+
+        // 8. Preemption phase (02-Microkernel-Layer.md §4). Ask the
+        //    kernel to arm the timer PPI, then loop forever bumping this
+        //    process's private counter word in the shared frame (offset
+        //    +8). From here NO `P2_YIELD` is issued — the timer
+        //    interrupt alone switches between this process and the
+        //    worker. In practice `kernel_arch_glue::p2_preempt_start`
+        //    always switches AWAY to a fresh thread sharing this same
+        //    address space before this `svc` ever returns (see its own
+        //    doc comment on why root's own vruntime-loaded TCB is
+        //    retired rather than reused) — this loop is the fallback
+        //    for the rare case that spawn fails, mirroring `umode_root_
+        //    x86`'s own identical tail exactly.
+        // Real, on-hardware self-exercise of sys::SCHED_SET_SYSTEM_POLICY
+        // (2026-09-18) — the one point in a real boot where this opcode can
+        // actually be observed end to end. simurgh-profile-policy's own
+        // process issues it for real when a user picks a profile in
+        // ui-core's PROFILE submenu, and once at its own startup, but
+        // neither happens on an unattended boot: policy-engine is spawned
+        // and then never scheduled before the fault-isolation demo below
+        // completes and powers the machine off (verified on a real QEMU
+        // boot — device-manager and the spawned security-broker are the
+        // only subsystem processes that run their own code at all here).
+        //
+        // Placed HERE deliberately: every subsystem process has already
+        // been spawned and admitted at this point, so the kernel's own log
+        // line reports a genuinely non-zero re-mode count over real,
+        // already-running threads — not a vacuous call against an empty
+        // scheduler table.
+        //
+        // A round trip, and net zero: Throughput (mode code 1) and
+        // straight back to Interactive (mode code 0), which is the mode
+        // every thread already had. No scheduling decision can happen
+        // between the two traps (each returns TrapOutcome::Resume, so
+        // this thread keeps the CPU across both), which is why this proves
+        // the mechanism without perturbing the boot that follows. Both
+        // calls pass kernel_sched::AGING_CAP_MS (50) — the cap already in
+        // force — so the aging term is left exactly as it was too.
+        raw_syscall_aarch64(sys::SCHED_SET_SYSTEM_POLICY, 1, 50);
+        raw_syscall_aarch64(sys::SCHED_SET_SYSTEM_POLICY, 0, 50);
+        raw_syscall_aarch64(sys::P2_PREEMPT_START, 0, 0);
+        core::arch::asm!(
+            "2:",
+            "ldr w9, [{va}]",
+            "add w9, w9, #1",
+            "str w9, [{va}]",
+            "b 2b",
+            va = in(reg) 0xC004_0008u64,
+            options(noreturn),
+        );
+    }
+}
+
+/// The SECOND user-space process (02-Microkernel-Layer.md §8.4). Linked
+/// into the same `.user_text` pages as `umode_root_aarch64` but run in
+/// its OWN isolated address space (space B) on its own stack by
+/// `kernel-arch-glue::setup_two_process`. Mirrors `umode_worker_x86`'s
+/// steps 1-4 exactly, including the preemptive-phase counting-loop tail.
+#[cfg(target_arch = "aarch64")]
+#[link_section = ".user_text"]
+extern "C" fn umode_worker_aarch64() -> ! {
+    // SAFETY: `svc #0` traps to the shared EL0-synchronous vector; the
+    // memory accesses go through `P2_VA_B_CONST` (0xC0200000), which
+    // `enter` maps `AP_USER R+W` onto the SAME physical frame as A's own
+    // `P2_VA_A_CONST` mapping, at a different VA in this isolated space.
+    unsafe {
+        let seen: usize;
+        core::arch::asm!(
+            "ldr {out:w}, [{va}]",
+            va = in(reg) 0xC020_0000u64,
+            out = out(reg) seen,
+            options(nostack, readonly),
+        );
+        raw_syscall_aarch64(sys::P2_REPORT_B, seen, 0);
+
+        core::arch::asm!(
+            "str {val:w}, [{va}]",
+            va = in(reg) 0xC020_0000u64,
+            val = in(reg) 0xB00Bu32,
+            options(nostack),
+        );
+
+        // 3. Hand the core back to process A for its final §8.4 check.
+        raw_syscall_aarch64(sys::P2_YIELD, 0, 0);
+
+        // 4. Resumed here (either by that hand-off's partner, or — once
+        //    process A calls P2_PREEMPT_START — by a timer tick). Loop
+        //    forever bumping this process's private counter word in the
+        //    shared frame (offset +12), issuing NO further `P2_YIELD`.
+        core::arch::asm!(
+            "2:",
+            "ldr w9, [{va}]",
+            "add w9, w9, #1",
+            "str w9, [{va}]",
+            "b 2b",
+            va = in(reg) 0xC020_000Cu64,
+            options(noreturn),
+        );
+    }
+}
+
+/// A THIRD user-space process, spawned via `kernel_arch_glue::
+/// spawn_process` (the generic path, not `umode_root_aarch64`/
+/// `umode_worker_aarch64`'s hand-written A/B setup) into its OWN
+/// isolated address space AND its OWN capability space — proof that
+/// process creation generalizes beyond the fixed two-process §8.4
+/// proof. Mirrors `umode_subsystem`/`umode_subsystem_x86` exactly:
+/// bumps a private counter word at a fixed low address inside its OWN
+/// stack region (safe because this loop pushes no stack frame — pure
+/// register ops).
+#[cfg(target_arch = "aarch64")]
+#[link_section = ".user_text"]
+extern "C" fn umode_subsystem_aarch64() -> ! {
+    // SAFETY: the address is the low end of this process's own `AP_USER
+    // R+W` stack mapping (`kernel_arch_glue::spawn_process` set it up);
+    // pure register ops, no stack frame, no relocation.
+    unsafe {
+        core::arch::asm!(
+            "2:",
+            "ldr w9, [{va}]",
+            "add w9, w9, #1",
+            "str w9, [{va}]",
+            "b 2b",
+            va = in(reg) 0xC030_0000u64,
+            options(noreturn),
+        );
+    }
+}
+
+/// Process A's preemptive-phase counting loop, run by a FRESH thread
+/// `kernel_arch_glue::p2_preempt_start` spawns to share root's own
+/// address space (not `umode_root_aarch64` continuing to run itself —
+/// see that function's doc comment on why root's own vruntime-loaded
+/// TCB is retired instead of reused). Bumps the SAME counter word
+/// `umode_root_aarch64` would have (`P2_VA_A_CONST + 8`), since it runs
+/// in the SAME space A. Mirrors `umode_a_loop`/`umode_a_loop_x86`
+/// exactly.
+#[cfg(target_arch = "aarch64")]
+#[link_section = ".user_text"]
+extern "C" fn umode_a_loop_aarch64() -> ! {
+    // SAFETY: the address is mapped `AP_USER R+W` in space A by `enter`/
+    // `umode_root_aarch64`'s own setup; pure register ops, no stack
+    // frame.
+    unsafe {
+        core::arch::asm!(
+            "2:",
+            "ldr w9, [{va}]",
+            "add w9, w9, #1",
+            "str w9, [{va}]",
+            "b 2b",
+            va = in(reg) 0xC004_0008u64,
+            options(noreturn),
+        );
+    }
+}
+
+/// Desktop build's idle thread body (replaces the counting loop): waits
+/// for an interrupt through `sys::IDLE_WAIT` instead of spinning, so an
+/// idle desktop no longer pins a host core at 100%. The kernel side
+/// (`kernel_arch_glue::desktop_idle_wait`) only halts when nothing else
+/// is `Ready` and always finishes with one scheduler tick, which keeps
+/// the preemption timer alive and lets a just-woken input driver run at
+/// once.
+#[cfg(all(feature = "desktop", target_arch = "aarch64"))]
+#[link_section = ".user_text"]
+extern "C" fn umode_idle_loop_aarch64() -> ! {
+    loop {
+        // SAFETY: plain trap into the kernel; `raw_syscall_aarch64` lives in
+        // `.user_text` like every other U-mode syscall wrapper.
+        unsafe { raw_syscall_aarch64(sys::IDLE_WAIT, 0, 0) };
+    }
+}
+
+/// Deliberately-crashing "driver" process — the 03-Kernel-Subsystems-
+/// Layer.md §5.2 acceptance-test demo. Executes `udf #0` (Permanently
+/// Undefined) the instant it is scheduled, taking a synchronous EL0
+/// exception (`ESR_EL1.EC` = 0x00, "Unknown reason") that `hal_arm64`'s
+/// shared EL0-synchronous vector routes to the registered
+/// `FaultHandler` (`simurgh_fault_aarch64` -> `kernel_arch_glue::
+/// p2_fault` -> `KernelState::terminate_thread`/
+/// `terminate_thread_and_handoff`) instead of halting the system —
+/// mirrors `umode_faulty_driver_x86` (`ud2`) exactly, just with
+/// aarch64's own ISA-guaranteed-undefined encoding.
+#[cfg(target_arch = "aarch64")]
+#[link_section = ".user_text"]
+extern "C" fn umode_faulty_driver_aarch64() -> ! {
+    // SAFETY: `udf #0` is not a valid instruction to EXECUTE (it is
+    // reserved specifically as "always undefined") — deliberately
+    // triggers a synchronous exception, the entire point of this
+    // process. `options(noreturn)` is honest: control never falls
+    // through (the thread is terminated by the fault handler and never
+    // resumes).
+    unsafe {
+        core::arch::asm!("udf #0", options(noreturn));
+    }
+}
+
+/// The real Call/Recv/Reply demo's SERVER (02-Microkernel-Layer.md
+/// §5.1/§8.2 — see `sys::IPC_DEMO_START`'s own doc comment). Spawned by
+/// `kernel_arch_glue::p2_ipc_demo_start`, sharing `umode_root_aarch64`'s
+/// OWN address space. Mirrors riscv64's `umode_ipc_server`/x86_64's
+/// `umode_ipc_server_x86` exactly.
+#[cfg(target_arch = "aarch64")]
+#[link_section = ".user_text"]
+extern "C" fn umode_ipc_server_aarch64() -> ! {
+    // SAFETY: `svc #0` traps to the shared EL0-synchronous vector; pure
+    // register ops, no stack frame, no relocation — same convention
+    // every other `.user_text` function here follows.
+    unsafe {
+        let ep = raw_syscall_aarch64(sys::IPC_ENDPOINT_CAP, 0, 0);
+        let (from, label) = raw_syscall2_aarch64(sys::IPC_RECV, ep, 0);
+        raw_syscall_aarch64(sys::IPC_REPLY, from, label.wrapping_add(1));
+        // `IPC_REPLY` always switches away on success (see its own doc
+        // comment) — unreachable in that case; this is the fallback for
+        // the error case, so this thread parks instead of running off
+        // the end of the function.
+        core::arch::asm!("2:", "b 2b", options(noreturn));
+    }
+}
+
+/// The syscall handler `hal_arm64::cpu`'s shared EL0-synchronous vector
+/// calls for a `svc` from EL0. Runs at EL1.
+#[cfg(target_arch = "aarch64")]
+fn simurgh_syscall_aarch64(x8: usize, x0: usize, x1: usize) -> hal_arm64::cpu::TrapOutcome {
+    use hal_arm64::cpu::TrapOutcome;
+
+    // Two-process hand-off / device-manager supervision arms resolve to
+    // a non-`Resume` outcome — mirrors `simurgh_syscall_x86`'s own
+    // dispatch order exactly.
+    match x8 {
+        sys::P2_YIELD => {
+            #[cfg(feature = "desktop")]
+            let yielded = kernel_arch_glue::desktop_yield(hal_arm64::cpu::wfi);
+            #[cfg(not(feature = "desktop"))]
+            let yielded = kernel_arch_glue::p2_yield();
+            return match yielded {
+                Some((save, into)) => TrapOutcome::SwitchTo { save, into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::P2_REPORT_A => {
+            kernel_arch_glue::p2_report_a(x0);
+            return TrapOutcome::Resume(0);
+        }
+        // Real Call/Recv/Reply demo (see `sys::IPC_DEMO_START`'s own doc
+        // comment) — mirrors `simurgh_syscall` (riscv64)'s / `simurgh_
+        // syscall_x86`'s own IPC arms exactly, including using
+        // `kstate().sched.running()` (not the hardcoded root thread
+        // every OTHER opcode here uses) since IPC_RECV/IPC_REPLY are
+        // called by the server thread too.
+        sys::IPC_DEMO_START => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate()
+                .sched
+                .running()
+                .unwrap_or(kernel_arch_glue::kstate().root_thread);
+            return match kernel_arch_glue::p2_ipc_demo_start(hal, caller, umode_ipc_server_aarch64 as usize) {
+                Some((ep, save, into)) => {
+                    // SAFETY: single-core; only this arm writes
+                    // G_IPC_EP_AARCH64, before either the client or the
+                    // server can read it.
+                    unsafe { core::ptr::addr_of_mut!(G_IPC_EP_AARCH64).write(ep) };
+                    TrapOutcome::SwitchTo { save, into }
+                }
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::IPC_ENDPOINT_CAP => {
+            // SAFETY: single-core; written once by IPC_DEMO_START before
+            // either caller of this opcode can run.
+            return TrapOutcome::Resume(unsafe { core::ptr::addr_of!(G_IPC_EP_AARCH64).read() } as usize);
+        }
+        sys::IPC_CALL => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate()
+                .sched
+                .running()
+                .unwrap_or(kernel_arch_glue::kstate().root_thread);
+            return match kernel_arch_glue::p2_ipc_call(hal, caller, x0 as u32, x1 as u64) {
+                Some(sw) => {
+                    match sw.poke {
+                        Some((p0, p1)) => {
+                            // SAFETY: `sw.into` is a kernel-owned,
+                            // currently not-executing
+                            // `HAL_USER_CONTEXT_BYTES` blob —
+                            // `p2_ipc_call`'s own contract.
+                            unsafe { hal_arm64::cpu::poke_saved_a0_a1(sw.into as *mut u8, p0, p1) };
+                            // A genuine `do_send` fast-path direct
+                            // delivery (`poke.is_some()` — `p2_ipc_call`'s
+                            // own doc comment) — the L4-style
+                            // register-only fast path
+                            // (02-Microkernel-Layer.md §5.3/§8.3) is safe
+                            // here. See `hal_arm64::cpu::TrapOutcome::
+                            // SwitchToFast`'s own doc comment for exactly
+                            // which registers this skips and why.
+                            TrapOutcome::SwitchToFast { save: sw.save, into: sw.into }
+                        }
+                        // **Real bug found via QEMU** (real-IPC plan Phase
+                        // 2): `poke.is_none()` here means `do_send` did
+                        // NOT deliver directly — `n` is a general
+                        // `pick_next` fallback pick (`p2_ipc_call`'s own
+                        // doc comment on its `Reschedule{next:Some(n)}`
+                        // arm), which can be ANY `Ready` thread
+                        // system-wide, not a cooperating participant in
+                        // the fast path's own narrow register-set
+                        // convention — same bug/fix as `SBS_IPC_RECV`'s
+                        // own arm (that one's doc comment has the full
+                        // real-crash story: `SwitchToFast` zeroing `rcx`
+                        // out from under the §8.4 demo's own process C).
+                        None => TrapOutcome::SwitchTo { save: sw.save, into: sw.into },
+                    }
+                }
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::IPC_RECV => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate()
+                .sched
+                .running()
+                .unwrap_or(kernel_arch_glue::kstate().root_thread);
+            return match kernel_arch_glue::p2_ipc_recv(hal, caller, x0 as u32) {
+                Some(kernel_arch_glue::IpcRecvOutcome::Immediate { from, label }) => {
+                    TrapOutcome::Resume2(from, label)
+                }
+                Some(kernel_arch_glue::IpcRecvOutcome::Switch(sw)) => {
+                    // `poke` is always `None` here — WE are the one
+                    // blocking (nothing to poke into our own trap; the
+                    // ordinary `Resume`/`Resume2` path handles that),
+                    // not being woken via a direct hand-off.
+                    TrapOutcome::SwitchToFast { save: sw.save, into: sw.into }
+                }
+                None => TrapOutcome::Resume2(0, 0),
+            };
+        }
+        sys::SBS_IPC_RECV => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate()
+                .sched
+                .running()
+                .unwrap_or(kernel_arch_glue::kstate().root_thread);
+            // See the x86_64/riscv64 `SBS_IPC_RECV` arm's own comment
+            // (`kernel_arch_glue::G_FS_ROOT_ONLY_PHASE`/`G_COMPOSITOR_
+            // ROOT_ONLY_PHASE`'s own doc comments for the full story) —
+            // identical reasoning, this arch's own register name (`x0`)
+            // for the endpoint argument.
+            let ipc_recv_outcome = if kernel_arch_glue::fs_tid() == Some(caller) {
+                kernel_arch_glue::fs_native_recv(hal, caller, x0 as u32)
+            } else if kernel_arch_glue::compositor_tid() == Some(caller) {
+                kernel_arch_glue::compositor_native_recv(hal, caller, x0 as u32)
+            } else {
+                kernel_arch_glue::p2_ipc_recv_general(hal, caller, x0 as u32)
+            };
+            return match ipc_recv_outcome {
+                Some(kernel_arch_glue::IpcRecvOutcome::Immediate { from, label }) => {
+                    TrapOutcome::Resume2(from, label)
+                }
+                Some(kernel_arch_glue::IpcRecvOutcome::Switch(sw)) => {
+                    // **Real bug found via QEMU** (real-IPC plan Phase 2):
+                    // unlike `IPC_RECV`'s own identical-LOOKING arm (whose
+                    // `p2_ipc_recv` ALWAYS switches to `root_thread`
+                    // specifically, a known participant in the L4 fast
+                    // path's own narrow register-set convention),
+                    // `p2_ipc_recv_general`'s whole POINT is a general
+                    // `pick_next` fallback that can land on ANY `Ready`
+                    // thread system-wide — confirmed via a real QEMU
+                    // crash (`#PF`, cr2=0) where `security-broker`'s own
+                    // `serve_requests` fan-in switched into the §8.4 A/B/C
+                    // fairness demo's process C mid-loop: `SwitchToFast`'s
+                    // own `restore_ipc_fast_context` deliberately ZEROES
+                    // `rcx`/`rdx`/`r8`-`r11` (real SysV caller-saved
+                    // scratch registers for the L4 IPC convention this
+                    // fast path was built for — see `TrapOutcome::
+                    // SwitchToFast`'s own doc comment: "used ONLY by...
+                    // real `IPC_CALL`/`IPC_RECV`/`IPC_REPLY`"), but process
+                    // C's own loop genuinely KEEPS its counter address
+                    // live in `rcx` across the switch — zeroing it turned
+                    // its next `mov eax, [rcx]` into a null-pointer read.
+                    // `SwitchTo` (full, unconditional register restore) is
+                    // exactly what `common_fault_entry`'s/`common_timer_
+                    // entry`'s own `SwitchToFast` arms already fall back
+                    // to for the identical reason ("no basis to assume the
+                    // fast path's narrower register set is safe").
+                    TrapOutcome::SwitchTo { save: sw.save, into: sw.into }
+                }
+                None => TrapOutcome::Resume2(0, 0),
+            };
+        }
+        sys::NOTIF_WAIT => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate()
+                .sched
+                .running()
+                .unwrap_or(kernel_arch_glue::kstate().root_thread);
+            return match kernel_arch_glue::p2_wait_general(hal, caller, x0 as u32) {
+                Some(kernel_arch_glue::WaitOutcome::Immediate(bits)) => TrapOutcome::Resume(bits as usize),
+                Some(kernel_arch_glue::WaitOutcome::Switch(sw)) => {
+                    // Same bug, same fix as `SBS_IPC_RECV`'s own identical
+                    // arm above: `p2_wait_general`'s `next` is a general
+                    // `pick_next` pick too, never the L4 fast path's own
+                    // narrow, cooperating-thread set — `SwitchTo`, not
+                    // `SwitchToFast`.
+                    TrapOutcome::SwitchTo { save: sw.save, into: sw.into }
+                }
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::NOTIF_WAIT_TIMEOUT => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate()
+                .sched
+                .running()
+                .unwrap_or(kernel_arch_glue::kstate().root_thread);
+            // The timeout path pokes (0, 0) into a woken thread's saved
+            // registers from inside the tick handler, which cannot know this
+            // architecture's context layout - so hand it the poke here.
+            kernel_arch_glue::register_saved_reg_poke(hal_arm64::cpu::poke_saved_a0_a1);
+            return match kernel_arch_glue::p2_wait_timeout_general(hal, caller, x0 as u32, x1 as u64) {
+                Some(kernel_arch_glue::WaitOutcome::Immediate(bits)) => TrapOutcome::Resume(bits as usize),
+                Some(kernel_arch_glue::WaitOutcome::Switch(sw)) => TrapOutcome::SwitchTo { save: sw.save, into: sw.into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::NOTIF_SIGNAL => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate()
+                .sched
+                .running()
+                .unwrap_or(kernel_arch_glue::kstate().root_thread);
+            return match kernel_arch_glue::p2_signal(hal, caller, x0 as u32, x1 as u64) {
+                kernel_arch_glue::SignalOutcome::OkWithPoke { woke, value } => {
+                    if let Some(ctx) = kernel_arch_glue::kstate().thread_context_mut_ptr(woke) {
+                        // SAFETY: `woke` is blocked (not currently
+                        // `Running` — single-core), so its own saved
+                        // context is not concurrently touched by
+                        // anything else; `SignalOutcome::OkWithPoke`'s
+                        // own doc comment.
+                        unsafe { hal_arm64::cpu::poke_saved_a0_a1(ctx, value as usize, 0) };
+                    }
+                    TrapOutcome::Resume(1)
+                }
+                kernel_arch_glue::SignalOutcome::Ok => TrapOutcome::Resume(1),
+                kernel_arch_glue::SignalOutcome::Failed => TrapOutcome::Resume(0),
+            };
+        }
+        sys::NOTIF_POLL => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate()
+                .sched
+                .running()
+                .unwrap_or(kernel_arch_glue::kstate().root_thread);
+            let bits = kernel_arch_glue::p2_poll(hal, caller, x0 as u32);
+            return TrapOutcome::Resume(bits as usize);
+        }
+        sys::PS_LIST_ENTRY => {
+            return TrapOutcome::Resume(match kernel_arch_glue::ps_list_entry(x0) {
+                Some((tid, state_code)) => ((tid as usize) << 8) | state_code as usize,
+                None => usize::MAX,
+            });
+        }
+        sys::THREAD_EXIT_POLL => {
+            let hal = kernel_arch_glue::khal();
+            // See the x86_64 handler's own arm for why the caller's
+            // identity is load-bearing here (it IS the access check).
+            let caller = kernel_arch_glue::kstate()
+                .sched
+                .running()
+                .unwrap_or(kernel_arch_glue::kstate().root_thread);
+            let (status, payload) = kernel_arch_glue::p2_thread_exit_status(hal, caller, x0 as u32);
+            return TrapOutcome::Resume2(status, payload);
+        }
+        sys::IN_SUPERVISE_REPORT => {
+            kernel_arch_glue::log(format_args!(
+                "init (U-mode): real post-launch crash-supervision self-check {} - THREAD_EXIT_POLL on its own spawned process returned {}\r\n",
+                if x0 == 1 { "PASSED" } else { "FAILED" },
+                thread_exit_status_name(x1)
+            ));
+            return TrapOutcome::Resume(0);
+        }
+        #[cfg(feature = "desktop")]
+        sys::IDLE_WAIT => {
+            return match kernel_arch_glue::desktop_idle_wait(hal_arm64::cpu::wfi) {
+                Some((save, into)) => TrapOutcome::SwitchTo { save, into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::SCHED_SET_SYSTEM_POLICY => {
+            return TrapOutcome::Resume(
+                match kernel_arch_glue::set_system_scheduler_policy(x0, x1) {
+                    Some(re_moded) => {
+                        kernel_arch_glue::log(format_args!(
+                            "kernel (aarch64): real SCHED_SET_SYSTEM_POLICY syscall - system \
+                             scheduler mode now {}, aging_cap_ms now {}, {} already-running \
+                             thread(s) re-moded\r\n",
+                            if x0 == 0 { "Interactive" } else { "Throughput" },
+                            x1,
+                            re_moded
+                        ));
+                        re_moded
+                    }
+                    None => {
+                        kernel_arch_glue::log(format_args!(
+                            "kernel (aarch64): SCHED_SET_SYSTEM_POLICY rejected - {} is not a \
+                             real scheduler mode code, nothing changed\r\n",
+                            x0
+                        ));
+                        usize::MAX
+                    }
+                },
+            );
+        }
+        sys::IPC_REPLY => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate()
+                .sched
+                .running()
+                .unwrap_or(kernel_arch_glue::kstate().root_thread);
+            return match kernel_arch_glue::p2_ipc_reply(hal, caller, x0 as u32, x1 as u64) {
+                Some(sw) => {
+                    if let Some((p0, p1)) = sw.poke {
+                        // SAFETY: same contract as IPC_CALL's own poke
+                        // above.
+                        unsafe { hal_arm64::cpu::poke_saved_a0_a1(sw.into as *mut u8, p0, p1) };
+                    }
+                    TrapOutcome::SwitchToFast { save: sw.save, into: sw.into }
+                }
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        // fs-native: the REAL FsRequest/FsResponse wire protocol — see
+        // riscv64's own identical arms (this file's `sys::FS_DEMO_START`
+        // doc comment) for the full rationale. Always called by root in
+        // this demo, so `kstate().root_thread` is correct here, unlike
+        // the generic IPC arms above (which the SERVER thread also
+        // calls).
+        sys::FS_DEMO_START => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            return match kernel_arch_glue::fs_demo_start(hal, caller, FS_NATIVE_ELF, elf_loader::machine::EM_AARCH64) {
+                Some((ep, save, into)) => {
+                    // SAFETY: single-core; only this arm writes
+                    // G_FS_EP_AARCH64, before any later FS_OPEN/FS_STAT/
+                    // FS_CLOSE call.
+                    unsafe { core::ptr::addr_of_mut!(G_FS_EP_AARCH64).write(ep) };
+                    TrapOutcome::SwitchTo { save, into }
+                }
+                None => TrapOutcome::Resume(usize::MAX),
+            };
+        }
+        sys::FS_OPEN => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            // SAFETY: single-core; written once by FS_DEMO_START, before
+            // any FS_OPEN call.
+            let ep = unsafe { core::ptr::addr_of!(G_FS_EP_AARCH64).read() };
+            return match kernel_arch_glue::fs_open_call(hal, caller, ep, x0 as u32, x1 as u32) {
+                Some(sw) => TrapOutcome::SwitchToFast { save: sw.save, into: sw.into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::FS_OPEN_RESULT => {
+            return TrapOutcome::Resume(kernel_arch_glue::fs_open_result());
+        }
+        sys::FS_STAT => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            // SAFETY: same contract as FS_OPEN's own read.
+            let ep = unsafe { core::ptr::addr_of!(G_FS_EP_AARCH64).read() };
+            return match kernel_arch_glue::fs_stat_call(hal, caller, ep, x0 as u32) {
+                Some(sw) => TrapOutcome::SwitchToFast { save: sw.save, into: sw.into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::FS_STAT_RESULT => {
+            return TrapOutcome::Resume(kernel_arch_glue::fs_stat_result());
+        }
+        sys::FS_CLOSE => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            // SAFETY: same contract as FS_OPEN's own read.
+            let ep = unsafe { core::ptr::addr_of!(G_FS_EP_AARCH64).read() };
+            return match kernel_arch_glue::fs_close_call(hal, caller, ep, x0 as u32) {
+                Some(sw) => TrapOutcome::SwitchToFast { save: sw.save, into: sw.into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::FS_CLOSE_RESULT => {
+            return TrapOutcome::Resume(kernel_arch_glue::fs_close_result());
+        }
+        sys::FS_WRITE => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            // SAFETY: same contract as FS_OPEN's own read.
+            let ep = unsafe { core::ptr::addr_of!(G_FS_EP_AARCH64).read() };
+            return match kernel_arch_glue::fs_write_call(hal, caller, ep, x0 as u32) {
+                Some(sw) => TrapOutcome::SwitchToFast { save: sw.save, into: sw.into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::FS_WRITE_RESULT => {
+            return TrapOutcome::Resume(kernel_arch_glue::fs_write_result());
+        }
+        sys::FS_READ => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            // SAFETY: same contract as FS_OPEN's own read.
+            let ep = unsafe { core::ptr::addr_of!(G_FS_EP_AARCH64).read() };
+            return match kernel_arch_glue::fs_read_call(hal, caller, ep, x0 as u32, x1 as u32) {
+                Some(sw) => TrapOutcome::SwitchToFast { save: sw.save, into: sw.into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::FS_READ_RESULT => {
+            return TrapOutcome::Resume(kernel_arch_glue::fs_read_result());
+        }
+        sys::FS_READ_RESULT_QUIET => {
+            return TrapOutcome::Resume(kernel_arch_glue::fs_read_result_quiet());
+        }
+        sys::FS_WRITE_THROUGHPUT_SUMMARY => {
+            kernel_arch_glue::fs_write_throughput_summary(x0, x1);
+            return TrapOutcome::Resume(0);
+        }
+        sys::FS_READ_THROUGHPUT_SUMMARY => {
+            kernel_arch_glue::fs_read_throughput_summary(x0, x1);
+            return TrapOutcome::Resume(0);
+        }
+        // virtio-blk driver: mirrors riscv64's own identical arms (this
+        // file's `sys::DRV_BLK_DEMO_START` doc comment) — same
+        // `Transport`-erased `kernel_arch_glue::spawn_virtio_blk_driver`
+        // entry point, just `EM_AARCH64` instead of `EM_RISCV` and this
+        // architecture's own `G_DRV_EP_AARCH64` slot. The device itself
+        // is discovered over PCI here (`hal_arm64::peripheral`'s own
+        // scan), not Device Tree — `spawn_virtio_blk_driver`'s own
+        // `mmio.config_space_base != 0` branch (kernel-arch-glue)
+        // resolves virtio-pci "modern" transport instead of virtio-mmio
+        // transparently to this dispatch code, which stays identical
+        // either way.
+        sys::DRV_BLK_DEMO_START => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            return match kernel_arch_glue::spawn_virtio_blk_driver(
+                hal,
+                caller,
+                DRIVER_VIRTIO_BLK_ELF,
+                elf_loader::machine::EM_AARCH64,
+            ) {
+                Some((ep, save, into)) => {
+                    // SAFETY: single-core; only this arm writes
+                    // G_DRV_EP_AARCH64, before any later DRV_BLK_* call.
+                    unsafe { core::ptr::addr_of_mut!(G_DRV_EP_AARCH64).write(ep) };
+                    TrapOutcome::SwitchTo { save, into }
+                }
+                None => TrapOutcome::Resume(usize::MAX),
+            };
+        }
+        sys::DRV_BLK_PROBE => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            // SAFETY: single-core; written once by DRV_BLK_DEMO_START,
+            // before any DRV_BLK_PROBE call.
+            let ep = unsafe { core::ptr::addr_of!(G_DRV_EP_AARCH64).read() };
+            return match kernel_arch_glue::drv_blk_probe_call(hal, caller, ep) {
+                Some(sw) => TrapOutcome::SwitchToFast { save: sw.save, into: sw.into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::DRV_BLK_PROBE_RESULT => {
+            return TrapOutcome::Resume(kernel_arch_glue::drv_blk_probe_result().0 as usize);
+        }
+        sys::DRV_BLK_WRITE => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            // SAFETY: same contract as DRV_BLK_PROBE's own read.
+            let ep = unsafe { core::ptr::addr_of!(G_DRV_EP_AARCH64).read() };
+            return match kernel_arch_glue::drv_blk_write_call(hal, caller, ep, x0 as u64) {
+                Some(sw) => TrapOutcome::SwitchToFast { save: sw.save, into: sw.into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::DRV_BLK_WRITE_RESULT => {
+            return TrapOutcome::Resume(kernel_arch_glue::drv_blk_write_result());
+        }
+        sys::DRV_BLK_READ => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            // SAFETY: same contract as DRV_BLK_PROBE's own read.
+            let ep = unsafe { core::ptr::addr_of!(G_DRV_EP_AARCH64).read() };
+            return match kernel_arch_glue::drv_blk_read_call(hal, caller, ep, x0 as u64) {
+                Some(sw) => TrapOutcome::SwitchToFast { save: sw.save, into: sw.into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::DRV_BLK_READ_RESULT => {
+            return TrapOutcome::Resume(kernel_arch_glue::drv_blk_read_result());
+        }
+        // virtio-net driver: mirrors riscv64's own identical arm (this
+        // file's `sys::DRV_NET_DEMO_START` doc comment on the x86_64
+        // dispatch table for the full "why a kernel-side cache, not
+        // this switching syscall's own return value" rationale) — same
+        // `Transport`-erased `kernel_arch_glue::spawn_virtio_net_driver`
+        // entry point, just `EM_AARCH64` and this architecture's own
+        // `G_DRV_NET_EP_AARCH64` slot.
+        sys::DRV_NET_DEMO_START => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            return match kernel_arch_glue::spawn_virtio_net_driver(
+                hal,
+                caller,
+                DRIVER_VIRTIO_NET_ELF,
+                elf_loader::machine::EM_AARCH64,
+            ) {
+                Some((ep, save, into)) => {
+                    // SAFETY: single-core; only this arm writes
+                    // G_DRV_NET_EP_AARCH64, before any later NET_DEMO_
+                    // START call.
+                    unsafe { core::ptr::addr_of_mut!(G_DRV_NET_EP_AARCH64).write(ep) };
+                    TrapOutcome::SwitchTo { save, into }
+                }
+                None => TrapOutcome::Resume(usize::MAX),
+            };
+        }
+        // Netstack: mirrors riscv64's own identical arm.
+        sys::NET_DEMO_START => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            // SAFETY: single-core; written once by DRV_NET_DEMO_START,
+            // before any NET_DEMO_START call.
+            let drv_ep = unsafe { core::ptr::addr_of!(G_DRV_NET_EP_AARCH64).read() };
+            return match kernel_arch_glue::spawn_netstack_service(
+                hal,
+                caller,
+                NETSTACK_ELF,
+                elf_loader::machine::EM_AARCH64,
+                drv_ep,
+            ) {
+                Some((save, into)) => TrapOutcome::SwitchTo { save, into },
+                None => TrapOutcome::Resume(usize::MAX),
+            };
+        }
+        sys::NET_STATUS_POLL => {
+            return TrapOutcome::Resume(kernel_arch_glue::netstack_status());
+        }
+        sys::COMPOSITOR_DEMO_START => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            return match kernel_arch_glue::compositor_demo_start(hal, caller, COMPOSITOR_ELF, elf_loader::machine::EM_AARCH64) {
+                Some((ep, save, into)) => {
+                    // SAFETY: single-core; only this arm writes
+                    // G_COMPOSITOR_EP_AARCH64, before any later
+                    // COMPOSITOR_CREATE_SURFACE/COMMIT_BUFFER/DESTROY_
+                    // SURFACE call.
+                    unsafe { core::ptr::addr_of_mut!(G_COMPOSITOR_EP_AARCH64).write(ep) };
+                    TrapOutcome::SwitchTo { save, into }
+                }
+                None => TrapOutcome::Resume(usize::MAX),
+            };
+        }
+        sys::COMPOSITOR_CREATE_SURFACE => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            // SAFETY: single-core; written once by COMPOSITOR_DEMO_START,
+            // before any COMPOSITOR_CREATE_SURFACE call.
+            let ep = unsafe { core::ptr::addr_of!(G_COMPOSITOR_EP_AARCH64).read() };
+            return match kernel_arch_glue::compositor_create_surface_call(hal, caller, ep) {
+                Some(sw) => TrapOutcome::SwitchToFast { save: sw.save, into: sw.into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::COMPOSITOR_CREATE_SURFACE_RESULT => {
+            return TrapOutcome::Resume(kernel_arch_glue::compositor_create_surface_result());
+        }
+        sys::COMPOSITOR_COMMIT_BUFFER => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            // SAFETY: same contract as COMPOSITOR_CREATE_SURFACE's own read.
+            let ep = unsafe { core::ptr::addr_of!(G_COMPOSITOR_EP_AARCH64).read() };
+            return match kernel_arch_glue::compositor_commit_call(hal, caller, ep, x0 as u32) {
+                Some(sw) => TrapOutcome::SwitchToFast { save: sw.save, into: sw.into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::COMPOSITOR_COMMIT_VERIFY => {
+            return TrapOutcome::Resume(kernel_arch_glue::compositor_commit_verify());
+        }
+        sys::COMPOSITOR_DESTROY_SURFACE => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            // SAFETY: same contract as COMPOSITOR_CREATE_SURFACE's own read.
+            let ep = unsafe { core::ptr::addr_of!(G_COMPOSITOR_EP_AARCH64).read() };
+            return match kernel_arch_glue::compositor_destroy_call(hal, caller, ep, x0 as u32) {
+                Some(sw) => TrapOutcome::SwitchToFast { save: sw.save, into: sw.into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::COMPOSITOR_DESTROY_RESULT => {
+            return TrapOutcome::Resume(kernel_arch_glue::compositor_destroy_result());
+        }
+        sys::MM_DEMO_START => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            return match kernel_arch_glue::mm_demo_start(hal, caller, MM_SERVICE_ELF, elf_loader::machine::EM_AARCH64) {
+                Some((ep, save, into)) => {
+                    // SAFETY: single-core; only this arm writes
+                    // G_MM_EP_AARCH64, before any later MM_REGISTER/
+                    // MM_UNREGISTER/MM_QUERY_VICTIM/MM_QUERY_TOTAL_
+                    // RESIDENT call.
+                    unsafe { core::ptr::addr_of_mut!(G_MM_EP_AARCH64).write(ep) };
+                    TrapOutcome::SwitchTo { save, into }
+                }
+                None => TrapOutcome::Resume(usize::MAX),
+            };
+        }
+        sys::MM_REGISTER => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            // SAFETY: single-core; written once by MM_DEMO_START, before
+            // any MM_REGISTER call.
+            let ep = unsafe { core::ptr::addr_of!(G_MM_EP_AARCH64).read() };
+            return match kernel_arch_glue::mm_register_call(hal, caller, ep, x0 as u32) {
+                Some(sw) => TrapOutcome::SwitchToFast { save: sw.save, into: sw.into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::MM_REGISTER_RESULT => {
+            return TrapOutcome::Resume(kernel_arch_glue::mm_register_result());
+        }
+        sys::MM_UNREGISTER => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            // SAFETY: same contract as MM_REGISTER's own read.
+            let ep = unsafe { core::ptr::addr_of!(G_MM_EP_AARCH64).read() };
+            return match kernel_arch_glue::mm_unregister_call(hal, caller, ep, x0 as u32) {
+                Some(sw) => TrapOutcome::SwitchToFast { save: sw.save, into: sw.into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::MM_UNREGISTER_RESULT => {
+            return TrapOutcome::Resume(kernel_arch_glue::mm_unregister_result());
+        }
+        sys::MM_QUERY_VICTIM => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            // SAFETY: same contract as MM_REGISTER's own read.
+            let ep = unsafe { core::ptr::addr_of!(G_MM_EP_AARCH64).read() };
+            return match kernel_arch_glue::mm_query_victim_call(hal, caller, ep) {
+                Some(sw) => TrapOutcome::SwitchToFast { save: sw.save, into: sw.into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::MM_QUERY_VICTIM_RESULT => {
+            return TrapOutcome::Resume(kernel_arch_glue::mm_query_victim_result());
+        }
+        sys::MM_QUERY_TOTAL_RESIDENT => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            // SAFETY: same contract as MM_REGISTER's own read.
+            let ep = unsafe { core::ptr::addr_of!(G_MM_EP_AARCH64).read() };
+            return match kernel_arch_glue::mm_query_total_resident_call(hal, caller, ep) {
+                Some(sw) => TrapOutcome::SwitchToFast { save: sw.save, into: sw.into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::MM_QUERY_TOTAL_RESIDENT_RESULT => {
+            return TrapOutcome::Resume(kernel_arch_glue::mm_query_total_resident_result());
+        }
+        sys::NET_BYPASS_REQUEST => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            return match kernel_arch_glue::net_bypass_request_call(hal, caller) {
+                Some(sw) => TrapOutcome::SwitchToFast { save: sw.save, into: sw.into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::NET_BYPASS_REQUEST_RESULT => {
+            return TrapOutcome::Resume(kernel_arch_glue::net_bypass_request_result());
+        }
+        sys::NET_STANDARD_SEND_REQUEST => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            return match kernel_arch_glue::net_standard_send_call(hal, caller) {
+                Some(sw) => TrapOutcome::SwitchToFast { save: sw.save, into: sw.into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::NET_STANDARD_SEND_REQUEST_RESULT => {
+            return TrapOutcome::Resume(kernel_arch_glue::net_standard_send_result());
+        }
+        sys::NET_LATENCY_SUMMARY => {
+            kernel_arch_glue::net_latency_summary(x0, x1);
+            return TrapOutcome::Resume(0);
+        }
+        sys::NET_BYPASS_SEND => {
+            let hal = kernel_arch_glue::khal();
+            let ns = kernel_arch_glue::net_bypass_direct_send(hal);
+            return TrapOutcome::Resume(ns.map(|v| v as usize).unwrap_or(usize::MAX));
+        }
+        sys::NOW_NS => {
+            let hal = kernel_arch_glue::khal();
+            return TrapOutcome::Resume(hal.now_ns() as usize);
+        }
+        sys::NET_LOG => {
+            return TrapOutcome::Resume(kernel_arch_glue::netstack_log(x0));
+        }
+        sys::MM_QUERY_TOTAL_RESIDENT_RESULT_QUIET => {
+            return TrapOutcome::Resume(kernel_arch_glue::mm_query_total_resident_result_quiet());
+        }
+        sys::CAP_GRANT => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate()
+                .sched
+                .running()
+                .unwrap_or(kernel_arch_glue::kstate().root_thread);
+            let target_thread = x0 as u32;
+            let cap = x1 as u32;
+            let rights_bits = (x1 >> 32) as u32;
+            return TrapOutcome::Resume(
+                match kernel_arch_glue::cap_grant(hal, caller, target_thread, cap, rights_bits) {
+                    Some(dst) => dst.as_u32() as usize,
+                    None => usize::MAX,
+                },
+            );
+        }
+        sys::CAP_REVOKE => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate()
+                .sched
+                .running()
+                .unwrap_or(kernel_arch_glue::kstate().root_thread);
+            return TrapOutcome::Resume(match kernel_arch_glue::cap_revoke(hal, caller, x0 as u32) {
+                Some(freed) => freed as usize,
+                None => usize::MAX,
+            });
+        }
+        // security-broker-intermediary (Issue #28) — see the x86_64
+        // `sys::SBI_DEMO_START` arm's own doc comment (`P2_PREEMPT_START`
+        // normally never returns to `.user_text`, so security-broker is
+        // spawned HERE, sequentially, before it — not inside that
+        // handler).
+        sys::SBI_DEMO_START => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            let Some(security_broker_tid) = spawn_security_broker_aarch64(hal) else {
+                return TrapOutcome::Resume(usize::MAX);
+            };
+            return match kernel_arch_glue::security_broker_intermediary_demo_start(
+                hal,
+                caller,
+                SECURITY_BROKER_INTERMEDIARY_ELF,
+                elf_loader::machine::EM_AARCH64,
+                security_broker_tid,
+            ) {
+                Some((ep, save, into)) => {
+                    // SAFETY: single-core; only this arm writes
+                    // G_SBI_EP_AARCH64, before any SBI_ENDPOINT_CAP/
+                    // SBI_CAP_GRANT call.
+                    unsafe { core::ptr::addr_of_mut!(G_SBI_EP_AARCH64).write(ep) };
+                    TrapOutcome::SwitchTo { save, into }
+                }
+                None => TrapOutcome::Resume(usize::MAX),
+            };
+        }
+        sys::SBI_ENDPOINT_CAP => {
+            // SAFETY: single-core; written once by SBI_DEMO_START.
+            return TrapOutcome::Resume(unsafe { core::ptr::addr_of!(G_SBI_EP_AARCH64).read() } as usize);
+        }
+        sys::SBI_CAP_GRANT => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            // `cap: 2` / `rights: READ|WRITE` (`0b011`) fixed for this
+            // demo — see riscv64's own identical arm's doc comment.
+            return match kernel_arch_glue::sbi_cap_grant_call(hal, caller, x0 as u32, x1 as u32, 2, 0b011) {
+                Some(sw) => {
+                    if let Some((p0, p1)) = sw.poke {
+                        // SAFETY: `sw.into` is a kernel-owned, currently
+                        // not-executing `HAL_USER_CONTEXT_BYTES` blob —
+                        // `sbi_cap_grant_call`'s own contract.
+                        unsafe { hal_arm64::cpu::poke_saved_a0_a1(sw.into as *mut u8, p0, p1) };
+                    }
+                    TrapOutcome::SwitchToFast { save: sw.save, into: sw.into }
+                }
+                None => TrapOutcome::Resume(usize::MAX),
+            };
+        }
+        sys::SBI_CAP_GRANT_RESULT => {
+            let dst = kernel_arch_glue::sbi_cap_grant_result();
+            if dst == usize::MAX {
+                kernel_arch_glue::log(format_args!(
+                    "root task (aarch64): security-broker-intermediary CapGrant FAILED (Issue #28)\r\n"
+                ));
+            } else {
+                kernel_arch_glue::log(format_args!(
+                    "root task (aarch64): security-broker-intermediary minted a REAL capability into security-broker's own cap space at slot {dst} (Issue #28, end-to-end proof)\r\n"
+                ));
+            }
+            return TrapOutcome::Resume(dst);
+        }
+        sys::SBI_CAP_REVOKE => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            // See riscv64's own identical arm's doc comment.
+            return match kernel_arch_glue::sbi_cap_revoke_call(hal, caller, x0 as u32, 2) {
+                Some(sw) => {
+                    if let Some((p0, p1)) = sw.poke {
+                        // SAFETY: `sw.into` is a kernel-owned, currently
+                        // not-executing `HAL_USER_CONTEXT_BYTES` blob —
+                        // `sbi_cap_revoke_call`'s own contract.
+                        unsafe { hal_arm64::cpu::poke_saved_a0_a1(sw.into as *mut u8, p0, p1) };
+                    }
+                    TrapOutcome::SwitchToFast { save: sw.save, into: sw.into }
+                }
+                None => TrapOutcome::Resume(usize::MAX),
+            };
+        }
+        sys::SBI_CAP_REVOKE_RESULT => {
+            let freed = kernel_arch_glue::sbi_cap_revoke_result();
+            if freed == usize::MAX {
+                kernel_arch_glue::log(format_args!(
+                    "root task (aarch64): security-broker-intermediary CapRevoke FAILED (Issue #28)\r\n"
+                ));
+            } else {
+                kernel_arch_glue::log(format_args!(
+                    "root task (aarch64): security-broker-intermediary revoked the demo capability — {freed} slot(s) freed across BOTH capability spaces (Issue #28, cross-space revoke proof)\r\n"
+                ));
+            }
+            return TrapOutcome::Resume(freed);
+        }
+        sys::SBI_CAP_GRANT2 => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            // See riscv64's own identical arm's doc comment.
+            return match kernel_arch_glue::sbi_cap_grant_call(hal, caller, x0 as u32, x1 as u32, 5, 0b011) {
+                Some(sw) => {
+                    if let Some((p0, p1)) = sw.poke {
+                        // SAFETY: `sw.into` is a kernel-owned, currently
+                        // not-executing `HAL_USER_CONTEXT_BYTES` blob —
+                        // `sbi_cap_grant_call`'s own contract.
+                        unsafe { hal_arm64::cpu::poke_saved_a0_a1(sw.into as *mut u8, p0, p1) };
+                    }
+                    TrapOutcome::SwitchToFast { save: sw.save, into: sw.into }
+                }
+                None => TrapOutcome::Resume(usize::MAX),
+            };
+        }
+        sys::SBI_CAP_GRANT2_RESULT => {
+            let dst = kernel_arch_glue::sbi_cap_grant_result();
+            if dst == usize::MAX {
+                kernel_arch_glue::log(format_args!(
+                    "root task (aarch64): security-broker-intermediary CapGrant (2nd target, mm-service) FAILED or skipped (Issue #28)\r\n"
+                ));
+            } else {
+                kernel_arch_glue::log(format_args!(
+                    "root task (aarch64): security-broker-intermediary minted a REAL capability into mm-service's own cap space at slot {dst} (Issue #28, multi-target proof)\r\n"
+                ));
+            }
+            return TrapOutcome::Resume(dst);
+        }
+        sys::SBI_CAP_REVOKE2 => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            return match kernel_arch_glue::sbi_cap_revoke_call(hal, caller, x0 as u32, 5) {
+                Some(sw) => {
+                    if let Some((p0, p1)) = sw.poke {
+                        // SAFETY: `sw.into` is a kernel-owned, currently
+                        // not-executing `HAL_USER_CONTEXT_BYTES` blob —
+                        // `sbi_cap_revoke_call`'s own contract.
+                        unsafe { hal_arm64::cpu::poke_saved_a0_a1(sw.into as *mut u8, p0, p1) };
+                    }
+                    TrapOutcome::SwitchToFast { save: sw.save, into: sw.into }
+                }
+                None => TrapOutcome::Resume(usize::MAX),
+            };
+        }
+        sys::SBI_CAP_REVOKE2_RESULT => {
+            let freed = kernel_arch_glue::sbi_cap_revoke_result();
+            if freed == usize::MAX {
+                kernel_arch_glue::log(format_args!(
+                    "root task (aarch64): security-broker-intermediary CapRevoke (2nd target) FAILED or skipped (Issue #28)\r\n"
+                ));
+            } else {
+                kernel_arch_glue::log(format_args!(
+                    "root task (aarch64): security-broker-intermediary revoked the 2nd demo capability — {freed} slot(s) freed (Issue #28, multi-target proof)\r\n"
+                ));
+            }
+            return TrapOutcome::Resume(freed);
+        }
+        sys::DRV_IRQ_WAIT => {
+            let hal = kernel_arch_glue::khal();
+            // Discovered ONCE, before the retry loop below — see
+            // riscv64's own identical `sys::DRV_IRQ_WAIT` arm (this
+            // file) and `kernel_arch_glue::drv_irq_wait_step`'s own doc
+            // comment for why re-discovering it on every iteration is a
+            // real bug, not a harmless simplification.
+            let caller = kernel_arch_glue::kstate()
+                .sched
+                .running()
+                .unwrap_or(kernel_arch_glue::kstate().root_thread);
+            // Real interrupt-driven idle wait — mirrors riscv64's own
+            // `sys::DRV_IRQ_WAIT` arm exactly (see its own doc comment
+            // for the full rationale), substituting hal-arm64's own
+            // `wfi()` (DAIF.I-toggling `wfi`, `hal_arm64::cpu`) for
+            // hal-riscv64's `sstatus.SIE`-toggling one — both gate the
+            // SAME class of "trap taken while already at the target
+            // privilege/exception level" case, GICv3 is already primed
+            // by `bootstrap_current_core`/`set_global_controller`
+            // (`hal_arm64_rust_entry`, called unconditionally at boot,
+            // not gated on this driver ever running).
+            loop {
+                match kernel_arch_glue::drv_irq_wait_step(hal, caller, x0 as u32) {
+                    kernel_arch_glue::IrqWaitOutcome::Ready(bits) => {
+                        return TrapOutcome::Resume(bits as usize);
+                    }
+                    kernel_arch_glue::IrqWaitOutcome::Blocked => {
+                        hal_arm64::cpu::wfi();
+                    }
+                    kernel_arch_glue::IrqWaitOutcome::Error => {
+                        return TrapOutcome::Resume(0);
+                    }
+                }
+            }
+        }
+        sys::P2_PREEMPT_START => {
+            // The cooperative §8.4 round-trip is done; spawn the fault-
+            // isolation demo (03-Kernel-Subsystems-Layer.md §5.2) and
+            // arm the preemptive scheduler (02-Microkernel-Layer.md §4)
+            // together, right here — mirrors `simurgh_syscall`
+            // (riscv64)'s own `P2_PREEMPT_START` arm exactly: device-
+            // manager and the faulty driver simply join the SAME
+            // timer-driven round-robin `p2_preempt_start`/`p2_tick`
+            // establish for A/B/C, rather than needing an explicit
+            // hand-off — `p2_fault`'s existing unconditional hand-off-
+            // to-`DM_TID` logic (already proven on riscv64 AND aarch64)
+            // takes over the instant the driver is scheduled and faults.
+            spawn_device_manager_aarch64(kernel_arch_glue::khal());
+            // security-broker is now spawned earlier, sequentially, by
+            // `sys::SBI_DEMO_START` (see that arm's own doc comment for
+            // why) — NOT spawned again here.
+            let _ = spawn_init_aarch64(kernel_arch_glue::khal());
+            let _ = spawn_account_manager_aarch64(kernel_arch_glue::khal());
+            kernel_arch_glue::set_backup_manager_tid(spawn_backup_manager_aarch64(kernel_arch_glue::khal()));
+            kernel_arch_glue::set_diagnostics_manager_tid(spawn_diagnostics_manager_aarch64(kernel_arch_glue::khal()));
+            let _ = spawn_store_aarch64(kernel_arch_glue::khal());
+            let _ = spawn_native_loader_aarch64(kernel_arch_glue::khal());
+            let _ = spawn_policy_engine_aarch64(kernel_arch_glue::khal());
+            // Gated exactly as in `simurgh_syscall_x86`'s own
+            // `P2_PREEMPT_START` arm — see it, and `kernel_arch_glue::
+            // p2_gate_fault_demo`'s own doc comment, for the rationale.
+            kernel_arch_glue::p2_gate_fault_demo(spawn_faulty_driver_aarch64(kernel_arch_glue::khal()));
+            return match kernel_arch_glue::p2_preempt_start() {
+                Some((save, into)) => TrapOutcome::SwitchTo { save, into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::P2_REPORT_B => {
+            kernel_arch_glue::p2_report_b(x0);
+            return TrapOutcome::Resume(0);
+        }
+        sys::DM_REPORT => {
+            let name = match x0 {
+                0 => "Starting",
+                1 => "Running",
+                2 => "Restarting",
+                3 => "Failed",
+                _ => "?",
+            };
+            kernel_arch_glue::log(format_args!(
+                "device-manager (U-mode, isolated subsystem process, aarch64): state={name} restarts_in_window={x1}\r\n"
+            ));
+            if x0 == 3 {
+                // See the x86_64 handler's own arm for the reasoning.
+                kernel_arch_glue::p2_verify_watched_driver_exit_query(kernel_arch_glue::khal());
+                kernel_arch_glue::p2_dm_supervision_done();
+            }
+            return TrapOutcome::Resume(0);
+        }
+        sys::NL_REPORT => {
+            if x0 == 1 {
+                kernel_arch_glue::log(format_args!(
+                    "native-loader (U-mode, aarch64): real request_capability round trip to security-broker succeeded, object_ref={x1:#x}\r\n"
+                ));
+            } else {
+                kernel_arch_glue::log(format_args!(
+                    "native-loader (U-mode, aarch64): real request_capability round trip to security-broker returned Err\r\n"
+                ));
+            }
+            return TrapOutcome::Resume(0);
+        }
+        sys::IN_REPORT => {
+            kernel_arch_glue::log(format_args!(
+                "init (U-mode, aarch64): self_check started {x0} unit(s), real_spawn_demo succeeded={}, real_manifest_read_demo succeeded={} (not wired on this arch yet)\r\n",
+                x1 & 1 == 1,
+                x1 & 2 == 2
+            ));
+            return TrapOutcome::Resume(0);
+        }
+        sys::SB_REPORT => {
+            kernel_arch_glue::log(format_args!(
+                "security-broker (U-mode, aarch64): served a real service call from requester#{x0}, granted={}\r\n",
+                x1 == 1
+            ));
+            return TrapOutcome::Resume(0);
+        }
+        sys::POWER_CONTROL => {
+            let hal = kernel_arch_glue::khal();
+            kernel_arch_glue::log(format_args!(
+                "root task (aarch64): real POWER_CONTROL syscall - {}\r\n",
+                if x0 == 0 { "reboot" } else { "shutdown" }
+            ));
+            if x0 == 0 {
+                hal.reboot();
+            } else {
+                hal.shutdown();
+            }
+        }
+        sys::DM_WAIT_CRASH => {
+            return match kernel_arch_glue::p2_dm_wait_crash() {
+                Some((save, into)) => TrapOutcome::SwitchTo { save, into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::DM_POLL_CRASH => {
+            return TrapOutcome::Resume(kernel_arch_glue::p2_poll_crash());
+        }
+        sys::DM_RESPAWN_DRIVER => {
+            return match spawn_faulty_driver_aarch64(kernel_arch_glue::khal()) {
+                Some(new_tid) => match kernel_arch_glue::p2_dm_handoff_to_driver(new_tid) {
+                    Some((save, into)) => TrapOutcome::SwitchTo { save, into },
+                    None => TrapOutcome::Resume(0),
+                },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::ALIVE => {
+            kernel_arch_glue::log(format_args!(
+                "root task (U-mode, aarch64, EL0): alive, made a svc syscall from AP_USER pages\r\n"
+            ));
+        }
+        sys::REPORT => {
+            kernel_arch_glue::log(format_args!(
+                "root task (U-mode, aarch64): syscall result = {:#x}\r\n",
+                x0
+            ));
+        }
+        _ => {}
+    }
+    TrapOutcome::Resume(0)
+}
+
+/// The per-process fault-isolation handler `hal_arm64::cpu`'s shared
+/// EL0-synchronous vector calls for a fatal EL0 exception that is not a
+/// `svc` (registered via `hal_arm64::cpu::set_fault_handler`) —
+/// 03-Kernel-Subsystems-Layer.md §2.1/§5.2. Mirrors
+/// `simurgh_fault_x86`/riscv64's `simurgh_fault` exactly: delegates to
+/// `kernel-arch-glue`, which terminates the faulting thread (or hands
+/// off directly to device-manager if it was the watched driver) and
+/// picks whatever else is runnable.
+#[cfg(target_arch = "aarch64")]
+fn simurgh_fault_aarch64(ec: usize, elr: usize, _far: usize) -> hal_arm64::cpu::TrapOutcome {
+    use hal_arm64::cpu::TrapOutcome;
+    match kernel_arch_glue::p2_fault(ec, elr, 0) {
+        Some(into) => TrapOutcome::Terminate { into },
+        None => TrapOutcome::Resume(0),
+    }
+}
+
+/// The preemptive-scheduler tick handler `hal_arm64::cpu`'s shared EL0
+/// IRQ vector calls for the timer PPI landing on a running U-mode
+/// thread (registered via `hal_arm64::cpu::set_tick_handler`) —
+/// 02-Microkernel-Layer.md §4. Delegates the round-robin decision to
+/// `kernel-arch-glue`; `Some((save, into))` preempts, `None` lets the
+/// current thread keep running. Mirrors `simurgh_tick` (riscv64)
+/// exactly.
+#[cfg(target_arch = "aarch64")]
+fn simurgh_tick_aarch64() -> hal_arm64::cpu::TrapOutcome {
+    use hal_arm64::cpu::TrapOutcome;
+    match kernel_arch_glue::p2_tick() {
+        Some((save, into)) => TrapOutcome::SwitchTo { save, into },
+        None => TrapOutcome::Resume(0),
+    }
+}
+
+/// Mirrors `spawn_device_manager_x86`/riscv64's `spawn_device_manager`
+/// exactly (see either's doc comment). Launches Device Manager —
+/// `Service::BOOT_ORDER[0]` — as a genuinely isolated process from its
+/// OWN separately-built ELF image (`kernel_arch_glue::
+/// spawn_process_from_elf`), the SAME mechanism the other two
+/// architectures use. Called once, right after the cooperative §8.4
+/// round-trip completes (`sys::P2_REPORT_A`).
+/// See riscv64's own `spawn_device_manager`'s doc comment for why this
+/// now returns the spawned thread's id.
+#[cfg(target_arch = "aarch64")]
+fn spawn_device_manager_aarch64(hal: &hal_core::HalInterface) -> Option<kernel_cap::ThreadId> {
+    let k = kernel_arch_glue::kstate();
+    let total = k.total_untyped_bytes();
+    match root_task::plan_boot(total) {
+        Ok(plan) => {
+            kernel_arch_glue::log(format_args!(
+                "root task (aarch64): plan_boot({} bytes) - root reserve {} bytes, {} service grant(s), {} bytes free\r\n",
+                total, plan.root_reserve_bytes, plan.grants.len(), plan.free_bytes
+            ));
+        }
+        Err(e) => {
+            kernel_arch_glue::log(format_args!(
+                "root task (aarch64): plan_boot failed: {:?} - device-manager not spawned\r\n",
+                e
+            ));
+            return None;
+        }
+    }
+
+    const DM_STACK_VMA: usize = 0xC040_0000;
+    const DM_STACK_LEN: usize = 4096 * 16;
+    match kernel_arch_glue::spawn_process_from_elf(
+        hal,
+        k,
+        DEVICE_MANAGER_ELF,
+        elf_loader::machine::EM_AARCH64,
+        DM_STACK_VMA,
+        DM_STACK_LEN,
+    ) {
+        Some((tid, _cap_space, _stack_phys)) => {
+            kernel_arch_glue::p2_register_device_manager(tid);
+            kernel_arch_glue::log(format_args!(
+                "root task (aarch64): spawned device-manager (tid {}) from its OWN separately-built ELF image\r\n",
+                tid.as_u32()
+            ));
+            Some(tid)
+        }
+        None => {
+            kernel_arch_glue::log(format_args!(
+                "root task (aarch64): device-manager spawn skipped (out of resources)\r\n"
+            ));
+            None
+        }
+    }
+}
+
+/// aarch64 counterpart of `spawn_security_broker` — see that function's
+/// own doc comment for the full rationale.
+/// See riscv64's own `spawn_security_broker`'s doc comment for why this
+/// now returns the spawned thread's id.
+fn spawn_security_broker_aarch64(hal: &hal_core::HalInterface) -> Option<kernel_cap::ThreadId> {
+    let k = kernel_arch_glue::kstate();
+
+    const SB_STACK_VMA: usize = 0xC041_0000;
+    /// **Real capacity bug found via QEMU** (real-IPC plan Phase 2): the
+    /// original `4096 * 16` (64 KiB, shared by every other subsystem
+    /// process spawned this way) was sized back when this process ran
+    /// Phase 1's own single, simple `serve_capability_requests` loop.
+    /// Phase 2's `serve_requests` fan-in now calls through 3 separate
+    /// handler paths (`serve_one_capability_request`/`_elevation_
+    /// request`/`_signature_request`), each with its own wire encode/
+    /// decode and (for `_signature_request`) a `StorePackage` built with
+    /// several `String`/`Vec` fields — real stack depth this process
+    /// never exercised before, compiled at `-O0` (larger per-frame stack
+    /// use than a release build). Confirmed via a real QEMU crash: `RIP`
+    /// landed INSIDE this process's own bump-allocator heap region (data,
+    /// never meant to be executed) — the unmistakable signature of a
+    /// stack overflow silently overwriting adjacent memory. Raised to
+    /// `4096 * 64` (256 KiB, 4x) for real headroom, matching this
+    /// project's own established precedent (`Simurgh-OS::kernel_core::
+    /// config::MAX_CAP_SPACES`/`CAP_SLOTS_PER_SPACE`'s own doc comments) —
+    /// left at the shared 64 KiB for every OTHER process spawned here,
+    /// none of which grew this way.
+    const SB_STACK_LEN: usize = 4096 * 64;
+    match kernel_arch_glue::spawn_process_from_elf(
+        hal,
+        k,
+        SECURITY_BROKER_ELF,
+        elf_loader::machine::EM_AARCH64,
+        SB_STACK_VMA,
+        SB_STACK_LEN,
+    ) {
+        Some((tid, _cap_space, _stack_phys)) => {
+            kernel_arch_glue::log(format_args!(
+                "root task (aarch64): spawned security-broker (tid {}) from its OWN separately-built ELF image (simurgh-security-broker repo)\r\n",
+                tid.as_u32()
+            ));
+            Some(tid)
+        }
+        None => {
+            kernel_arch_glue::log(format_args!(
+                "root task (aarch64): security-broker spawn skipped (out of resources)\r\n"
+            ));
+            None
+        }
+    }
+}
+
+/// aarch64 counterpart of `spawn_init` (riscv64) — see that function's
+/// own doc comment for the full rationale. Same shape as
+/// `spawn_security_broker_aarch64`.
+fn spawn_init_aarch64(hal: &hal_core::HalInterface) -> Option<kernel_cap::ThreadId> {
+    let k = kernel_arch_glue::kstate();
+
+    const INIT_STACK_VMA: usize = 0xC042_0000;
+    const INIT_STACK_LEN: usize = 4096 * 16;
+    match kernel_arch_glue::spawn_process_from_elf(
+        hal,
+        k,
+        INIT_ELF,
+        elf_loader::machine::EM_AARCH64,
+        INIT_STACK_VMA,
+        INIT_STACK_LEN,
+    ) {
+        Some((tid, _cap_space, _stack_phys)) => {
+            kernel_arch_glue::log(format_args!(
+                "root task (aarch64): spawned init (tid {}) from its OWN separately-built ELF image (simurgh-init repo)\r\n",
+                tid.as_u32()
+            ));
+            Some(tid)
+        }
+        None => {
+            kernel_arch_glue::log(format_args!(
+                "root task (aarch64): init spawn skipped (out of resources)\r\n"
+            ));
+            None
+        }
+    }
+}
+
+/// aarch64 counterpart of `spawn_account_manager` (riscv64) — see that
+/// function's own doc comment for the full rationale. Same shape as
+/// `spawn_init_aarch64`.
+fn spawn_account_manager_aarch64(hal: &hal_core::HalInterface) -> Option<kernel_cap::ThreadId> {
+    let k = kernel_arch_glue::kstate();
+
+    const ACCOUNT_MANAGER_STACK_VMA: usize = 0xC043_0000;
+    // Bumped alongside `SB_STACK_LEN`/`NATIVE_LOADER_STACK_LEN`'s own
+    // identical fix (`SB_STACK_LEN`'s own doc comment has the full
+    // story) — real headroom for this process's own real-IPC plan
+    // Phase 2 additions.
+    const ACCOUNT_MANAGER_STACK_LEN: usize = 4096 * 64;
+    match kernel_arch_glue::spawn_process_from_elf(
+        hal,
+        k,
+        ACCOUNT_MANAGER_ELF,
+        elf_loader::machine::EM_AARCH64,
+        ACCOUNT_MANAGER_STACK_VMA,
+        ACCOUNT_MANAGER_STACK_LEN,
+    ) {
+        Some((tid, _cap_space, _stack_phys)) => {
+            kernel_arch_glue::log(format_args!(
+                "root task (aarch64): spawned account-manager (tid {}) from its OWN separately-built ELF image (simurgh-account-manager repo)\r\n",
+                tid.as_u32()
+            ));
+            Some(tid)
+        }
+        None => {
+            kernel_arch_glue::log(format_args!(
+                "root task (aarch64): account-manager spawn skipped (out of resources)\r\n"
+            ));
+            None
+        }
+    }
+}
+
+/// aarch64 counterpart of `spawn_backup_manager` (riscv64) — see that
+/// function's own doc comment for the full rationale. Same shape as
+/// `spawn_account_manager_aarch64`.
+fn spawn_backup_manager_aarch64(hal: &hal_core::HalInterface) -> Option<kernel_cap::ThreadId> {
+    let k = kernel_arch_glue::kstate();
+
+    const BACKUP_MANAGER_STACK_VMA: usize = 0xC044_0000;
+    const BACKUP_MANAGER_STACK_LEN: usize = 4096 * 16;
+    match kernel_arch_glue::spawn_process_from_elf(
+        hal,
+        k,
+        BACKUP_MANAGER_ELF,
+        elf_loader::machine::EM_AARCH64,
+        BACKUP_MANAGER_STACK_VMA,
+        BACKUP_MANAGER_STACK_LEN,
+    ) {
+        Some((tid, _cap_space, _stack_phys)) => {
+            kernel_arch_glue::log(format_args!(
+                "root task (aarch64): spawned backup-manager (tid {}) from its OWN separately-built ELF image (simurgh-backup-manager repo)\r\n",
+                tid.as_u32()
+            ));
+            Some(tid)
+        }
+        None => {
+            kernel_arch_glue::log(format_args!(
+                "root task (aarch64): backup-manager spawn skipped (out of resources)\r\n"
+            ));
+            None
+        }
+    }
+}
+
+/// aarch64 counterpart of `spawn_diagnostics_manager` (riscv64) — see
+/// that function's own doc comment for the full rationale. Same shape as
+/// `spawn_backup_manager_aarch64`.
+fn spawn_diagnostics_manager_aarch64(hal: &hal_core::HalInterface) -> Option<kernel_cap::ThreadId> {
+    let k = kernel_arch_glue::kstate();
+
+    const DIAGNOSTICS_MANAGER_STACK_VMA: usize = 0xC045_0000;
+    const DIAGNOSTICS_MANAGER_STACK_LEN: usize = 4096 * 16;
+    match kernel_arch_glue::spawn_process_from_elf(
+        hal,
+        k,
+        DIAGNOSTICS_MANAGER_ELF,
+        elf_loader::machine::EM_AARCH64,
+        DIAGNOSTICS_MANAGER_STACK_VMA,
+        DIAGNOSTICS_MANAGER_STACK_LEN,
+    ) {
+        Some((tid, _cap_space, _stack_phys)) => {
+            kernel_arch_glue::log(format_args!(
+                "root task (aarch64): spawned diagnostics-manager (tid {}) from its OWN separately-built ELF image (simurgh-diagnostics repo)\r\n",
+                tid.as_u32()
+            ));
+            Some(tid)
+        }
+        None => {
+            kernel_arch_glue::log(format_args!(
+                "root task (aarch64): diagnostics-manager spawn skipped (out of resources)\r\n"
+            ));
+            None
+        }
+    }
+}
+
+/// aarch64 counterpart of `spawn_store` (riscv64) — see that function's
+/// own doc comment for the full rationale. Same shape as
+/// `spawn_diagnostics_manager_aarch64`.
+fn spawn_store_aarch64(hal: &hal_core::HalInterface) -> Option<kernel_cap::ThreadId> {
+    let k = kernel_arch_glue::kstate();
+
+    const STORE_STACK_VMA: usize = 0xC046_0000;
+    // Bumped alongside `SB_STACK_LEN`/`NATIVE_LOADER_STACK_LEN`'s own
+    // identical fix (`SB_STACK_LEN`'s own doc comment has the full
+    // story) — real headroom for this process's own real-IPC plan
+    // Phase 2 additions.
+    const STORE_STACK_LEN: usize = 4096 * 64;
+    match kernel_arch_glue::spawn_process_from_elf(
+        hal,
+        k,
+        STORE_ELF,
+        elf_loader::machine::EM_AARCH64,
+        STORE_STACK_VMA,
+        STORE_STACK_LEN,
+    ) {
+        Some((tid, _cap_space, _stack_phys)) => {
+            kernel_arch_glue::log(format_args!(
+                "root task (aarch64): spawned store (tid {}) from its OWN separately-built ELF image (simurgh-store repo)\r\n",
+                tid.as_u32()
+            ));
+            Some(tid)
+        }
+        None => {
+            kernel_arch_glue::log(format_args!(
+                "root task (aarch64): store spawn skipped (out of resources)\r\n"
+            ));
+            None
+        }
+    }
+}
+
+/// aarch64 counterpart of `spawn_native_loader` (riscv64) — see that
+/// function's own doc comment for the full rationale. Same shape as
+/// `spawn_store_aarch64`.
+fn spawn_native_loader_aarch64(hal: &hal_core::HalInterface) -> Option<kernel_cap::ThreadId> {
+    let k = kernel_arch_glue::kstate();
+
+    const NATIVE_LOADER_STACK_VMA: usize = 0xC047_0000;
+    // Bumped alongside `SB_STACK_LEN`'s own identical fix (that
+    // constant's own doc comment has the full story — a real QEMU-traced
+    // crash bisected into this process's own bump-allocator code,
+    // consistent with a stack overflow corrupting nearby state) — this
+    // process's own real-IPC plan Phase 2 additions (`NOTIF_SIGNAL` +
+    // wire encode/decode) are new stack depth Phase 1 never exercised.
+    const NATIVE_LOADER_STACK_LEN: usize = 4096 * 64;
+    match kernel_arch_glue::spawn_process_from_elf(
+        hal,
+        k,
+        NATIVE_LOADER_ELF,
+        elf_loader::machine::EM_AARCH64,
+        NATIVE_LOADER_STACK_VMA,
+        NATIVE_LOADER_STACK_LEN,
+    ) {
+        Some((tid, _cap_space, _stack_phys)) => {
+            kernel_arch_glue::log(format_args!(
+                "root task (aarch64): spawned native-loader (tid {}) from its OWN separately-built ELF image (simurgh-native-sdk repo)\r\n",
+                tid.as_u32()
+            ));
+            Some(tid)
+        }
+        None => {
+            kernel_arch_glue::log(format_args!(
+                "root task (aarch64): native-loader spawn skipped (out of resources)\r\n"
+            ));
+            None
+        }
+    }
+}
+
+/// aarch64 counterpart of `spawn_policy_engine` (riscv64) — see that
+/// function's own doc comment for the full rationale. Same shape as
+/// `spawn_native_loader_aarch64`.
+fn spawn_policy_engine_aarch64(hal: &hal_core::HalInterface) -> Option<kernel_cap::ThreadId> {
+    let k = kernel_arch_glue::kstate();
+
+    const POLICY_ENGINE_STACK_VMA: usize = 0xC048_0000;
+    const POLICY_ENGINE_STACK_LEN: usize = 4096 * 16;
+    match kernel_arch_glue::spawn_process_from_elf(
+        hal,
+        k,
+        POLICY_ENGINE_ELF,
+        elf_loader::machine::EM_AARCH64,
+        POLICY_ENGINE_STACK_VMA,
+        POLICY_ENGINE_STACK_LEN,
+    ) {
+        Some((tid, _cap_space, _stack_phys)) => {
+            kernel_arch_glue::log(format_args!(
+                "root task (aarch64): spawned policy-engine (tid {}) from its OWN separately-built ELF image (simurgh-profile-policy repo)\r\n",
+                tid.as_u32()
+            ));
+            Some(tid)
+        }
+        None => {
+            kernel_arch_glue::log(format_args!(
+                "root task (aarch64): policy-engine spawn skipped (out of resources)\r\n"
+            ));
+            None
+        }
+    }
+}
+
+/// Spawns `umode_faulty_driver_aarch64` (see its doc comment) via the
+/// SAME generic `kernel_arch_glue::spawn_process` path as
+/// device-manager. Mirrors `spawn_faulty_driver_x86`/riscv64's
+/// `spawn_faulty_driver` exactly.
+#[cfg(target_arch = "aarch64")]
+fn spawn_faulty_driver_aarch64(hal: &hal_core::HalInterface) -> Option<kernel_cap::ThreadId> {
+    let k = kernel_arch_glue::kstate();
+    let user = user_image();
+    const FAULTY_STACK_VMA: usize = 0xC050_0000;
+    const FAULTY_STACK_LEN: usize = 4096 * 4;
+    match kernel_arch_glue::spawn_process(
+        hal,
+        k,
+        user.text_vma,
+        user.text_lma,
+        user.text_len,
+        FAULTY_STACK_VMA,
+        FAULTY_STACK_LEN,
+        umode_faulty_driver_aarch64 as usize,
+    ) {
+        Some((tid, _cap_space, _stack_phys)) => {
+            kernel_arch_glue::p2_watch_driver(tid);
+            kernel_arch_glue::log(format_args!(
+                "root task (aarch64): spawned faulty-driver (tid {}) - it will fault on its first instruction (fault-isolation demo, 03 5.2)\r\n",
+                tid.as_u32()
+            ));
+            Some(tid)
+        }
+        None => {
+            kernel_arch_glue::log(format_args!(
+                "root task (aarch64): faulty-driver spawn skipped (out of resources)\r\n"
+            ));
+            None
+        }
+    }
+}
+
+// Linker symbols for the aarch64 user (layer-3) Root Task image — see
+// hal-arm64/src/linker.ld's `.user_text` / `.user_stack` sections.
+#[cfg(target_arch = "aarch64")]
+unsafe extern "C" {
+    static __user_text_start: u8;
+    static __user_text_end: u8;
+    static __user_text_lma: u8;
+    static __user_stack_start: u8;
+    static __user_stack_end: u8;
+    static __user_stack_lma: u8;
+}
+
+/// Reads the `.user_*` linker symbols into the descriptor `enter` needs to
+/// map the Root Task's pages `AP_USER` before dropping to EL0.
+#[cfg(target_arch = "aarch64")]
+fn user_image() -> kernel_arch_glue::UserImage {
+    let sym = |s: &u8| s as *const u8 as usize;
+    // SAFETY: these are linker-defined addresses, taken by reference only,
+    // never dereferenced — the standard idiom for consuming linker script
+    // symbols.
+    unsafe {
+        kernel_arch_glue::UserImage {
+            text_vma: sym(&__user_text_start),
+            text_lma: sym(&__user_text_lma),
+            text_len: sym(&__user_text_end) - sym(&__user_text_start),
+            stack_vma: sym(&__user_stack_start),
+            stack_lma: sym(&__user_stack_lma),
+            stack_len: sym(&__user_stack_end) - sym(&__user_stack_start),
+            entry_vma: umode_root_aarch64 as usize,
+            worker_entry_vma: umode_worker_aarch64 as usize,
+            subsystem_entry_vma: umode_subsystem_aarch64 as usize,
+            a_loop_entry_vma: {
+                #[cfg(feature = "desktop")]
+                { umode_idle_loop_aarch64 as usize }
+                #[cfg(not(feature = "desktop"))]
+                { umode_a_loop_aarch64 as usize }
+            },
+        }
+    }
+}
+
+/// Physical address of the frame the most recent `MAP_PAGE` handed the
+/// Root Task (for `XCHECK`'s kernel-side cross-check read).
+#[cfg(target_arch = "riscv64")]
+static mut LAST_MAPPED_FRAME: usize = 0;
+/// The Frame capability (an `UntypedMemory` cap) the most recent
+/// `MAP_PAGE` retyped. `MAP_ALIAS` maps this SAME capability at a second
+/// VA — real capability-gated aliasing (`do_map` resolves it exactly like
+/// the first `Map` did), not a kernel-side "trust the last physical
+/// address" shortcut: a caller can never smuggle in an arbitrary
+/// physical address, only a capability it actually holds.
+#[cfg(target_arch = "riscv64")]
+static mut LAST_MAPPED_FRAME_CAP: u32 = 0;
+
+/// Retypes one page-sized `Untyped` object out of whichever of the Root
+/// Task's `UntypedMemory` capabilities still has room, returning both the
+/// new Frame capability (for `SyscallOp::Map`'s `frame` argument) and its
+/// physical base (for `XCHECK`'s kernel-side read — `Map` itself does not
+/// hand this back). `None` if no region has room, or the cap lookup fails.
+///
+/// This used to say "the Root Task's FIRST `UntypedMemory` capability"
+/// and hardcode `CapId::new(0)`, which is the same latent untyped-
+/// exhaustion bug that really did crash the aarch64 boot — see
+/// `kernel_arch_glue::retype_one_from_any_untyped`'s own doc comment for
+/// the full, gdb-confirmed story. Every riscv64 `sys::MAP_PAGE` call
+/// comes through here, so it would have failed the same way once slot
+/// 0's own fragment filled.
+#[cfg(target_arch = "riscv64")]
+fn alloc_root_frame(
+    k: &mut kernel_core::KernelState,
+    hal: &hal_core::HalInterface,
+) -> Option<(kernel_cap::CapId, usize)> {
+    use kernel_mm::KernelObjectType;
+
+    let root = k.root_thread;
+    let cap =
+        kernel_arch_glue::retype_one_from_any_untyped(k, hal, root, KernelObjectType::Untyped, 1)?;
+    let uid = kernel_cap::UntypedId::new(
+        k.cap_space(k.root_cap_space)
+            .and_then(|t| t.lookup(cap))
+            .map(|c| c.object.id.as_u32())?,
+    );
+    let phys = k.untyped_mut(uid)?.base().as_usize();
+    Some((cap, phys))
+}
+
+/// Real x86_64 paging, proven the same way hal-riscv64's OWN first Sv39
+/// milestone was: build a fresh, hardware-real page table via the
+/// generic `HalInterface` (not this crate's own early-boot identity
+/// map — see `hal_x86_64::memory`'s module doc comment on that being a
+/// SEPARATE, pre-`kernel_main` table), activate it, `map_range` one
+/// fresh 4 KiB page at a VA no identity leaf covers, write a sentinel
+/// through that VA, and cross-check it against the SAME physical frame
+/// read through its (still-identity-mapped) own address — proving the
+/// VA the walker just built genuinely translates to that physical page,
+/// not merely "whatever `map_range` happened to write is what comes
+/// back". No U-mode / `.user_text` / syscall boundary yet — see
+/// IMPLEMENTATION-PLAN.md for that follow-up (this session's own
+/// `map_ram_identity`/`map_range`/`activate_address_space`/`flush_tlb`
+/// implementations are the piece it is gated on).
+///
+/// Runs before `kernel_arch_glue::enter` (which still parks — no user
+/// image on this architecture yet); this function's own new page table
+/// stays active afterward (x86_64 cannot return to a "no paging" state
+/// the way riscv64's Bare-mode sentinel does — see
+/// `Cpu::activate_address_space`'s doc comment), which is harmless: it
+/// identity-maps everything the kernel itself needs, same as the
+/// bootloader's own table did.
+#[cfg(target_arch = "x86_64")]
+fn x86_64_paging_selftest(hal: &hal_core::HalInterface, k: &mut kernel_core::KernelState) {
+    let carve = |k: &mut kernel_core::KernelState, align: u64, bytes: u64| {
+        k.untyped_mut(kernel_cap::UntypedId::new(0))
+            .and_then(|u| u.alloc(align, bytes).ok())
+            .map(|p| p.as_usize())
+    };
+
+    // `root_pt`: 3 CONTIGUOUS pages — PML4, its companion PDPT, and a
+    // dedicated PD table for the Local APIC's own identity leaf (see
+    // `hal_x86_64::cpu::x86_64_paging`'s module doc comment, `map_ram_
+    // identity`'s own, on why every `root_frame` needs this THIRD page
+    // now — this call site was a REAL, QEMU-confirmed gap this
+    // session's preemption work found: still carving only 2 pages here
+    // after `map_ram_identity` grew a third-page precondition silently
+    // corrupted `pool` below, the exact "sp_b overwritten while building
+    // sp_a's table" class of bug this file's own `two_space` comment
+    // already documents for a DIFFERENT call site). `pool`: PD/PT
+    // levels `map_range` builds below that PDPT — one of each is enough
+    // for a single 4 KiB test page.
+    let (Some(root_pt), Some(pool), Some(test_phys)) = (
+        carve(k, 4096, 4096 * 3),
+        carve(k, 4096, 4096 * 2),
+        carve(k, 4096, 4096),
+    ) else {
+        kernel_arch_glue::log(format_args!(
+            "x86_64: paging self-test skipped (out of untyped RAM)\r\n"
+        ));
+        return;
+    };
+    // SAFETY: fresh untyped RAM, identity-addressable (this core's
+    // bootloader-built table is still active); single-core. `map_range`
+    // needs the pool pre-zeroed; the test frame starts clean too.
+    unsafe {
+        core::ptr::write_bytes(pool as *mut u8, 0, 4096 * 2);
+        core::ptr::write_bytes(test_phys as *mut u8, 0, 4096);
+    }
+
+    hal.map_ram_identity(root_pt, 3, false);
+    // A VA in GiB 3 (0xC000_0000) — deliberately ABOVE the 3 GiB
+    // `map_ram_identity` just identity-mapped, so its PDPT slot is still
+    // absent and `map_range` must walk/allocate PD + PT for it, exactly
+    // like the fine-grained mappings a real per-process address space
+    // needs (`.user_text` etc., once that follow-up lands).
+    const TEST_VA: usize = 0xC000_0000;
+    let n = hal.map_range(root_pt, TEST_VA, test_phys, 4096, 1 | 2, pool, 2);
+    if n == u32::MAX {
+        kernel_arch_glue::log(format_args!("x86_64: paging self-test FAILED (map_range error)\r\n"));
+        return;
+    }
+    hal.activate_address_space(root_pt);
+    hal.flush_tlb();
+
+    // SAFETY: `TEST_VA` was just mapped R+W by `map_range`, backed by
+    // `test_phys` — writing through it and reading `test_phys` back
+    // through its own (still identity-mapped, GiB 0-2) VA proves the
+    // walker's translation is genuinely correct, not merely "whatever
+    // was written comes back through the same pointer".
+    let (via_va, via_identity) = unsafe {
+        core::ptr::write_volatile(TEST_VA as *mut u32, 0x5eed_5eed);
+        (
+            core::ptr::read_volatile(TEST_VA as *const u32),
+            core::ptr::read_volatile(test_phys as *const u32),
+        )
+    };
+    kernel_arch_glue::log(format_args!(
+        "x86_64: MMU read/write self-test - wrote {:#x} at VA {:#x}, read back {:#x}, kernel sees {:#x} at PA {:#x} -> {}\r\n",
+        0x5eed_5eed_u32,
+        TEST_VA,
+        via_va,
+        via_identity,
+        test_phys,
+        if via_va == 0x5eed_5eed && via_identity == 0x5eed_5eed {
+            "OK"
+        } else {
+            "MISMATCH"
+        }
+    ));
+}
+
+/// The syscall handler the HAL trap vector calls for an `ecall` from
+/// U-mode (registered via `hal_riscv64::set_syscall_handler`). Runs at
+/// S-mode privilege.
+#[cfg(target_arch = "riscv64")]
+fn simurgh_syscall(
+    a7: usize,
+    a0: usize,
+    a1: usize,
+    _a2: usize,
+    _a3: usize,
+    _a4: usize,
+) -> hal_riscv64::cpu::TrapOutcome {
+    use hal_riscv64::cpu::TrapOutcome;
+    use kernel_core::{SyscallOp, SyscallReturn};
+    use kernel_mm::KernelObjectType;
+
+    // Two-process hand-off / reporting arms resolve to a non-`Resume`
+    // outcome or run before the object-model borrow below.
+    match a7 {
+        sys::P2_YIELD => {
+            #[cfg(feature = "desktop")]
+            let yielded = kernel_arch_glue::desktop_yield(hal_riscv64::cpu::wfi);
+            #[cfg(not(feature = "desktop"))]
+            let yielded = kernel_arch_glue::p2_yield();
+            return match yielded {
+                Some((save, into)) => TrapOutcome::SwitchTo { save, into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::P2_REPORT_A => {
+            kernel_arch_glue::p2_report_a(a0);
+            return TrapOutcome::Resume(0);
+        }
+        sys::P2_REPORT_B => {
+            kernel_arch_glue::p2_report_b(a0);
+            return TrapOutcome::Resume(0);
+        }
+        sys::P2_PREEMPT_START => {
+            spawn_device_manager(kernel_arch_glue::khal());
+            // security-broker is now spawned earlier, sequentially, by
+            // `sys::SBI_DEMO_START` (see that arm's own doc comment for
+            // why) — NOT spawned again here.
+            let _ = spawn_init(kernel_arch_glue::khal());
+            let _ = spawn_account_manager(kernel_arch_glue::khal());
+            kernel_arch_glue::set_backup_manager_tid(spawn_backup_manager(kernel_arch_glue::khal()));
+            kernel_arch_glue::set_diagnostics_manager_tid(spawn_diagnostics_manager(kernel_arch_glue::khal()));
+            let _ = spawn_store(kernel_arch_glue::khal());
+            let _ = spawn_native_loader(kernel_arch_glue::khal());
+            let _ = spawn_policy_engine(kernel_arch_glue::khal());
+            // Gated exactly as in `simurgh_syscall_x86`'s own
+            // `P2_PREEMPT_START` arm — see it, and `kernel_arch_glue::
+            // p2_gate_fault_demo`'s own doc comment, for the rationale.
+            kernel_arch_glue::p2_gate_fault_demo(spawn_faulty_driver(kernel_arch_glue::khal()));
+            return match kernel_arch_glue::p2_preempt_start() {
+                Some((save, into)) => TrapOutcome::SwitchTo { save, into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::DM_REPORT => {
+            let name = match a0 {
+                0 => "Starting",
+                1 => "Running",
+                2 => "Restarting",
+                3 => "Failed",
+                _ => "?",
+            };
+            kernel_arch_glue::log(format_args!(
+                "device-manager (U-mode, isolated subsystem process): state={name} restarts_in_window={a1}\r\n"
+            ));
+            if a0 == 3 {
+                // `Failed`: device-manager has given up and drops into
+                // its own "spin forever" idle (matches every other demo
+                // process's convention) — it will never again call
+                // `DM_WAIT_CRASH`/`DM_RESPAWN_DRIVER`, so it must stop
+                // being exempt from ordinary preemption (`p2_tick`'s
+                // `DM_TID` check), or it would monopolize the CPU forever
+                // and starve A/B/C's own fairness demo. A real bug hit
+                // via QEMU: `s_timer` fired ~12500 times in a tight
+                // re-arm loop with zero forward progress once
+                // device-manager's exemption outlived its purpose.
+                //
+                // See the x86_64 handler's own arm for the additive
+                // general-thread-exit cross-check below, which must run
+                // before `p2_dm_supervision_done` purely for log ordering.
+                kernel_arch_glue::p2_verify_watched_driver_exit_query(kernel_arch_glue::khal());
+                kernel_arch_glue::p2_dm_supervision_done();
+            }
+            return TrapOutcome::Resume(0);
+        }
+        sys::NL_REPORT => {
+            if a0 == 1 {
+                kernel_arch_glue::log(format_args!(
+                    "native-loader (U-mode): real request_capability round trip to security-broker succeeded, object_ref={a1:#x}\r\n"
+                ));
+            } else {
+                kernel_arch_glue::log(format_args!(
+                    "native-loader (U-mode): real request_capability round trip to security-broker returned Err\r\n"
+                ));
+            }
+            return TrapOutcome::Resume(0);
+        }
+        sys::IN_REPORT => {
+            kernel_arch_glue::log(format_args!(
+                "init (U-mode): self_check started {a0} unit(s), real_spawn_demo succeeded={}, real_manifest_read_demo succeeded={} (not wired on this arch yet)\r\n",
+                a1 & 1 == 1,
+                a1 & 2 == 2
+            ));
+            return TrapOutcome::Resume(0);
+        }
+        sys::SB_REPORT => {
+            kernel_arch_glue::log(format_args!(
+                "security-broker (U-mode): served a real service call from requester#{a0}, granted={}\r\n",
+                a1 == 1
+            ));
+            return TrapOutcome::Resume(0);
+        }
+        sys::POWER_CONTROL => {
+            let hal = kernel_arch_glue::khal();
+            kernel_arch_glue::log(format_args!(
+                "root task (riscv64): real POWER_CONTROL syscall - {}\r\n",
+                if a0 == 0 { "reboot" } else { "shutdown" }
+            ));
+            if a0 == 0 {
+                hal.reboot();
+            } else {
+                hal.shutdown();
+            }
+        }
+        sys::DM_WAIT_CRASH => {
+            return match kernel_arch_glue::p2_dm_wait_crash() {
+                Some((save, into)) => TrapOutcome::SwitchTo { save, into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::DM_POLL_CRASH => {
+            return TrapOutcome::Resume(kernel_arch_glue::p2_poll_crash());
+        }
+        sys::DM_RESPAWN_DRIVER => {
+            return match spawn_faulty_driver(kernel_arch_glue::khal()) {
+                Some(new_tid) => match kernel_arch_glue::p2_dm_handoff_to_driver(new_tid) {
+                    Some((save, into)) => TrapOutcome::SwitchTo { save, into },
+                    None => TrapOutcome::Resume(0),
+                },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        // Real Call/Recv/Reply demo (see `sys::IPC_DEMO_START`'s own doc
+        // comment) — every arm here calls `kernel_arch_glue::kstate().
+        // sched.running()` for "who trapped", not the hardcoded `root`
+        // every OTHER opcode above uses: those are only ever called BY
+        // root in this demo, but IPC_RECV/IPC_REPLY are called by the
+        // SERVER thread too.
+        sys::IPC_DEMO_START => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate()
+                .sched
+                .running()
+                .unwrap_or(kernel_arch_glue::kstate().root_thread);
+            return match kernel_arch_glue::p2_ipc_demo_start(hal, caller, umode_ipc_server as usize) {
+                Some((ep, save, into)) => {
+                    // SAFETY: single-core; only this arm writes G_IPC_EP,
+                    // before either the client or the server can read it.
+                    unsafe { core::ptr::addr_of_mut!(G_IPC_EP).write(ep) };
+                    TrapOutcome::SwitchTo { save, into }
+                }
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::IPC_ENDPOINT_CAP => {
+            // SAFETY: single-core; written once by IPC_DEMO_START before
+            // either caller of this opcode can run.
+            return TrapOutcome::Resume(unsafe { core::ptr::addr_of!(G_IPC_EP).read() } as usize);
+        }
+        sys::IPC_CALL => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate()
+                .sched
+                .running()
+                .unwrap_or(kernel_arch_glue::kstate().root_thread);
+            return match kernel_arch_glue::p2_ipc_call(hal, caller, a0 as u32, a1 as u64) {
+                Some(sw) => {
+                    match sw.poke {
+                        Some((p0, p1)) => {
+                            // SAFETY: `sw.into` is a kernel-owned,
+                            // currently not-executing
+                            // `HAL_USER_CONTEXT_BYTES` blob —
+                            // `p2_ipc_call`'s own contract.
+                            unsafe { hal_riscv64::cpu::poke_saved_a0_a1(sw.into as *mut u8, p0, p1) };
+                            // A genuine `do_send` fast-path direct
+                            // delivery (`poke.is_some()` — `p2_ipc_call`'s
+                            // own doc comment) — the L4-style
+                            // register-only fast path
+                            // (02-Microkernel-Layer.md §5.3/§8.3) is safe
+                            // here. See `hal_riscv64::cpu::TrapOutcome::
+                            // SwitchToFast`'s own doc comment for exactly
+                            // which registers this skips and why.
+                            TrapOutcome::SwitchToFast { save: sw.save, into: sw.into }
+                        }
+                        // **Real bug found via QEMU** (real-IPC plan Phase
+                        // 2): `poke.is_none()` here means `do_send` did
+                        // NOT deliver directly — `n` is a general
+                        // `pick_next` fallback pick (`p2_ipc_call`'s own
+                        // doc comment on its `Reschedule{next:Some(n)}`
+                        // arm), which can be ANY `Ready` thread
+                        // system-wide, not a cooperating participant in
+                        // the fast path's own narrow register-set
+                        // convention — same bug/fix as `SBS_IPC_RECV`'s
+                        // own arm (that one's doc comment has the full
+                        // real-crash story: `SwitchToFast` zeroing `rcx`
+                        // out from under the §8.4 demo's own process C).
+                        None => TrapOutcome::SwitchTo { save: sw.save, into: sw.into },
+                    }
+                }
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::IPC_RECV => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate()
+                .sched
+                .running()
+                .unwrap_or(kernel_arch_glue::kstate().root_thread);
+            return match kernel_arch_glue::p2_ipc_recv(hal, caller, a0 as u32) {
+                Some(kernel_arch_glue::IpcRecvOutcome::Immediate { from, label }) => {
+                    TrapOutcome::Resume2(from, label)
+                }
+                Some(kernel_arch_glue::IpcRecvOutcome::Switch(sw)) => {
+                    // `poke` is always `None` here — WE are the one
+                    // blocking (nothing to poke into our own trap; the
+                    // ordinary `Resume`/`Resume2` path handles that),
+                    // not being woken via a direct hand-off.
+                    // The L4-style register-only fast path
+                    // (02-Microkernel-Layer.md §5.3/§8.3) — see
+                    // `hal_riscv64::cpu::TrapOutcome::SwitchToFast`'s own
+                    // doc comment for exactly which registers this skips
+                    // and why it is safe to.
+                    TrapOutcome::SwitchToFast { save: sw.save, into: sw.into }
+                }
+                None => TrapOutcome::Resume2(0, 0),
+            };
+        }
+        sys::SBS_IPC_RECV => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate()
+                .sched
+                .running()
+                .unwrap_or(kernel_arch_glue::kstate().root_thread);
+            // fs-native and Compositor are REAL, general multi-client
+            // `SBS_IPC_RECV` callers (`simurgh-file-manager`/`Simurgh-UI-
+            // Template01`'s own edges, this session), but EACH needs the
+            // narrow, hardcoded-root dispatch for its own Root-Task-only
+            // bootstrap phase — see `kernel_arch_glue::G_FS_ROOT_ONLY_
+            // PHASE`/`G_COMPOSITOR_ROOT_ONLY_PHASE`'s own doc comments for
+            // the real QEMU-confirmed hangs `fs_native_recv`/
+            // `compositor_native_recv` fix. Every other `SBS_IPC_RECV`
+            // caller (`security-broker`, `policy-engine`, ...) is
+            // unaffected — both checks are `false` for them.
+            let ipc_recv_outcome = if kernel_arch_glue::fs_tid() == Some(caller) {
+                kernel_arch_glue::fs_native_recv(hal, caller, a0 as u32)
+            } else if kernel_arch_glue::compositor_tid() == Some(caller) {
+                kernel_arch_glue::compositor_native_recv(hal, caller, a0 as u32)
+            } else {
+                kernel_arch_glue::p2_ipc_recv_general(hal, caller, a0 as u32)
+            };
+            return match ipc_recv_outcome {
+                Some(kernel_arch_glue::IpcRecvOutcome::Immediate { from, label }) => {
+                    TrapOutcome::Resume2(from, label)
+                }
+                Some(kernel_arch_glue::IpcRecvOutcome::Switch(sw)) => {
+                    // **Real bug found via QEMU** (real-IPC plan Phase 2):
+                    // unlike `IPC_RECV`'s own identical-LOOKING arm (whose
+                    // `p2_ipc_recv` ALWAYS switches to `root_thread`
+                    // specifically, a known participant in the L4 fast
+                    // path's own narrow register-set convention),
+                    // `p2_ipc_recv_general`'s whole POINT is a general
+                    // `pick_next` fallback that can land on ANY `Ready`
+                    // thread system-wide — confirmed via a real QEMU
+                    // crash (`#PF`, cr2=0) where `security-broker`'s own
+                    // `serve_requests` fan-in switched into the §8.4 A/B/C
+                    // fairness demo's process C mid-loop: `SwitchToFast`'s
+                    // own `restore_ipc_fast_context` deliberately ZEROES
+                    // `rcx`/`rdx`/`r8`-`r11` (real SysV caller-saved
+                    // scratch registers for the L4 IPC convention this
+                    // fast path was built for — see `TrapOutcome::
+                    // SwitchToFast`'s own doc comment: "used ONLY by...
+                    // real `IPC_CALL`/`IPC_RECV`/`IPC_REPLY`"), but process
+                    // C's own loop genuinely KEEPS its counter address
+                    // live in `rcx` across the switch — zeroing it turned
+                    // its next `mov eax, [rcx]` into a null-pointer read.
+                    // `SwitchTo` (full, unconditional register restore) is
+                    // exactly what `common_fault_entry`'s/`common_timer_
+                    // entry`'s own `SwitchToFast` arms already fall back
+                    // to for the identical reason ("no basis to assume the
+                    // fast path's narrower register set is safe").
+                    TrapOutcome::SwitchTo { save: sw.save, into: sw.into }
+                }
+                None => TrapOutcome::Resume2(0, 0),
+            };
+        }
+        sys::NOTIF_WAIT => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate()
+                .sched
+                .running()
+                .unwrap_or(kernel_arch_glue::kstate().root_thread);
+            return match kernel_arch_glue::p2_wait_general(hal, caller, a0 as u32) {
+                Some(kernel_arch_glue::WaitOutcome::Immediate(bits)) => TrapOutcome::Resume(bits as usize),
+                Some(kernel_arch_glue::WaitOutcome::Switch(sw)) => {
+                    // Same bug, same fix as `SBS_IPC_RECV`'s own identical
+                    // arm above: `p2_wait_general`'s `next` is a general
+                    // `pick_next` pick too, never the L4 fast path's own
+                    // narrow, cooperating-thread set — `SwitchTo`, not
+                    // `SwitchToFast`.
+                    TrapOutcome::SwitchTo { save: sw.save, into: sw.into }
+                }
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::NOTIF_WAIT_TIMEOUT => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate()
+                .sched
+                .running()
+                .unwrap_or(kernel_arch_glue::kstate().root_thread);
+            // The timeout path pokes (0, 0) into a woken thread's saved
+            // registers from inside the tick handler, which cannot know this
+            // architecture's context layout - so hand it the poke here.
+            kernel_arch_glue::register_saved_reg_poke(hal_riscv64::cpu::poke_saved_a0_a1);
+            return match kernel_arch_glue::p2_wait_timeout_general(hal, caller, a0 as u32, a1 as u64) {
+                Some(kernel_arch_glue::WaitOutcome::Immediate(bits)) => TrapOutcome::Resume(bits as usize),
+                Some(kernel_arch_glue::WaitOutcome::Switch(sw)) => TrapOutcome::SwitchTo { save: sw.save, into: sw.into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::NOTIF_SIGNAL => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate()
+                .sched
+                .running()
+                .unwrap_or(kernel_arch_glue::kstate().root_thread);
+            return match kernel_arch_glue::p2_signal(hal, caller, a0 as u32, a1 as u64) {
+                kernel_arch_glue::SignalOutcome::OkWithPoke { woke, value } => {
+                    if let Some(ctx) = kernel_arch_glue::kstate().thread_context_mut_ptr(woke) {
+                        // SAFETY: `woke` is blocked (not currently
+                        // `Running` -- single-core), so its own saved
+                        // context is not concurrently touched by
+                        // anything else; `SignalOutcome::OkWithPoke`s
+                        // own doc comment.
+                        unsafe { hal_riscv64::cpu::poke_saved_a0_a1(ctx, value as usize, 0) };
+                    }
+                    TrapOutcome::Resume(1)
+                }
+                kernel_arch_glue::SignalOutcome::Ok => TrapOutcome::Resume(1),
+                kernel_arch_glue::SignalOutcome::Failed => TrapOutcome::Resume(0),
+            };
+        }
+        sys::NOTIF_POLL => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate()
+                .sched
+                .running()
+                .unwrap_or(kernel_arch_glue::kstate().root_thread);
+            let bits = kernel_arch_glue::p2_poll(hal, caller, a0 as u32);
+            return TrapOutcome::Resume(bits as usize);
+        }
+        sys::PS_LIST_ENTRY => {
+            return TrapOutcome::Resume(match kernel_arch_glue::ps_list_entry(a0) {
+                Some((tid, state_code)) => ((tid as usize) << 8) | state_code as usize,
+                None => usize::MAX,
+            });
+        }
+        sys::THREAD_EXIT_POLL => {
+            let hal = kernel_arch_glue::khal();
+            // Same `running()`-with-root-fallback shape every other
+            // caller-identifying opcode in this handler uses (see
+            // `sys::NOTIF_POLL` just above). The caller's identity is
+            // load-bearing here, not incidental: it IS the access check
+            // (`kernel_core::SyscallOp::ThreadExitStatus` answers only a
+            // thread's own spawner).
+            let caller = kernel_arch_glue::kstate()
+                .sched
+                .running()
+                .unwrap_or(kernel_arch_glue::kstate().root_thread);
+            let (status, payload) = kernel_arch_glue::p2_thread_exit_status(hal, caller, a0 as u32);
+            // Two registers, not one packed value: the payload can be a
+            // full-width architecture trap cause (this opcode's own doc
+            // comment).
+            return TrapOutcome::Resume2(status, payload);
+        }
+        sys::IN_SUPERVISE_REPORT => {
+            kernel_arch_glue::log(format_args!(
+                "init (U-mode): real post-launch crash-supervision self-check {} - THREAD_EXIT_POLL on its own spawned process returned {}\r\n",
+                if a0 == 1 { "PASSED" } else { "FAILED" },
+                thread_exit_status_name(a1)
+            ));
+            return TrapOutcome::Resume(0);
+        }
+        #[cfg(feature = "desktop")]
+        sys::IDLE_WAIT => {
+            return match kernel_arch_glue::desktop_idle_wait(hal_riscv64::cpu::wfi) {
+                Some((save, into)) => TrapOutcome::SwitchTo { save, into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::SCHED_SET_SYSTEM_POLICY => {
+            return TrapOutcome::Resume(
+                match kernel_arch_glue::set_system_scheduler_policy(a0, a1) {
+                    Some(re_moded) => {
+                        kernel_arch_glue::log(format_args!(
+                            "kernel (riscv64): real SCHED_SET_SYSTEM_POLICY syscall - system \
+                             scheduler mode now {}, aging_cap_ms now {}, {} already-running \
+                             thread(s) re-moded\r\n",
+                            if a0 == 0 { "Interactive" } else { "Throughput" },
+                            a1,
+                            re_moded
+                        ));
+                        re_moded
+                    }
+                    None => {
+                        kernel_arch_glue::log(format_args!(
+                            "kernel (riscv64): SCHED_SET_SYSTEM_POLICY rejected - {} is not a \
+                             real scheduler mode code, nothing changed\r\n",
+                            a0
+                        ));
+                        usize::MAX
+                    }
+                },
+            );
+        }
+        sys::IPC_REPLY => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate()
+                .sched
+                .running()
+                .unwrap_or(kernel_arch_glue::kstate().root_thread);
+            return match kernel_arch_glue::p2_ipc_reply(hal, caller, a0 as u32, a1 as u64) {
+                Some(sw) => {
+                    if let Some((p0, p1)) = sw.poke {
+                        // SAFETY: same contract as IPC_CALL's own poke
+                        // above.
+                        unsafe { hal_riscv64::cpu::poke_saved_a0_a1(sw.into as *mut u8, p0, p1) };
+                    }
+                    // The L4-style register-only fast path
+                    // (02-Microkernel-Layer.md §5.3/§8.3) — see
+                    // `hal_riscv64::cpu::TrapOutcome::SwitchToFast`'s own
+                    // doc comment for exactly which registers this skips
+                    // and why it is safe to.
+                    TrapOutcome::SwitchToFast { save: sw.save, into: sw.into }
+                }
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        // fs-native: the REAL FsRequest/FsResponse wire protocol (see
+        // `sys::FS_DEMO_START`'s own doc comment) — always called by
+        // root in this demo, so `kstate().root_thread` (not `sched.
+        // running()`) is correct here, unlike the generic IPC arms
+        // above (which the SERVER thread also calls).
+        sys::FS_DEMO_START => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            return match kernel_arch_glue::fs_demo_start(hal, caller, FS_NATIVE_ELF, elf_loader::machine::EM_RISCV) {
+                Some((ep, save, into)) => {
+                    // SAFETY: single-core; only this arm writes G_FS_EP,
+                    // before any later FS_OPEN/FS_STAT/FS_CLOSE call.
+                    unsafe { core::ptr::addr_of_mut!(G_FS_EP).write(ep) };
+                    TrapOutcome::SwitchTo { save, into }
+                }
+                None => TrapOutcome::Resume(usize::MAX),
+            };
+        }
+        sys::FS_OPEN => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            // SAFETY: single-core; written once by FS_DEMO_START, before
+            // any FS_OPEN call.
+            let ep = unsafe { core::ptr::addr_of!(G_FS_EP).read() };
+            return match kernel_arch_glue::fs_open_call(hal, caller, ep, a0 as u32, a1 as u32) {
+                Some(sw) => TrapOutcome::SwitchToFast { save: sw.save, into: sw.into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::FS_OPEN_RESULT => {
+            return TrapOutcome::Resume(kernel_arch_glue::fs_open_result());
+        }
+        sys::FS_STAT => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            // SAFETY: same contract as FS_OPEN's own read.
+            let ep = unsafe { core::ptr::addr_of!(G_FS_EP).read() };
+            return match kernel_arch_glue::fs_stat_call(hal, caller, ep, a0 as u32) {
+                Some(sw) => TrapOutcome::SwitchToFast { save: sw.save, into: sw.into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::FS_STAT_RESULT => {
+            return TrapOutcome::Resume(kernel_arch_glue::fs_stat_result());
+        }
+        sys::FS_CLOSE => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            // SAFETY: same contract as FS_OPEN's own read.
+            let ep = unsafe { core::ptr::addr_of!(G_FS_EP).read() };
+            return match kernel_arch_glue::fs_close_call(hal, caller, ep, a0 as u32) {
+                Some(sw) => TrapOutcome::SwitchToFast { save: sw.save, into: sw.into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::FS_CLOSE_RESULT => {
+            return TrapOutcome::Resume(kernel_arch_glue::fs_close_result());
+        }
+        sys::FS_WRITE => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            // SAFETY: same contract as FS_OPEN's own read.
+            let ep = unsafe { core::ptr::addr_of!(G_FS_EP).read() };
+            return match kernel_arch_glue::fs_write_call(hal, caller, ep, a0 as u32) {
+                Some(sw) => TrapOutcome::SwitchToFast { save: sw.save, into: sw.into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::FS_WRITE_RESULT => {
+            return TrapOutcome::Resume(kernel_arch_glue::fs_write_result());
+        }
+        sys::FS_READ => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            // SAFETY: same contract as FS_OPEN's own read.
+            let ep = unsafe { core::ptr::addr_of!(G_FS_EP).read() };
+            return match kernel_arch_glue::fs_read_call(hal, caller, ep, a0 as u32, a1 as u32) {
+                Some(sw) => TrapOutcome::SwitchToFast { save: sw.save, into: sw.into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::FS_READ_RESULT => {
+            return TrapOutcome::Resume(kernel_arch_glue::fs_read_result());
+        }
+        sys::FS_READ_RESULT_QUIET => {
+            return TrapOutcome::Resume(kernel_arch_glue::fs_read_result_quiet());
+        }
+        sys::FS_WRITE_THROUGHPUT_SUMMARY => {
+            kernel_arch_glue::fs_write_throughput_summary(a0, a1);
+            return TrapOutcome::Resume(0);
+        }
+        sys::FS_READ_THROUGHPUT_SUMMARY => {
+            kernel_arch_glue::fs_read_throughput_summary(a0, a1);
+            return TrapOutcome::Resume(0);
+        }
+        sys::DRV_BLK_DEMO_START => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            return match kernel_arch_glue::spawn_virtio_blk_driver(
+                hal,
+                caller,
+                DRIVER_VIRTIO_BLK_ELF,
+                elf_loader::machine::EM_RISCV,
+            ) {
+                Some((ep, save, into)) => {
+                    // SAFETY: single-core; only this arm writes
+                    // G_DRV_EP, before any later DRV_BLK_* call.
+                    unsafe { core::ptr::addr_of_mut!(G_DRV_EP).write(ep) };
+                    TrapOutcome::SwitchTo { save, into }
+                }
+                None => TrapOutcome::Resume(usize::MAX),
+            };
+        }
+        sys::DRV_BLK_PROBE => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            // SAFETY: single-core; written once by DRV_BLK_DEMO_START,
+            // before any DRV_BLK_PROBE call.
+            let ep = unsafe { core::ptr::addr_of!(G_DRV_EP).read() };
+            return match kernel_arch_glue::drv_blk_probe_call(hal, caller, ep) {
+                Some(sw) => TrapOutcome::SwitchToFast { save: sw.save, into: sw.into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::DRV_BLK_PROBE_RESULT => {
+            return TrapOutcome::Resume(kernel_arch_glue::drv_blk_probe_result().0 as usize);
+        }
+        sys::DRV_BLK_WRITE => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            // SAFETY: same contract as DRV_BLK_PROBE's own read.
+            let ep = unsafe { core::ptr::addr_of!(G_DRV_EP).read() };
+            return match kernel_arch_glue::drv_blk_write_call(hal, caller, ep, a0 as u64) {
+                Some(sw) => TrapOutcome::SwitchToFast { save: sw.save, into: sw.into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::DRV_BLK_WRITE_RESULT => {
+            return TrapOutcome::Resume(kernel_arch_glue::drv_blk_write_result());
+        }
+        sys::DRV_BLK_READ => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            // SAFETY: same contract as DRV_BLK_PROBE's own read.
+            let ep = unsafe { core::ptr::addr_of!(G_DRV_EP).read() };
+            return match kernel_arch_glue::drv_blk_read_call(hal, caller, ep, a0 as u64) {
+                Some(sw) => TrapOutcome::SwitchToFast { save: sw.save, into: sw.into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::DRV_BLK_READ_RESULT => {
+            return TrapOutcome::Resume(kernel_arch_glue::drv_blk_read_result());
+        }
+        // `ep` is cached in `G_DRV_NET_EP`, NOT relied upon as this
+        // switching syscall's own "return value" — see x86_64's own
+        // `sys::DRV_NET_DEMO_START` doc comment (this file) for the
+        // full rationale (`IpcSwitch::poke` is always `None` on the
+        // fallback path that eventually resumes `caller` here).
+        sys::DRV_NET_DEMO_START => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            return match kernel_arch_glue::spawn_virtio_net_driver(
+                hal,
+                caller,
+                DRIVER_VIRTIO_NET_ELF,
+                elf_loader::machine::EM_RISCV,
+            ) {
+                Some((ep, save, into)) => {
+                    // SAFETY: single-core; only this arm writes
+                    // G_DRV_NET_EP, before any later NET_DEMO_START call.
+                    unsafe { core::ptr::addr_of_mut!(G_DRV_NET_EP).write(ep) };
+                    TrapOutcome::SwitchTo { save, into }
+                }
+                None => TrapOutcome::Resume(usize::MAX),
+            };
+        }
+        // Netstack: spawns the real Netstack process (`kernel_arch_
+        // glue::spawn_netstack_service`) on top of the driver endpoint
+        // `DRV_NET_DEMO_START` cached, which immediately starts driving
+        // it over real IPC (`sys::IPC_CALL`) — `netstack::subsystem_
+        // entry`'s own module doc comment has the full picture.
+        sys::NET_DEMO_START => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            // SAFETY: single-core; written once by DRV_NET_DEMO_START,
+            // before any NET_DEMO_START call.
+            let drv_ep = unsafe { core::ptr::addr_of!(G_DRV_NET_EP).read() };
+            return match kernel_arch_glue::spawn_netstack_service(
+                hal,
+                caller,
+                NETSTACK_ELF,
+                elf_loader::machine::EM_RISCV,
+                drv_ep,
+            ) {
+                Some((save, into)) => TrapOutcome::SwitchTo { save, into },
+                None => TrapOutcome::Resume(usize::MAX),
+            };
+        }
+        sys::NET_STATUS_POLL => {
+            return TrapOutcome::Resume(kernel_arch_glue::netstack_status());
+        }
+        sys::COMPOSITOR_DEMO_START => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            return match kernel_arch_glue::compositor_demo_start(hal, caller, COMPOSITOR_ELF, elf_loader::machine::EM_RISCV) {
+                Some((ep, save, into)) => {
+                    // SAFETY: single-core; only this arm writes
+                    // G_COMPOSITOR_EP, before any later COMPOSITOR_
+                    // CREATE_SURFACE/COMMIT_BUFFER/DESTROY_SURFACE call.
+                    unsafe { core::ptr::addr_of_mut!(G_COMPOSITOR_EP).write(ep) };
+                    TrapOutcome::SwitchTo { save, into }
+                }
+                None => TrapOutcome::Resume(usize::MAX),
+            };
+        }
+        sys::COMPOSITOR_CREATE_SURFACE => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            // SAFETY: single-core; written once by COMPOSITOR_DEMO_START,
+            // before any COMPOSITOR_CREATE_SURFACE call.
+            let ep = unsafe { core::ptr::addr_of!(G_COMPOSITOR_EP).read() };
+            return match kernel_arch_glue::compositor_create_surface_call(hal, caller, ep) {
+                Some(sw) => TrapOutcome::SwitchToFast { save: sw.save, into: sw.into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::COMPOSITOR_CREATE_SURFACE_RESULT => {
+            return TrapOutcome::Resume(kernel_arch_glue::compositor_create_surface_result());
+        }
+        sys::COMPOSITOR_COMMIT_BUFFER => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            // SAFETY: same contract as COMPOSITOR_CREATE_SURFACE's own read.
+            let ep = unsafe { core::ptr::addr_of!(G_COMPOSITOR_EP).read() };
+            return match kernel_arch_glue::compositor_commit_call(hal, caller, ep, a0 as u32) {
+                Some(sw) => TrapOutcome::SwitchToFast { save: sw.save, into: sw.into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::COMPOSITOR_COMMIT_VERIFY => {
+            return TrapOutcome::Resume(kernel_arch_glue::compositor_commit_verify());
+        }
+        sys::COMPOSITOR_DESTROY_SURFACE => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            // SAFETY: same contract as COMPOSITOR_CREATE_SURFACE's own read.
+            let ep = unsafe { core::ptr::addr_of!(G_COMPOSITOR_EP).read() };
+            return match kernel_arch_glue::compositor_destroy_call(hal, caller, ep, a0 as u32) {
+                Some(sw) => TrapOutcome::SwitchToFast { save: sw.save, into: sw.into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::COMPOSITOR_DESTROY_RESULT => {
+            return TrapOutcome::Resume(kernel_arch_glue::compositor_destroy_result());
+        }
+        sys::MM_DEMO_START => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            return match kernel_arch_glue::mm_demo_start(hal, caller, MM_SERVICE_ELF, elf_loader::machine::EM_RISCV) {
+                Some((ep, save, into)) => {
+                    // SAFETY: single-core; only this arm writes G_MM_EP,
+                    // before any later MM_REGISTER/MM_UNREGISTER/MM_
+                    // QUERY_VICTIM/MM_QUERY_TOTAL_RESIDENT call.
+                    unsafe { core::ptr::addr_of_mut!(G_MM_EP).write(ep) };
+                    TrapOutcome::SwitchTo { save, into }
+                }
+                None => TrapOutcome::Resume(usize::MAX),
+            };
+        }
+        sys::MM_REGISTER => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            // SAFETY: single-core; written once by MM_DEMO_START, before
+            // any MM_REGISTER call.
+            let ep = unsafe { core::ptr::addr_of!(G_MM_EP).read() };
+            return match kernel_arch_glue::mm_register_call(hal, caller, ep, a0 as u32) {
+                Some(sw) => TrapOutcome::SwitchToFast { save: sw.save, into: sw.into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::MM_REGISTER_RESULT => {
+            return TrapOutcome::Resume(kernel_arch_glue::mm_register_result());
+        }
+        sys::MM_UNREGISTER => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            // SAFETY: same contract as MM_REGISTER's own read.
+            let ep = unsafe { core::ptr::addr_of!(G_MM_EP).read() };
+            return match kernel_arch_glue::mm_unregister_call(hal, caller, ep, a0 as u32) {
+                Some(sw) => TrapOutcome::SwitchToFast { save: sw.save, into: sw.into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::MM_UNREGISTER_RESULT => {
+            return TrapOutcome::Resume(kernel_arch_glue::mm_unregister_result());
+        }
+        sys::MM_QUERY_VICTIM => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            // SAFETY: same contract as MM_REGISTER's own read.
+            let ep = unsafe { core::ptr::addr_of!(G_MM_EP).read() };
+            return match kernel_arch_glue::mm_query_victim_call(hal, caller, ep) {
+                Some(sw) => TrapOutcome::SwitchToFast { save: sw.save, into: sw.into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::MM_QUERY_VICTIM_RESULT => {
+            return TrapOutcome::Resume(kernel_arch_glue::mm_query_victim_result());
+        }
+        sys::MM_QUERY_TOTAL_RESIDENT => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            // SAFETY: same contract as MM_REGISTER's own read.
+            let ep = unsafe { core::ptr::addr_of!(G_MM_EP).read() };
+            return match kernel_arch_glue::mm_query_total_resident_call(hal, caller, ep) {
+                Some(sw) => TrapOutcome::SwitchToFast { save: sw.save, into: sw.into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::MM_QUERY_TOTAL_RESIDENT_RESULT => {
+            return TrapOutcome::Resume(kernel_arch_glue::mm_query_total_resident_result());
+        }
+        sys::NET_BYPASS_REQUEST => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            return match kernel_arch_glue::net_bypass_request_call(hal, caller) {
+                Some(sw) => TrapOutcome::SwitchToFast { save: sw.save, into: sw.into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::NET_BYPASS_REQUEST_RESULT => {
+            return TrapOutcome::Resume(kernel_arch_glue::net_bypass_request_result());
+        }
+        sys::NET_STANDARD_SEND_REQUEST => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            return match kernel_arch_glue::net_standard_send_call(hal, caller) {
+                Some(sw) => TrapOutcome::SwitchToFast { save: sw.save, into: sw.into },
+                None => TrapOutcome::Resume(0),
+            };
+        }
+        sys::NET_STANDARD_SEND_REQUEST_RESULT => {
+            return TrapOutcome::Resume(kernel_arch_glue::net_standard_send_result());
+        }
+        sys::NET_LATENCY_SUMMARY => {
+            kernel_arch_glue::net_latency_summary(a0, a1);
+            return TrapOutcome::Resume(0);
+        }
+        sys::NET_BYPASS_SEND => {
+            let hal = kernel_arch_glue::khal();
+            let ns = kernel_arch_glue::net_bypass_direct_send(hal);
+            return TrapOutcome::Resume(ns.map(|v| v as usize).unwrap_or(usize::MAX));
+        }
+        sys::NOW_NS => {
+            let hal = kernel_arch_glue::khal();
+            return TrapOutcome::Resume(hal.now_ns() as usize);
+        }
+        sys::NET_LOG => {
+            return TrapOutcome::Resume(kernel_arch_glue::netstack_log(a0));
+        }
+        sys::MM_QUERY_TOTAL_RESIDENT_RESULT_QUIET => {
+            return TrapOutcome::Resume(kernel_arch_glue::mm_query_total_resident_result_quiet());
+        }
+        sys::CAP_GRANT => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate()
+                .sched
+                .running()
+                .unwrap_or(kernel_arch_glue::kstate().root_thread);
+            let target_thread = a0 as u32;
+            let cap = a1 as u32;
+            let rights_bits = (a1 >> 32) as u32;
+            return TrapOutcome::Resume(
+                match kernel_arch_glue::cap_grant(hal, caller, target_thread, cap, rights_bits) {
+                    Some(dst) => dst.as_u32() as usize,
+                    None => usize::MAX,
+                },
+            );
+        }
+        sys::CAP_REVOKE => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate()
+                .sched
+                .running()
+                .unwrap_or(kernel_arch_glue::kstate().root_thread);
+            return TrapOutcome::Resume(match kernel_arch_glue::cap_revoke(hal, caller, a0 as u32) {
+                Some(freed) => freed as usize,
+                None => usize::MAX,
+            });
+        }
+        // security-broker-intermediary (Issue #28). Spawns security-
+        // broker itself HERE (sequentially, before `P2_PREEMPT_START`)
+        // rather than reading a global written by that handler:
+        // `P2_PREEMPT_START`'s own ecall normally never returns to
+        // `.user_text` in the success case (it switches straight into the
+        // preemption phase) — see this file's own `sys::P2_PREEMPT_START`
+        // doc comment — so any `.user_text` opcode issued sequentially
+        // AFTER it is dead code. This opcode therefore runs BEFORE
+        // `P2_PREEMPT_START`, mirroring fs-native/compositor/mm-service's
+        // own `*_DEMO_START` opcodes exactly.
+        sys::SBI_DEMO_START => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            let Some(security_broker_tid) = spawn_security_broker(hal) else {
+                return TrapOutcome::Resume(usize::MAX);
+            };
+            return match kernel_arch_glue::security_broker_intermediary_demo_start(
+                hal,
+                caller,
+                SECURITY_BROKER_INTERMEDIARY_ELF,
+                elf_loader::machine::EM_RISCV,
+                security_broker_tid,
+            ) {
+                Some((ep, save, into)) => {
+                    // SAFETY: single-core; only this arm writes G_SBI_EP,
+                    // before any SBI_ENDPOINT_CAP/SBI_CAP_GRANT call.
+                    unsafe { core::ptr::addr_of_mut!(G_SBI_EP).write(ep) };
+                    TrapOutcome::SwitchTo { save, into }
+                }
+                None => TrapOutcome::Resume(usize::MAX),
+            };
+        }
+        sys::SBI_ENDPOINT_CAP => {
+            // SAFETY: single-core; written once by SBI_DEMO_START.
+            return TrapOutcome::Resume(unsafe { core::ptr::addr_of!(G_SBI_EP).read() } as usize);
+        }
+        sys::SBI_CAP_GRANT => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            // `cap: 2` / `rights: READ|WRITE` (`0b011`, `kernel_cap::
+            // CapabilityRights`'s own bit layout) are fixed for this demo
+            // — see `security_broker_intermediary_demo_start`'s own doc
+            // comment on why slot 2 is always the demo resource.
+            return match kernel_arch_glue::sbi_cap_grant_call(hal, caller, a0 as u32, a1 as u32, 2, 0b011) {
+                Some(sw) => {
+                    if let Some((p0, p1)) = sw.poke {
+                        // SAFETY: `sw.into` is a kernel-owned, currently
+                        // not-executing `HAL_USER_CONTEXT_BYTES` blob —
+                        // `sbi_cap_grant_call`'s own contract (mirrors
+                        // `p2_ipc_call`'s).
+                        unsafe { hal_riscv64::cpu::poke_saved_a0_a1(sw.into as *mut u8, p0, p1) };
+                    }
+                    TrapOutcome::SwitchToFast { save: sw.save, into: sw.into }
+                }
+                None => TrapOutcome::Resume(usize::MAX),
+            };
+        }
+        sys::SBI_CAP_GRANT_RESULT => {
+            let dst = kernel_arch_glue::sbi_cap_grant_result();
+            if dst == usize::MAX {
+                kernel_arch_glue::log(format_args!(
+                    "root task: security-broker-intermediary CapGrant FAILED (Issue #28)\r\n"
+                ));
+            } else {
+                kernel_arch_glue::log(format_args!(
+                    "root task: security-broker-intermediary minted a REAL capability into security-broker's own cap space at slot {dst} (Issue #28, end-to-end proof)\r\n"
+                ));
+            }
+            return TrapOutcome::Resume(dst);
+        }
+        sys::SBI_CAP_REVOKE => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            // `cap: 2` — the SAME demo resource `SBI_CAP_GRANT` copied a
+            // derived child of into security-broker's own cap space; see
+            // `sys::SBI_CAP_REVOKE`'s own doc comment.
+            return match kernel_arch_glue::sbi_cap_revoke_call(hal, caller, a0 as u32, 2) {
+                Some(sw) => {
+                    if let Some((p0, p1)) = sw.poke {
+                        // SAFETY: `sw.into` is a kernel-owned, currently
+                        // not-executing `HAL_USER_CONTEXT_BYTES` blob —
+                        // `sbi_cap_revoke_call`'s own contract.
+                        unsafe { hal_riscv64::cpu::poke_saved_a0_a1(sw.into as *mut u8, p0, p1) };
+                    }
+                    TrapOutcome::SwitchToFast { save: sw.save, into: sw.into }
+                }
+                None => TrapOutcome::Resume(usize::MAX),
+            };
+        }
+        sys::SBI_CAP_REVOKE_RESULT => {
+            let freed = kernel_arch_glue::sbi_cap_revoke_result();
+            if freed == usize::MAX {
+                kernel_arch_glue::log(format_args!(
+                    "root task: security-broker-intermediary CapRevoke FAILED (Issue #28)\r\n"
+                ));
+            } else {
+                kernel_arch_glue::log(format_args!(
+                    "root task: security-broker-intermediary revoked the demo capability — {freed} slot(s) freed across BOTH capability spaces (Issue #28, cross-space revoke proof)\r\n"
+                ));
+            }
+            return TrapOutcome::Resume(freed);
+        }
+        sys::SBI_CAP_GRANT2 => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            // `cap: 5` / `target_service` (`a1`, `kernel_arch_glue::
+            // SBI_TARGET_MM_SERVICE` for this demo) — a SECOND real
+            // target, proving `target_service` resolution generalizes
+            // (`security_broker_intermediary_demo_start`'s own slot 3/4
+            // doc comment).
+            return match kernel_arch_glue::sbi_cap_grant_call(hal, caller, a0 as u32, a1 as u32, 5, 0b011) {
+                Some(sw) => {
+                    if let Some((p0, p1)) = sw.poke {
+                        // SAFETY: `sw.into` is a kernel-owned, currently
+                        // not-executing `HAL_USER_CONTEXT_BYTES` blob —
+                        // `sbi_cap_grant_call`'s own contract.
+                        unsafe { hal_riscv64::cpu::poke_saved_a0_a1(sw.into as *mut u8, p0, p1) };
+                    }
+                    TrapOutcome::SwitchToFast { save: sw.save, into: sw.into }
+                }
+                None => TrapOutcome::Resume(usize::MAX),
+            };
+        }
+        sys::SBI_CAP_GRANT2_RESULT => {
+            let dst = kernel_arch_glue::sbi_cap_grant_result();
+            if dst == usize::MAX {
+                kernel_arch_glue::log(format_args!(
+                    "root task: security-broker-intermediary CapGrant (2nd target, mm-service) FAILED or skipped (Issue #28)\r\n"
+                ));
+            } else {
+                kernel_arch_glue::log(format_args!(
+                    "root task: security-broker-intermediary minted a REAL capability into mm-service's own cap space at slot {dst} (Issue #28, multi-target proof)\r\n"
+                ));
+            }
+            return TrapOutcome::Resume(dst);
+        }
+        sys::SBI_CAP_REVOKE2 => {
+            let hal = kernel_arch_glue::khal();
+            let caller = kernel_arch_glue::kstate().root_thread;
+            return match kernel_arch_glue::sbi_cap_revoke_call(hal, caller, a0 as u32, 5) {
+                Some(sw) => {
+                    if let Some((p0, p1)) = sw.poke {
+                        // SAFETY: `sw.into` is a kernel-owned, currently
+                        // not-executing `HAL_USER_CONTEXT_BYTES` blob —
+                        // `sbi_cap_revoke_call`'s own contract.
+                        unsafe { hal_riscv64::cpu::poke_saved_a0_a1(sw.into as *mut u8, p0, p1) };
+                    }
+                    TrapOutcome::SwitchToFast { save: sw.save, into: sw.into }
+                }
+                None => TrapOutcome::Resume(usize::MAX),
+            };
+        }
+        sys::SBI_CAP_REVOKE2_RESULT => {
+            let freed = kernel_arch_glue::sbi_cap_revoke_result();
+            if freed == usize::MAX {
+                kernel_arch_glue::log(format_args!(
+                    "root task: security-broker-intermediary CapRevoke (2nd target) FAILED or skipped (Issue #28)\r\n"
+                ));
+            } else {
+                kernel_arch_glue::log(format_args!(
+                    "root task: security-broker-intermediary revoked the 2nd demo capability — {freed} slot(s) freed (Issue #28, multi-target proof)\r\n"
+                ));
+            }
+            return TrapOutcome::Resume(freed);
+        }
+        sys::DRV_IRQ_WAIT => {
+            let hal = kernel_arch_glue::khal();
+            // Discovered ONCE, before the retry loop below — see
+            // `kernel_arch_glue::drv_irq_wait_step`'s own doc comment
+            // for why re-discovering it on every iteration (via
+            // `sched.running()`, which the FIRST `Blocked` outcome's
+            // own `note_blocked` call clears) is a real bug, not a
+            // harmless simplification.
+            let caller = kernel_arch_glue::kstate()
+                .sched
+                .running()
+                .unwrap_or(kernel_arch_glue::kstate().root_thread);
+            // Real interrupt-driven idle wait (03-Kernel-Subsystems-
+            // Layer.md §2.1/§5.1): `drv_irq_wait_step` issues ONE
+            // `SyscallOp::Wait`. `Blocked` means the caller (the
+            // virtio-blk driver process, via `kernel_core::syscall::
+            // do_wait`'s own `note_blocked` call) is now genuinely off
+            // the scheduler's Ready pool with nothing else runnable at
+            // this point in the boot sequence (the preemptive timer
+            // is not armed yet) — rather than needing a generic
+            // "pick_next / switch to whoever's next, or truly idle"
+            // mechanism nothing else in this codebase has ever needed,
+            // this loop stays in the SAME trap context (no context
+            // switch happens or is needed) and halts the core (`wfi`)
+            // until an interrupt actually fires. The virtio-blk IRQ's
+            // own trampoline (`kernel_arch_glue::virtio_blk_irq_
+            // trampoline`, installed by `IrqBind`) signals the
+            // notification and marks the caller `Ready` again from
+            // INSIDE that interrupt; when `wfi` returns (control
+            // resumes right here — no switch ever happened), the loop
+            // re-issues `Wait`, which now sees the pending bits.
+            loop {
+                match kernel_arch_glue::drv_irq_wait_step(hal, caller, a0 as u32) {
+                    kernel_arch_glue::IrqWaitOutcome::Ready(bits) => {
+                        return TrapOutcome::Resume(bits as usize);
+                    }
+                    kernel_arch_glue::IrqWaitOutcome::Blocked => {
+                        hal_riscv64::cpu::wfi();
+                    }
+                    kernel_arch_glue::IrqWaitOutcome::Error => {
+                        return TrapOutcome::Resume(0);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+
+    let k = kernel_arch_glue::kstate();
+    let hal = kernel_arch_glue::khal();
+    let root = k.root_thread;
+
+    let ret: usize = match a7 {
+        sys::DEBUG_LOG => {
+            // SAFETY: MVP single-address-space (satp=0). `a0..a0+a1` is a
+            // byte range in the shared address space; treat invalid UTF-8
+            // leniently. A real kernel validates the pointer against the
+            // caller's address space first.
+            let bytes = unsafe { core::slice::from_raw_parts(a0 as *const u8, a1) };
+            let text = core::str::from_utf8(bytes).unwrap_or("<non-utf8>");
+            kernel_arch_glue::log(format_args!("{}", text));
+            0
+        }
+        sys::RETYPE_ENDPOINT => {
+            // `retype_one_from_any_untyped`, not a hardcoded
+            // `CapId::new(0)` — see that helper's own doc comment for the
+            // real aarch64 boot crash a pinned slot 0 caused.
+            match kernel_arch_glue::retype_one_from_any_untyped(
+                k,
+                hal,
+                root,
+                KernelObjectType::Endpoint,
+                1,
+            ) {
+                Some(cap) => cap.as_u32() as usize,
+                None => usize::MAX,
+            }
+        }
+        sys::MAP_PAGE => {
+            // Retype a real Frame (Untyped) capability, then the REAL,
+            // capability-gated `Map` syscall: `do_map` resolves
+            // `page_table` (WRITE) and `frame` (rights matching `perms`),
+            // records the software-model mapping, AND walks a genuine
+            // Sv39 leaf into the LIVE page table (the map pool `enter`
+            // installed makes this real, not just a model update).
+            let (frame_cap, frame_phys) = match alloc_root_frame(k, hal) {
+                Some(f) => f,
+                None => return TrapOutcome::Resume(usize::MAX),
+            };
+            match k.dispatch(
+                root,
+                hal.now_ns(),
+                SyscallOp::Map {
+                    page_table: k.root_page_table_cap,
+                    frame: frame_cap,
+                    vaddr: hal_core::VirtAddr::new(a0),
+                    perms: hal_core::MapPermissions::KERNEL_DATA,
+                },
+                hal,
+            ) {
+                Ok(SyscallReturn::Mapped) => {}
+                _ => return TrapOutcome::Resume(usize::MAX),
+            }
+            // SAFETY: single-core syscall path; only written here.
+            unsafe {
+                core::ptr::addr_of_mut!(LAST_MAPPED_FRAME).write(frame_phys);
+                core::ptr::addr_of_mut!(LAST_MAPPED_FRAME_CAP).write(frame_cap.as_u32());
+            }
+            frame_phys
+        }
+        sys::MAP_ALIAS => {
+            // SAFETY: single-core; set by the last MAP_PAGE.
+            let (frame_phys, frame_cap) = unsafe {
+                (
+                    core::ptr::addr_of!(LAST_MAPPED_FRAME).read(),
+                    kernel_cap::CapId::new(core::ptr::addr_of!(LAST_MAPPED_FRAME_CAP).read()),
+                )
+            };
+            if frame_phys == 0 {
+                return TrapOutcome::Resume(usize::MAX);
+            }
+            // Map the SAME Frame capability at a second VA — the
+            // capability-gated form of the alias: the kernel does not
+            // pick or trust a bare physical address, `do_map` resolves
+            // `frame_cap` exactly like the first `Map` did.
+            match k.dispatch(
+                root,
+                hal.now_ns(),
+                SyscallOp::Map {
+                    page_table: k.root_page_table_cap,
+                    frame: frame_cap,
+                    vaddr: hal_core::VirtAddr::new(a0),
+                    perms: hal_core::MapPermissions::KERNEL_DATA,
+                },
+                hal,
+            ) {
+                Ok(SyscallReturn::Mapped) => {}
+                _ => return TrapOutcome::Resume(usize::MAX),
+            }
+            0
+        }
+        sys::TRANSLATE => match k
+            .addr_space_mut(k.root_addr_space)
+            .and_then(|s| s.translate(hal_core::VirtAddr::new(a0)))
+        {
+            Some((pa, _perms)) => pa.as_usize(),
+            None => usize::MAX,
+        },
+        sys::ALIVE => {
+            kernel_arch_glue::log(format_args!(
+                "root task (U-mode, ISOLATED under Sv39): alive, made an ecall from U=1 pages\r\n"
+            ));
+            0
+        }
+        sys::REPORT => {
+            kernel_arch_glue::log(format_args!(
+                "root task (U-mode): ecall result = {:#x}\r\n",
+                a0
+            ));
+            0
+        }
+        sys::XCHECK => {
+            // `a0` = the physical frame MAP_PAGE returned; `a1` = the u32
+            // the Root Task read back through the alias VA. Read the same
+            // frame through the kernel's own identity map and report
+            // whether the U-mode write, the alias read, and the kernel
+            // view all agree.
+            // SAFETY: `a0` is a frame the kernel just allocated from
+            // untyped and identity-maps `U=0` in the active table; a u32
+            // read from it is valid and non-aliasing here.
+            let at_phys = unsafe { core::ptr::read_volatile(a0 as *const u32) } as usize;
+            let expected = unsafe { core::ptr::addr_of!(LAST_MAPPED_FRAME).read() };
+            let ok = at_phys == a1 && a1 == 0x5EED && a0 == expected;
+            kernel_arch_glue::log(format_args!(
+                "root task (U-mode): zero-copy proof - U-mode wrote {:#x} at VA 0xd0000000, read {:#x} at alias VA 0xd0001000; kernel reads {:#x} at PA {:#x} -> {}\r\n",
+                0x5EED_usize,
+                a1,
+                at_phys,
+                a0,
+                if ok { "ALL THREE AGREE" } else { "MISMATCH" }
+            ));
+            0
+        }
+        _ => usize::MAX,
+    };
+    TrapOutcome::Resume(ret)
+}
+
+/// The preemptive-scheduler tick handler the HAL trap vector calls for a
+/// supervisor timer interrupt taken on a running U-mode thread
+/// (registered via `hal_riscv64::cpu::set_tick_handler`). Delegates the
+/// round-robin decision to `kernel-arch-glue`; `Some((save, into))`
+/// preempts, `None` lets the current thread keep running.
+#[cfg(target_arch = "riscv64")]
+fn simurgh_tick() -> hal_riscv64::cpu::TrapOutcome {
+    use hal_riscv64::cpu::TrapOutcome;
+    match kernel_arch_glue::p2_tick() {
+        Some((save, into)) => TrapOutcome::SwitchTo { save, into },
+        None => TrapOutcome::Resume(0),
+    }
+}
+
+/// The per-process fault-isolation handler the HAL trap vector calls for
+/// a synchronous exception taken from a running U-mode thread that is
+/// not an `ecall` (registered via `hal_riscv64::cpu::set_fault_handler`)
+/// — 03-Kernel-Subsystems-Layer.md §2.1/§5.2. Delegates to
+/// `kernel-arch-glue`, which terminates the faulting thread and picks
+/// whatever else is runnable; `Some(into)` resumes it, `None` means
+/// nothing else was runnable (fatal — the trap vector falls through to
+/// the system-halt dump in that case).
+#[cfg(target_arch = "riscv64")]
+fn simurgh_fault(cause_code: usize, sepc: usize, stval: usize) -> hal_riscv64::cpu::TrapOutcome {
+    use hal_riscv64::cpu::TrapOutcome;
+    match kernel_arch_glue::p2_fault(cause_code, sepc, stval) {
+        Some(into) => TrapOutcome::Terminate { into },
+        None => TrapOutcome::Resume(0),
+    }
+}
+
+// Linker symbols for the user (layer-3) Root Task image — see
+// hal-riscv64/src/linker.ld's `.user_text` / `.user_stack` sections.
+#[cfg(target_arch = "riscv64")]
+unsafe extern "C" {
+    static __user_text_start: u8;
+    static __user_text_end: u8;
+    static __user_text_lma: u8;
+    static __user_stack_start: u8;
+    static __user_stack_end: u8;
+    static __user_stack_lma: u8;
+}
+
+/// Reads the `.user_*` linker symbols into the descriptor `enter` needs to
+/// map the Root Task's pages `U=1` before dropping to U-mode.
+#[cfg(target_arch = "riscv64")]
+fn user_image() -> kernel_arch_glue::UserImage {
+    let sym = |s: &u8| s as *const u8 as usize;
+    // SAFETY: these are linker-defined addresses, taken by reference only,
+    // never dereferenced — the standard idiom for consuming linker script
+    // symbols.
+    unsafe {
+        kernel_arch_glue::UserImage {
+            text_vma: sym(&__user_text_start),
+            text_lma: sym(&__user_text_lma),
+            text_len: sym(&__user_text_end) - sym(&__user_text_start),
+            stack_vma: sym(&__user_stack_start),
+            stack_lma: sym(&__user_stack_lma),
+            stack_len: sym(&__user_stack_end) - sym(&__user_stack_start),
+            entry_vma: umode_root as usize,
+            worker_entry_vma: umode_worker as usize,
+            subsystem_entry_vma: umode_subsystem as usize,
+            a_loop_entry_vma: {
+                #[cfg(feature = "desktop")]
+                { umode_idle_loop as usize }
+                #[cfg(not(feature = "desktop"))]
+                { umode_a_loop as usize }
+            },
+        }
+    }
+}
+
+/// Layer-3 subsystems as processes (IMPLEMENTATION-PLAN.md follow-up):
+/// runs `root-task`'s REAL `plan_boot` (not a re-derived shortcut) and
+/// launches Device Manager — `Service::BOOT_ORDER[0]` — as a genuinely
+/// isolated process via the SAME generic `kernel_arch_glue::spawn_process`
+/// that spawns this demo's own process C, so it joins the SAME
+/// preemption loop. Called once, from the `P2_PREEMPT_START` ecall
+/// handler (the same transition point process C joins at, and for the
+/// same reason: `plan_boot`'s in-kernel computation touches nothing
+/// U-mode-visible, so its timing relative to the cooperative phase
+/// doesn't matter, but doing it here keeps every "who else joins the
+/// preemption loop" decision in one place).
+#[cfg(target_arch = "riscv64")]
+/// Returns the new thread's id (or `None` if spawning failed/skipped) —
+/// needed (same reason `spawn_security_broker`'s own doc comment gives)
+/// so `spawn_security_broker_intermediary`-style callers can mint a REAL
+/// destination-TCB capability for it.
+fn spawn_device_manager(hal: &hal_core::HalInterface) -> Option<kernel_cap::ThreadId> {
+    let k = kernel_arch_glue::kstate();
+
+    // The Root Task's own untyped total stands in for "RAM this boot has
+    // to plan with" at this MVP stage (a real Root Task would sum every
+    // `UntypedMemory` capability it holds, not just query the kernel
+    // directly like this).
+    let total = k.total_untyped_bytes();
+    match root_task::plan_boot(total) {
+        Ok(plan) => {
+            kernel_arch_glue::log(format_args!(
+                "root task: plan_boot({} bytes) - root reserve {} bytes, {} service grant(s), {} bytes free\r\n",
+                total,
+                plan.root_reserve_bytes,
+                plan.grants.len(),
+                plan.free_bytes
+            ));
+            for g in plan.grants.iter() {
+                kernel_arch_glue::log(format_args!(
+                    "root task: plan_boot grant - {:?}: {} bytes\r\n",
+                    g.service, g.bytes
+                ));
+            }
+        }
+        Err(e) => {
+            kernel_arch_glue::log(format_args!(
+                "root task: plan_boot failed: {:?} - device-manager not spawned\r\n",
+                e
+            ));
+            return None;
+        }
+    }
+
+    // Device Manager is BOOT_ORDER[0] — launch it for real, from its OWN
+    // separately-built ELF image (`device-manager-bin`, embedded via
+    // `DEVICE_MANAGER_ELF` below — see `spawn_process_from_elf`'s doc
+    // comment for how this differs from `spawn_process`'s "shares the
+    // kernel's own `.user_text`" approach every other demo process here
+    // still uses) on its OWN fresh stack/address space/capability space.
+    const DM_STACK_VMA: usize = 0xC040_0000;
+    // 64 KiB, not the 16 KiB every other spawned demo process uses:
+    // device-manager's own ecall handlers (`DM_RESPAWN_DRIVER`) now call
+    // BACK INTO `spawn_process` itself, on device-manager's OWN stack (an
+    // `ecall`'s handler runs on the caller's stack — see `raw_syscall`'s
+    // doc comment) — and `kernel`/`kernel-arch-glue`'s unoptimized (`dev`
+    // profile, no per-package `opt-level` override unlike `device-manager`
+    // itself) call chain into `spawn_process` needs real headroom.
+    // **Bug found via QEMU** (`-d int`): with the old 16 KiB, the very
+    // first `DM_RESPAWN_DRIVER` overflowed BELOW `DM_STACK_VMA` (unmapped)
+    // — `trap_entry`'s own prologue then faulted pushing the NEXT trap
+    // frame onto the now-invalid `sp`, an infinite recursive-trap storm
+    // (millions of `store_page_fault`/`fault_store` entries at
+    // `trap_entry`'s first instruction, `tval` walking down from just
+    // below `DM_STACK_VMA` in exact `sizeof(TrapFrame)`=248-byte steps).
+    const DM_STACK_LEN: usize = 4096 * 16;
+    match kernel_arch_glue::spawn_process_from_elf(
+        hal,
+        k,
+        DEVICE_MANAGER_ELF,
+        elf_loader::machine::EM_RISCV,
+        DM_STACK_VMA,
+        DM_STACK_LEN,
+    ) {
+        Some((tid, _cap_space, _stack_phys)) => {
+            kernel_arch_glue::p2_register_device_manager(tid);
+            kernel_arch_glue::log(format_args!(
+                "root task: spawned device-manager (tid {}) from its OWN separately-built ELF image, joining the preemption loop\r\n",
+                tid.as_u32()
+            ));
+            Some(tid)
+        }
+        None => {
+            kernel_arch_glue::log(format_args!(
+                "root task: device-manager spawn skipped (out of resources)\r\n"
+            ));
+            None
+        }
+    }
+}
+
+/// Spawns `security-broker-bin` — `simurgh-security-broker`'s own real
+/// process image, from its own separately-built ELF, mirroring
+/// `spawn_device_manager` exactly. The FIRST layer-4 service this
+/// project spawns as a real process (REPO-simurgh-security-broker.md
+/// §1), not a layer-3 subsystem.
+///
+/// Unlike `device-manager`, this process is granted no capability yet
+/// beyond the implicit ones `spawn_process_from_elf` always sets up
+/// (its own address space / thread) — no `Endpoint` capability grant,
+/// since nothing spawned so far sends it anything (the still-open
+/// `security-broker-intermediary` follow-up, flagged in
+/// `simurgh-security-broker`'s own README, is what a real caller and a
+/// granted Endpoint depend on). `subsystem_entry::subsystem_main`'s own
+/// `IPC_RECV` loop blocks immediately on a capability slot that
+/// currently resolves to nothing — an intentional, honest placeholder
+/// state (see that crate's own doc comment), not a bug: this pass only
+/// proves the process itself boots and its ported `Broker` logic runs
+/// correctly on real hardware (see `self_check` in that crate), not a
+/// working IPC round trip yet.
+/// Returns the new thread's id (or `None` if spawning failed) — needed
+/// now (unlike before Issue #28) so `spawn_security_broker_intermediary`
+/// can mint a REAL destination-TCB capability for it (`kernel_arch_glue::
+/// mint_tcb_cap_into`'s own doc comment). `_cap_space` stays discarded
+/// here: nothing in this pass needs it directly (the intermediary mints
+/// its OWN TCB capability straight from `tid`, not by copying anything
+/// out of security-broker's cap space).
+fn spawn_security_broker(hal: &hal_core::HalInterface) -> Option<kernel_cap::ThreadId> {
+    let k = kernel_arch_glue::kstate();
+
+    const SB_STACK_VMA: usize = 0xC041_0000;
+    /// **Real capacity bug found via QEMU** (real-IPC plan Phase 2): the
+    /// original `4096 * 16` (64 KiB, shared by every other subsystem
+    /// process spawned this way) was sized back when this process ran
+    /// Phase 1's own single, simple `serve_capability_requests` loop.
+    /// Phase 2's `serve_requests` fan-in now calls through 3 separate
+    /// handler paths (`serve_one_capability_request`/`_elevation_
+    /// request`/`_signature_request`), each with its own wire encode/
+    /// decode and (for `_signature_request`) a `StorePackage` built with
+    /// several `String`/`Vec` fields — real stack depth this process
+    /// never exercised before, compiled at `-O0` (larger per-frame stack
+    /// use than a release build). Confirmed via a real QEMU crash: `RIP`
+    /// landed INSIDE this process's own bump-allocator heap region (data,
+    /// never meant to be executed) — the unmistakable signature of a
+    /// stack overflow silently overwriting adjacent memory. Raised to
+    /// `4096 * 64` (256 KiB, 4x) for real headroom, matching this
+    /// project's own established precedent (`Simurgh-OS::kernel_core::
+    /// config::MAX_CAP_SPACES`/`CAP_SLOTS_PER_SPACE`'s own doc comments) —
+    /// left at the shared 64 KiB for every OTHER process spawned here,
+    /// none of which grew this way.
+    const SB_STACK_LEN: usize = 4096 * 64;
+    match kernel_arch_glue::spawn_process_from_elf(
+        hal,
+        k,
+        SECURITY_BROKER_ELF,
+        elf_loader::machine::EM_RISCV,
+        SB_STACK_VMA,
+        SB_STACK_LEN,
+    ) {
+        Some((tid, _cap_space, _stack_phys)) => {
+            kernel_arch_glue::log(format_args!(
+                "root task: spawned security-broker (tid {}) from its OWN separately-built ELF image (simurgh-security-broker repo)\r\n",
+                tid.as_u32()
+            ));
+            Some(tid)
+        }
+        None => {
+            kernel_arch_glue::log(format_args!(
+                "root task: security-broker spawn skipped (out of resources)\r\n"
+            ));
+            None
+        }
+    }
+}
+
+/// Spawns `init-bin` — the SECOND layer-4 process this project spawns as
+/// a real Simurgh-OS subsystem (`simurgh-init`, a separate git repo —
+/// REPO-simurgh-init.md §1: "the very first one the kernel's Root Task
+/// would start, which then starts every other layer-4+ service"). Unlike
+/// `spawn_security_broker`, this process's own real logic
+/// (`init_core::subsystem_entry::self_check`) is entirely self-contained
+/// — it does not yet ask the kernel/intermediary for anything, since no
+/// architecture doc in this project defines a real process-launch
+/// mechanism a non-privileged layer-4 process could call (see that
+/// crate's own `subsystem_entry.rs` module doc) — so, unlike security-
+/// broker, this spawn needs no follow-up `CapGrant`/intermediary dance;
+/// it simply proves the process itself boots and its ported `Init`
+/// DAG-resolution logic runs correctly on real hardware.
+fn spawn_init(hal: &hal_core::HalInterface) -> Option<kernel_cap::ThreadId> {
+    let k = kernel_arch_glue::kstate();
+
+    const INIT_STACK_VMA: usize = 0xC042_0000;
+    const INIT_STACK_LEN: usize = 4096 * 16;
+    match kernel_arch_glue::spawn_process_from_elf(
+        hal,
+        k,
+        INIT_ELF,
+        elf_loader::machine::EM_RISCV,
+        INIT_STACK_VMA,
+        INIT_STACK_LEN,
+    ) {
+        Some((tid, _cap_space, _stack_phys)) => {
+            kernel_arch_glue::log(format_args!(
+                "root task: spawned init (tid {}) from its OWN separately-built ELF image (simurgh-init repo)\r\n",
+                tid.as_u32()
+            ));
+            Some(tid)
+        }
+        None => {
+            kernel_arch_glue::log(format_args!(
+                "root task: init spawn skipped (out of resources)\r\n"
+            ));
+            None
+        }
+    }
+}
+
+/// Spawns `account-manager-bin` — the THIRD layer-4 process this project
+/// spawns as a real Simurgh-OS subsystem (`simurgh-account-manager`, a
+/// separate git repo). Same shape and same reasoning as `spawn_init`:
+/// this process's own real logic (`session_manager::subsystem_entry::
+/// self_check`) is entirely self-contained (no real IPC transport to
+/// `simurgh-security-broker` exists yet on either side), so it simply
+/// proves the process itself boots and its ported account/session logic
+/// runs correctly on real hardware.
+fn spawn_account_manager(hal: &hal_core::HalInterface) -> Option<kernel_cap::ThreadId> {
+    let k = kernel_arch_glue::kstate();
+
+    const ACCOUNT_MANAGER_STACK_VMA: usize = 0xC043_0000;
+    // Bumped alongside `SB_STACK_LEN`/`NATIVE_LOADER_STACK_LEN`'s own
+    // identical fix (`SB_STACK_LEN`'s own doc comment has the full
+    // story) — real headroom for this process's own real-IPC plan
+    // Phase 2 additions.
+    const ACCOUNT_MANAGER_STACK_LEN: usize = 4096 * 64;
+    match kernel_arch_glue::spawn_process_from_elf(
+        hal,
+        k,
+        ACCOUNT_MANAGER_ELF,
+        elf_loader::machine::EM_RISCV,
+        ACCOUNT_MANAGER_STACK_VMA,
+        ACCOUNT_MANAGER_STACK_LEN,
+    ) {
+        Some((tid, _cap_space, _stack_phys)) => {
+            kernel_arch_glue::log(format_args!(
+                "root task: spawned account-manager (tid {}) from its OWN separately-built ELF image (simurgh-account-manager repo)\r\n",
+                tid.as_u32()
+            ));
+            Some(tid)
+        }
+        None => {
+            kernel_arch_glue::log(format_args!(
+                "root task: account-manager spawn skipped (out of resources)\r\n"
+            ));
+            None
+        }
+    }
+}
+
+/// Spawns `backup-manager-bin` — the FOURTH layer-4 process this project
+/// spawns as a real Simurgh-OS subsystem (`simurgh-backup-manager`, a
+/// separate git repo). Same shape and same reasoning as
+/// `spawn_account_manager`: this process's own real logic (`backup_core::
+/// subsystem_entry::self_check`) is entirely self-contained (no real IPC
+/// transport to `simurgh-account-manager`/`simurgh-store` exists yet on
+/// either side), so it simply proves the process itself boots and its
+/// ported backup/restore logic runs correctly on real hardware.
+fn spawn_backup_manager(hal: &hal_core::HalInterface) -> Option<kernel_cap::ThreadId> {
+    let k = kernel_arch_glue::kstate();
+
+    const BACKUP_MANAGER_STACK_VMA: usize = 0xC044_0000;
+    const BACKUP_MANAGER_STACK_LEN: usize = 4096 * 16;
+    match kernel_arch_glue::spawn_process_from_elf(
+        hal,
+        k,
+        BACKUP_MANAGER_ELF,
+        elf_loader::machine::EM_RISCV,
+        BACKUP_MANAGER_STACK_VMA,
+        BACKUP_MANAGER_STACK_LEN,
+    ) {
+        Some((tid, _cap_space, _stack_phys)) => {
+            kernel_arch_glue::log(format_args!(
+                "root task: spawned backup-manager (tid {}) from its OWN separately-built ELF image (simurgh-backup-manager repo)\r\n",
+                tid.as_u32()
+            ));
+            Some(tid)
+        }
+        None => {
+            kernel_arch_glue::log(format_args!(
+                "root task: backup-manager spawn skipped (out of resources)\r\n"
+            ));
+            None
+        }
+    }
+}
+
+/// Spawns `diagnostics-manager-bin` — the FIFTH layer-4 process this
+/// project spawns as a real Simurgh-OS subsystem (`simurgh-diagnostics`,
+/// a separate git repo). Same shape and same reasoning as
+/// `spawn_backup_manager`: this process's own real logic
+/// (`diagnostics_manager::subsystem_entry::self_check`) is entirely
+/// self-contained (no real IPC transport to `Simurgh-OS`'s own Log
+/// Collector or a real network sender exists yet on either side), so it
+/// simply proves the process itself boots and its ported poll/build/
+/// batch-send logic runs correctly on real hardware.
+fn spawn_diagnostics_manager(hal: &hal_core::HalInterface) -> Option<kernel_cap::ThreadId> {
+    let k = kernel_arch_glue::kstate();
+
+    const DIAGNOSTICS_MANAGER_STACK_VMA: usize = 0xC045_0000;
+    const DIAGNOSTICS_MANAGER_STACK_LEN: usize = 4096 * 16;
+    match kernel_arch_glue::spawn_process_from_elf(
+        hal,
+        k,
+        DIAGNOSTICS_MANAGER_ELF,
+        elf_loader::machine::EM_RISCV,
+        DIAGNOSTICS_MANAGER_STACK_VMA,
+        DIAGNOSTICS_MANAGER_STACK_LEN,
+    ) {
+        Some((tid, _cap_space, _stack_phys)) => {
+            kernel_arch_glue::log(format_args!(
+                "root task: spawned diagnostics-manager (tid {}) from its OWN separately-built ELF image (simurgh-diagnostics repo)\r\n",
+                tid.as_u32()
+            ));
+            Some(tid)
+        }
+        None => {
+            kernel_arch_glue::log(format_args!(
+                "root task: diagnostics-manager spawn skipped (out of resources)\r\n"
+            ));
+            None
+        }
+    }
+}
+
+/// Spawns `store-bin` — the SIXTH layer-4 process this project spawns
+/// as a real Simurgh-OS subsystem (`simurgh-store`, a separate git
+/// repo). Same shape and same reasoning as `spawn_diagnostics_manager`:
+/// this process's own real logic (`manifest_installer::subsystem_entry::
+/// self_check`) is entirely self-contained (no real IPC transport to
+/// `simurgh-security-broker` or the Store's own catalog backend exists
+/// yet on either side), so it simply proves the process itself boots and
+/// its ported install-manifest logic runs correctly on real hardware.
+fn spawn_store(hal: &hal_core::HalInterface) -> Option<kernel_cap::ThreadId> {
+    let k = kernel_arch_glue::kstate();
+
+    const STORE_STACK_VMA: usize = 0xC046_0000;
+    // Bumped alongside `SB_STACK_LEN`/`NATIVE_LOADER_STACK_LEN`'s own
+    // identical fix (`SB_STACK_LEN`'s own doc comment has the full
+    // story) — real headroom for this process's own real-IPC plan
+    // Phase 2 additions.
+    const STORE_STACK_LEN: usize = 4096 * 64;
+    match kernel_arch_glue::spawn_process_from_elf(
+        hal,
+        k,
+        STORE_ELF,
+        elf_loader::machine::EM_RISCV,
+        STORE_STACK_VMA,
+        STORE_STACK_LEN,
+    ) {
+        Some((tid, _cap_space, _stack_phys)) => {
+            kernel_arch_glue::log(format_args!(
+                "root task: spawned store (tid {}) from its OWN separately-built ELF image (simurgh-store repo)\r\n",
+                tid.as_u32()
+            ));
+            Some(tid)
+        }
+        None => {
+            kernel_arch_glue::log(format_args!(
+                "root task: store spawn skipped (out of resources)\r\n"
+            ));
+            None
+        }
+    }
+}
+
+/// Spawns `native-loader-bin` — the SEVENTH layer-4 process this
+/// project spawns as a real Simurgh-OS subsystem (`simurgh-native-sdk`,
+/// a separate git repo). Same shape and same reasoning as `spawn_store`:
+/// this process's own real logic (`native_loader::subsystem_entry::
+/// self_check`) is entirely self-contained (no real IPC transport to
+/// `simurgh-security-broker` exists yet on either side), so it simply
+/// proves the process itself boots and its ported loader/registry logic
+/// runs correctly on real hardware.
+fn spawn_native_loader(hal: &hal_core::HalInterface) -> Option<kernel_cap::ThreadId> {
+    let k = kernel_arch_glue::kstate();
+
+    const NATIVE_LOADER_STACK_VMA: usize = 0xC047_0000;
+    // Bumped alongside `SB_STACK_LEN`'s own identical fix (that
+    // constant's own doc comment has the full story — a real QEMU-traced
+    // crash bisected into this process's own bump-allocator code,
+    // consistent with a stack overflow corrupting nearby state) — this
+    // process's own real-IPC plan Phase 2 additions (`NOTIF_SIGNAL` +
+    // wire encode/decode) are new stack depth Phase 1 never exercised.
+    const NATIVE_LOADER_STACK_LEN: usize = 4096 * 64;
+    match kernel_arch_glue::spawn_process_from_elf(
+        hal,
+        k,
+        NATIVE_LOADER_ELF,
+        elf_loader::machine::EM_RISCV,
+        NATIVE_LOADER_STACK_VMA,
+        NATIVE_LOADER_STACK_LEN,
+    ) {
+        Some((tid, _cap_space, _stack_phys)) => {
+            kernel_arch_glue::log(format_args!(
+                "root task: spawned native-loader (tid {}) from its OWN separately-built ELF image (simurgh-native-sdk repo)\r\n",
+                tid.as_u32()
+            ));
+            Some(tid)
+        }
+        None => {
+            kernel_arch_glue::log(format_args!(
+                "root task: native-loader spawn skipped (out of resources)\r\n"
+            ));
+            None
+        }
+    }
+}
+
+/// Spawns `policy-engine-bin` — the EIGHTH layer-4 process this project
+/// spawns as a real Simurgh-OS subsystem (`simurgh-profile-policy`, a
+/// separate git repo). Same shape and same reasoning as
+/// `spawn_native_loader`: this process's own real logic
+/// (`profile_policy::subsystem_entry::self_check`) is entirely self-
+/// contained (no real IPC transport to any other service exists yet on
+/// either side), so it simply proves the process itself boots and its
+/// ported profile/Rhai logic — including a real `rhai::Engine` script
+/// evaluation, the riskiest untested-on-hardware part of this port —
+/// runs correctly on real hardware.
+fn spawn_policy_engine(hal: &hal_core::HalInterface) -> Option<kernel_cap::ThreadId> {
+    let k = kernel_arch_glue::kstate();
+
+    const POLICY_ENGINE_STACK_VMA: usize = 0xC048_0000;
+    const POLICY_ENGINE_STACK_LEN: usize = 4096 * 16;
+    match kernel_arch_glue::spawn_process_from_elf(
+        hal,
+        k,
+        POLICY_ENGINE_ELF,
+        elf_loader::machine::EM_RISCV,
+        POLICY_ENGINE_STACK_VMA,
+        POLICY_ENGINE_STACK_LEN,
+    ) {
+        Some((tid, _cap_space, _stack_phys)) => {
+            kernel_arch_glue::log(format_args!(
+                "root task: spawned policy-engine (tid {}) from its OWN separately-built ELF image (simurgh-profile-policy repo)\r\n",
+                tid.as_u32()
+            ));
+            Some(tid)
+        }
+        None => {
+            kernel_arch_glue::log(format_args!(
+                "root task: policy-engine spawn skipped (out of resources)\r\n"
+            ));
+            None
+        }
+    }
+}
+
+/// Spawns `umode_faulty_driver` (see its doc comment) via the SAME
+/// generic `kernel_arch_glue::spawn_process` path as device-manager, so
+/// it joins the same preemption loop and its crash can be observed
+/// happening concurrently with the rest of the demo — the real §5.2
+/// proof point is that A/B/C and device-manager are unaffected by it.
+/// Returns the new thread's id (or `None` if spawning failed) so a
+/// respawn caller (`sys::DM_RESPAWN_DRIVER`) can hand off to it directly.
+#[cfg(target_arch = "riscv64")]
+fn spawn_faulty_driver(hal: &hal_core::HalInterface) -> Option<kernel_cap::ThreadId> {
+    let k = kernel_arch_glue::kstate();
+    let user = user_image();
+    const FAULTY_STACK_VMA: usize = 0xC050_0000;
+    const FAULTY_STACK_LEN: usize = 4096 * 4;
+    match kernel_arch_glue::spawn_process(
+        hal,
+        k,
+        user.text_vma,
+        user.text_lma,
+        user.text_len,
+        FAULTY_STACK_VMA,
+        FAULTY_STACK_LEN,
+        umode_faulty_driver as usize,
+    ) {
+        Some((tid, _cap_space, _stack_phys)) => {
+            kernel_arch_glue::p2_watch_driver(tid);
+            kernel_arch_glue::log(format_args!(
+                "root task: spawned faulty-driver (tid {}) - it will fault on its first instruction (fault-isolation demo, 03 5.2)\r\n",
+                tid.as_u32()
+            ));
+            Some(tid)
+        }
+        None => {
+            kernel_arch_glue::log(format_args!(
+                "root task: faulty-driver spawn skipped (out of resources)\r\n"
+            ));
+            None
+        }
+    }
+}
+
+// ----------------------------------------------------------------------------
+// kernel_main — architecture-independent body
+// ----------------------------------------------------------------------------
+
+#[no_mangle]
+pub extern "Rust" fn kernel_main(hal: hal_core::HalInterface, boot_info: BootInfo) -> ! {
+    // `hal` arrives BY VALUE, so it would otherwise live in THIS
+    // function's own stack frame for the rest of boot — `kernel_main`
+    // never returns, so every downstream `&hal` reference (`enter`'s own
+    // `G_HAL` included) stays validly pointing at it for as long as
+    // nothing EVER writes back over that stack region. That held for
+    // riscv64/x86_64 (SP only ever descends further) and for aarch64
+    // before `hal_arm64::cpu::restore_user_and_eret`'s own SP-reset fix
+    // (see its doc comment for the full story) — but once a `SwitchTo`/
+    // `Terminate` there resets SP_EL1 to a fixed top-of-stack baseline
+    // on every process switch, LATER exception handling reuses and
+    // overwrites this exact memory, corrupting `hal`'s own bytes the
+    // moment a deep-enough call chain reaches them (root-caused via
+    // bisection: `G_HAL`'s own stored POINTER survives, since it is
+    // itself a separate, genuinely-static 8-byte slot, but
+    // dereferencing THROUGH it — e.g. `hal.now_ns()`'s indirect call
+    // via a function-pointer field of the now-corrupted `HalInterface`
+    // bytes — silently jumps to garbage). Moving `hal` into `.bss` here
+    // (mirrors `KernelState::init_global`'s own "no stack temporary"
+    // rationale) makes it immune regardless of what any architecture's
+    // own SP does afterward. (`boot_info: &BootInfo` is NOT similarly
+    // hazardous — `enter` only reads through it locally, never storing
+    // the pointer past its own call.)
+    static mut HAL_STORAGE: core::mem::MaybeUninit<hal_core::HalInterface> =
+        core::mem::MaybeUninit::uninit();
+    // SAFETY: single-core boot, `kernel_main` runs exactly once, before
+    // this static is read anywhere else. `addr_of_mut!`/`addr_of!` avoid
+    // forming an intermediate `&mut`/`&` to the `static mut` itself,
+    // matching `KernelState::init_global`'s own idiom.
+    let hal: &'static hal_core::HalInterface = unsafe {
+        core::ptr::addr_of_mut!(HAL_STORAGE)
+            .cast::<hal_core::HalInterface>()
+            .write(hal);
+        &*core::ptr::addr_of!(HAL_STORAGE).cast::<hal_core::HalInterface>()
+    };
+    SerialWriter::init();
+    let mut s = SerialWriter;
+
+    let _ = writeln!(s, "|======================================================================|");
+    let _ = writeln!(s, "|   Simurgh Operating System - Microkernel (Phase 2)  v0.1.0            |");
+    let _ = writeln!(s, "|======================================================================|");
+
+    match kernel_arch_glue::build(hal, &boot_info, serial_log) {
+        Ok((report, state)) => {
+            let _ = writeln!(s, "boot protocol            : {:?}", report.protocol);
+            let _ = writeln!(s, "cpu cores (HalInterface) : {}", report.cpu_cores);
+            let _ = writeln!(s, "timer frequency          : {} Hz", report.timer_hz);
+            let _ = writeln!(s, "UntypedMemory objects    : {}", report.untyped_objects);
+            let _ = writeln!(
+                s,
+                "total untyped memory     : {} bytes",
+                report.total_untyped_bytes
+            );
+            let _ = writeln!(s, "peripheral devices       : {}", report.peripheral_devices);
+            let _ = writeln!(s, "compute devices          : {}", report.compute_devices);
+            let _ = writeln!(s, "root task thread id      : {}", report.root_thread);
+            let _ = writeln!(s, "first scheduled thread   : {:?}", report.first_scheduled);
+            let _ = writeln!(s, "KernelState built: OK");
+            let _ = writeln!(s, "----------------------------------------------------------------------");
+            let _ = writeln!(s, "handing control to the Root Task...");
+            // Register the S-mode syscall handler the HAL trap vector
+            // invokes for an `ecall` from U-mode, the tick handler it
+            // invokes for a supervisor timer interrupt on a U-mode thread,
+            // and the fault handler it invokes for any other synchronous
+            // exception taken from U-mode (03-Kernel-Subsystems-Layer.md
+            // §2.1/§5.2 per-process fault isolation).
+            #[cfg(target_arch = "riscv64")]
+            hal_riscv64::cpu::set_syscall_handler(simurgh_syscall);
+            #[cfg(target_arch = "riscv64")]
+            hal_riscv64::cpu::set_tick_handler(simurgh_tick);
+            #[cfg(target_arch = "riscv64")]
+            hal_riscv64::cpu::set_fault_handler(simurgh_fault);
+            // Real x86_64 paging self-test (see its own doc comment) —
+            // an independent, kernel-mode-only sanity check that stays
+            // useful even now that `enter` below ALSO does real paging
+            // (for the Root Task's own, separate address space): if the
+            // U-mode path below ever regresses, this narrows whether
+            // paging itself or the U-mode/syscall boundary specifically
+            // is at fault.
+            #[cfg(target_arch = "x86_64")]
+            x86_64_paging_selftest(hal, state);
+            // Register the syscall handler `hal_x86_64::cpu`'s
+            // dedicated `int 0x80` (DPL 3) trampoline calls.
+            #[cfg(target_arch = "x86_64")]
+            hal_x86_64::cpu::set_syscall_handler(simurgh_syscall_x86);
+            // Register the per-process fault-isolation handler
+            // `hal_x86_64::cpu`'s dedicated `#UD` trampoline calls
+            // (03-Kernel-Subsystems-Layer.md §2.1/§5.2).
+            #[cfg(target_arch = "x86_64")]
+            hal_x86_64::cpu::set_fault_handler(simurgh_fault_x86);
+            // Register the preemptive-scheduler tick handler
+            // `hal_x86_64::cpu`'s dedicated LAPIC-timer trampoline calls
+            // (02-Microkernel-Layer.md §4).
+            #[cfg(target_arch = "x86_64")]
+            hal_x86_64::cpu::set_tick_handler(simurgh_tick_x86);
+            // Register the syscall handler `hal_arm64::cpu`'s shared
+            // EL0-synchronous vector calls.
+            #[cfg(target_arch = "aarch64")]
+            hal_arm64::cpu::set_syscall_handler(simurgh_syscall_aarch64);
+            // Register the per-process fault-isolation handler the SAME
+            // shared vector calls for a fatal EL0 exception that is not
+            // a `svc` (03-Kernel-Subsystems-Layer.md §2.1/§5.2).
+            #[cfg(target_arch = "aarch64")]
+            hal_arm64::cpu::set_fault_handler(simurgh_fault_aarch64);
+            // Register the preemptive-scheduler tick handler the SAME
+            // shared EL0 IRQ vector calls for the timer PPI landing on a
+            // running U-mode thread (02-Microkernel-Layer.md §4).
+            #[cfg(target_arch = "aarch64")]
+            hal_arm64::cpu::set_tick_handler(simurgh_tick_aarch64);
+            // Never returns: runs the in-kernel demo, then (riscv64/
+            // x86_64/aarch64) maps the user image U=1/AP_USER, activates
+            // paging, and drops the Root Task to U-mode/EL0 isolated.
+            #[cfg(target_arch = "riscv64")]
+            {
+                kernel_arch_glue::enter(hal, state, user_image(), &boot_info)
+            }
+            #[cfg(target_arch = "x86_64")]
+            {
+                kernel_arch_glue::enter(hal, state, user_image(), &boot_info)
+            }
+            #[cfg(target_arch = "aarch64")]
+            {
+                kernel_arch_glue::enter(hal, state, user_image(), &boot_info)
+            }
+            #[cfg(not(any(
+                target_arch = "riscv64",
+                target_arch = "x86_64",
+                target_arch = "aarch64"
+            )))]
+            {
+                kernel_arch_glue::enter(hal, state, kernel_arch_glue::UserImage::EMPTY, &boot_info)
+            }
+        }
+        Err(e) => {
+            let _ = writeln!(s, "kernel bring-up FAILED: {e:?}");
+            halt_forever()
+        }
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Halt — architecture-specific instruction, identical structure
+// ----------------------------------------------------------------------------
+
+fn halt_forever() -> ! {
+    loop {
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: cli+hlt is the standard x86_64 terminal halt.
+        unsafe {
+            core::arch::asm!("cli");
+            core::arch::asm!("hlt");
+        }
+        #[cfg(target_arch = "aarch64")]
+        // SAFETY: masking DAIF then wfi is the standard AArch64 terminal halt.
+        unsafe {
+            core::arch::asm!("msr daifset, #0xF");
+            core::arch::asm!("wfi");
+        }
+        #[cfg(target_arch = "riscv64")]
+        // SAFETY: clearing SIE then wfi is the standard RISC-V terminal halt.
+        unsafe {
+            core::arch::asm!("csrci sstatus, 0x2");
+            core::arch::asm!("wfi");
+        }
+    }
+}
+
+#[panic_handler]
+fn panic(info: &PanicInfo) -> ! {
+    SerialWriter::init();
+    let mut s = SerialWriter;
+    let _ = writeln!(s, "KERNEL PANIC: {info}");
+    halt_forever();
+}

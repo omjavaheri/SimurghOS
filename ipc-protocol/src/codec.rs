@@ -1,0 +1,1796 @@
+//! ============================================================================
+//! codec.rs
+//!
+//! Purpose: pack/unpack message types to/from `kernel_ipc::SmallMessage`
+//! words. Hand-written for the MVP (IMPLEMENTATION-PLAN.md D7) — no `serde`,
+//! no proc-macro IDL. The encoding is: the `SmallMessage` label carries
+//! `(namespace, version, opcode)` (see `crate::Namespace`), and the data
+//! words carry the variant's fields in declaration order.
+//!
+//! Architecture reference: 03-Kernel-Subsystems-Layer.md §3 (typed,
+//! low-overhead, versioned).
+//!
+//! Position in the system: called on both ends of every layer-3 IPC. This
+//! module implements the `FsRequest`/`FsResponse` codec in full as the
+//! reference (`FsResponse` used for real by the fs-native process —
+//! 03-Kernel-Subsystems-Layer.md §2.2, §5.3), and the `DriverRequest`/
+//! `DriverResponse` codec (used by the real Device Manager ↔ driver
+//! process IPC — §2.1, §5.2) the identical way; the remaining namespaces
+//! follow the same pattern and are a mechanical follow-up (their
+//! opcodes/labels are already defined).
+//!
+//! Safety/invariants: `decode_*` is total — it returns `DecodeError` for a
+//! bad version, an unknown opcode, or a truncated payload, and never
+//! panics.
+//! ============================================================================
+
+use crate::display::{DisplayErrorCode, DisplayRequest, DisplayResponse, SurfaceHandle};
+use crate::driver::{DriverErrorCode, DriverRequest, DriverResponse};
+use crate::fs::{FileHandle, FsErrorCode, FsRequest, FsResponse, OpenFlags, PathId};
+use crate::mm::{ComputeKind, MmErrorCode, MmRequest, MmResponse, ReclaimClass};
+use crate::net::{DirectNicHandle, NetBypassRequest, NetBypassResponse};
+use crate::security::{SecurityErrorCode, SecurityRequest, SecurityResponse};
+use crate::{label_parts, Namespace, PROTOCOL_VERSION};
+use kernel_ipc::SmallMessage;
+
+/// Why decoding failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DecodeError {
+    /// The label's namespace byte did not match the expected namespace.
+    WrongNamespace,
+    /// The label's protocol version is not `PROTOCOL_VERSION`.
+    VersionMismatch,
+    /// The opcode is not a known variant of this namespace.
+    UnknownOpcode,
+    /// The message had fewer data words than the variant needs.
+    Truncated,
+    /// A field held a value outside its valid range (e.g. undefined
+    /// flag bits).
+    BadField,
+}
+
+// FsRequest opcodes (low byte of the label).
+const OP_OPEN: u8 = 1;
+const OP_READ: u8 = 2;
+const OP_WRITE: u8 = 3;
+const OP_STAT: u8 = 4;
+const OP_CLOSE: u8 = 5;
+const OP_REGISTER_PATH: u8 = 6;
+const OP_LIST_DIRECTORY: u8 = 7;
+const OP_DELETE: u8 = 8;
+const OP_RENAME: u8 = 9;
+
+/// Encodes a `FsRequest` into a `SmallMessage`.
+///
+/// Word layout by variant:
+/// - `Open`:  `[path, flags]`
+/// - `Read`:  `[handle, offset, len, shared_cap]`
+/// - `Write`: `[handle, offset, len, shared_cap]`
+/// - `Stat`:  `[path]`
+/// - `Close`: `[handle]`
+/// - `RegisterPath`: `[len, shared_cap]`
+/// - `ListDirectory`: `[path, start_index, shared_cap]`
+/// - `Delete`: `[path]`
+/// - `Rename`: `[from, to]`
+pub fn encode_fs_request(req: &FsRequest) -> SmallMessage {
+    let (op, words): (u8, [u64; 4]) = match *req {
+        FsRequest::Open { path, flags } => {
+            (OP_OPEN, [path.0 as u64, flags.bits() as u64, 0, 0])
+        }
+        FsRequest::Read {
+            handle,
+            offset,
+            len,
+            shared_cap,
+        } => (
+            OP_READ,
+            [handle.0 as u64, offset, len as u64, shared_cap as u64],
+        ),
+        FsRequest::Write {
+            handle,
+            offset,
+            len,
+            shared_cap,
+        } => (
+            OP_WRITE,
+            [handle.0 as u64, offset, len as u64, shared_cap as u64],
+        ),
+        FsRequest::Stat { path } => (OP_STAT, [path.0 as u64, 0, 0, 0]),
+        FsRequest::Close { handle } => (OP_CLOSE, [handle.0 as u64, 0, 0, 0]),
+        FsRequest::RegisterPath { len, shared_cap } => {
+            (OP_REGISTER_PATH, [len as u64, shared_cap as u64, 0, 0])
+        }
+        FsRequest::ListDirectory { path, start_index, shared_cap } => (
+            OP_LIST_DIRECTORY,
+            [path.0 as u64, start_index as u64, shared_cap as u64, 0],
+        ),
+        FsRequest::Delete { path } => (OP_DELETE, [path.0 as u64, 0, 0, 0]),
+        FsRequest::Rename { from, to } => (OP_RENAME, [from.0 as u64, to.0 as u64, 0, 0]),
+    };
+    let n = match op {
+        OP_OPEN | OP_REGISTER_PATH | OP_RENAME => 2,
+        OP_LIST_DIRECTORY => 3,
+        OP_READ | OP_WRITE => 4,
+        _ => 1,
+    };
+    // `from_words` cannot fail here: n <= 4 <= MSG_MAX_WORDS.
+    SmallMessage::from_words(Namespace::Fs.label(op), &words[..n])
+        .unwrap_or_else(|_| SmallMessage::new(Namespace::Fs.label(op)))
+}
+
+/// Decodes a `FsRequest` from a `SmallMessage`.
+pub fn decode_fs_request(msg: &SmallMessage) -> Result<FsRequest, DecodeError> {
+    match Namespace::from_label(msg.label) {
+        Some(Namespace::Fs) => {}
+        _ => return Err(DecodeError::WrongNamespace),
+    }
+    let (version, op) = label_parts(msg.label);
+    if version != PROTOCOL_VERSION {
+        return Err(DecodeError::VersionMismatch);
+    }
+    let w = msg.words();
+    let need = |n: usize| -> Result<(), DecodeError> {
+        if w.len() < n {
+            Err(DecodeError::Truncated)
+        } else {
+            Ok(())
+        }
+    };
+    match op {
+        OP_OPEN => {
+            need(2)?;
+            let flags = OpenFlags::from_bits(w[1] as u32).ok_or(DecodeError::BadField)?;
+            Ok(FsRequest::Open {
+                path: PathId(w[0] as u32),
+                flags,
+            })
+        }
+        OP_READ => {
+            need(4)?;
+            Ok(FsRequest::Read {
+                handle: FileHandle(w[0] as u32),
+                offset: w[1],
+                len: w[2] as u32,
+                shared_cap: w[3] as u32,
+            })
+        }
+        OP_WRITE => {
+            need(4)?;
+            Ok(FsRequest::Write {
+                handle: FileHandle(w[0] as u32),
+                offset: w[1],
+                len: w[2] as u32,
+                shared_cap: w[3] as u32,
+            })
+        }
+        OP_STAT => {
+            need(1)?;
+            Ok(FsRequest::Stat {
+                path: PathId(w[0] as u32),
+            })
+        }
+        OP_CLOSE => {
+            need(1)?;
+            Ok(FsRequest::Close {
+                handle: FileHandle(w[0] as u32),
+            })
+        }
+        OP_REGISTER_PATH => {
+            need(2)?;
+            Ok(FsRequest::RegisterPath {
+                len: w[0] as u32,
+                shared_cap: w[1] as u32,
+            })
+        }
+        OP_LIST_DIRECTORY => {
+            need(3)?;
+            Ok(FsRequest::ListDirectory {
+                path: PathId(w[0] as u32),
+                start_index: w[1] as u32,
+                shared_cap: w[2] as u32,
+            })
+        }
+        OP_DELETE => {
+            need(1)?;
+            Ok(FsRequest::Delete {
+                path: PathId(w[0] as u32),
+            })
+        }
+        OP_RENAME => {
+            need(2)?;
+            Ok(FsRequest::Rename {
+                from: PathId(w[0] as u32),
+                to: PathId(w[1] as u32),
+            })
+        }
+        _ => Err(DecodeError::UnknownOpcode),
+    }
+}
+
+// FsResponse opcodes — a separate small sequence from the FsRequest
+// opcodes above; the two are never decoded by the same function (each
+// side of the IPC knows which direction a given message is), so the
+// numbers may overlap in principle, but are kept sequential-and-distinct
+// here for readability when reading a raw trace — same convention
+// `OP_DRR_*` below uses relative to `OP_DR_*`.
+const OP_FR_OPENED: u8 = 1;
+const OP_FR_READ: u8 = 2;
+const OP_FR_WRITTEN: u8 = 3;
+const OP_FR_STAT: u8 = 4;
+const OP_FR_CLOSED: u8 = 5;
+const OP_FR_ERROR: u8 = 6;
+const OP_FR_PATH_REGISTERED: u8 = 7;
+const OP_FR_DIR_ENTRIES: u8 = 8;
+const OP_FR_DELETED: u8 = 9;
+const OP_FR_RENAMED: u8 = 10;
+
+/// Encodes a `FsResponse` into a `SmallMessage`.
+///
+/// Word layout by variant:
+/// - `Opened`: `[handle]`
+/// - `Read`: `[bytes]`
+/// - `Written`: `[bytes]`
+/// - `Stat`: `[size, is_dir]`
+/// - `Closed`: `[]`
+/// - `PathRegistered`: `[path]`
+/// - `Error`: `[code]`
+/// - `DirEntries`: `[count, more]`
+/// - `Deleted`: `[]`
+/// - `Renamed`: `[]`
+pub fn encode_fs_response(resp: &FsResponse) -> SmallMessage {
+    let (op, words): (u8, [u64; 2]) = match *resp {
+        FsResponse::Opened { handle } => (OP_FR_OPENED, [handle.0 as u64, 0]),
+        FsResponse::Read { bytes } => (OP_FR_READ, [bytes as u64, 0]),
+        FsResponse::Written { bytes } => (OP_FR_WRITTEN, [bytes as u64, 0]),
+        FsResponse::Stat { size, is_dir } => (OP_FR_STAT, [size, is_dir as u64]),
+        FsResponse::Closed => (OP_FR_CLOSED, [0, 0]),
+        FsResponse::PathRegistered { path } => (OP_FR_PATH_REGISTERED, [path.0 as u64, 0]),
+        FsResponse::Error { code } => (OP_FR_ERROR, [code as u64, 0]),
+        FsResponse::DirEntries { count, more } => (OP_FR_DIR_ENTRIES, [count as u64, more as u64]),
+        FsResponse::Deleted => (OP_FR_DELETED, [0, 0]),
+        FsResponse::Renamed => (OP_FR_RENAMED, [0, 0]),
+    };
+    let n = if op == OP_FR_STAT || op == OP_FR_DIR_ENTRIES {
+        2
+    } else if op == OP_FR_CLOSED || op == OP_FR_DELETED || op == OP_FR_RENAMED {
+        0
+    } else {
+        1
+    };
+    // `from_words` cannot fail here: n <= 2 <= MSG_MAX_WORDS.
+    SmallMessage::from_words(Namespace::Fs.label(op), &words[..n])
+        .unwrap_or_else(|_| SmallMessage::new(Namespace::Fs.label(op)))
+}
+
+/// Decodes a `FsResponse` from a `SmallMessage`.
+pub fn decode_fs_response(msg: &SmallMessage) -> Result<FsResponse, DecodeError> {
+    match Namespace::from_label(msg.label) {
+        Some(Namespace::Fs) => {}
+        _ => return Err(DecodeError::WrongNamespace),
+    }
+    let (version, op) = label_parts(msg.label);
+    if version != PROTOCOL_VERSION {
+        return Err(DecodeError::VersionMismatch);
+    }
+    let w = msg.words();
+    let need = |n: usize| -> Result<(), DecodeError> {
+        if w.len() < n {
+            Err(DecodeError::Truncated)
+        } else {
+            Ok(())
+        }
+    };
+    match op {
+        OP_FR_OPENED => {
+            need(1)?;
+            Ok(FsResponse::Opened {
+                handle: FileHandle(w[0] as u32),
+            })
+        }
+        OP_FR_READ => {
+            need(1)?;
+            Ok(FsResponse::Read { bytes: w[0] as u32 })
+        }
+        OP_FR_WRITTEN => {
+            need(1)?;
+            Ok(FsResponse::Written { bytes: w[0] as u32 })
+        }
+        OP_FR_STAT => {
+            need(2)?;
+            Ok(FsResponse::Stat {
+                size: w[0],
+                is_dir: w[1] != 0,
+            })
+        }
+        OP_FR_CLOSED => Ok(FsResponse::Closed),
+        OP_FR_PATH_REGISTERED => {
+            need(1)?;
+            Ok(FsResponse::PathRegistered {
+                path: PathId(w[0] as u32),
+            })
+        }
+        OP_FR_DIR_ENTRIES => {
+            need(2)?;
+            Ok(FsResponse::DirEntries {
+                count: w[0] as u32,
+                more: w[1] != 0,
+            })
+        }
+        OP_FR_DELETED => Ok(FsResponse::Deleted),
+        OP_FR_RENAMED => Ok(FsResponse::Renamed),
+        OP_FR_ERROR => {
+            need(1)?;
+            let code = match w[0] {
+                1 => FsErrorCode::NotFound,
+                2 => FsErrorCode::Denied,
+                3 => FsErrorCode::BadHandle,
+                4 => FsErrorCode::BadPath,
+                5 => FsErrorCode::Unsupported,
+                6 => FsErrorCode::BadSharedRegion,
+                7 => FsErrorCode::Io,
+                _ => return Err(DecodeError::BadField),
+            };
+            Ok(FsResponse::Error { code })
+        }
+        _ => Err(DecodeError::UnknownOpcode),
+    }
+}
+
+// DriverRequest opcodes (low byte of the label).
+const OP_DR_PROBE: u8 = 1;
+const OP_DR_IRQ: u8 = 2;
+const OP_DR_READ_BLOCKS: u8 = 3;
+const OP_DR_WRITE_BLOCKS: u8 = 4;
+const OP_DR_QUIESCE: u8 = 5;
+const OP_DR_SEND_FRAME: u8 = 6;
+const OP_DR_POLL_FRAME: u8 = 7;
+
+/// Encodes a `DriverRequest` into a `SmallMessage`.
+///
+/// Word layout by variant:
+/// - `Probe`, `Quiesce`, `PollFrame`: `[]`
+/// - `Irq`: `[line]`
+/// - `ReadBlocks` / `WriteBlocks`: `[lba, sector_count, shared_cap]`
+/// - `SendFrame`: `[len]`
+pub fn encode_driver_request(req: &DriverRequest) -> SmallMessage {
+    let (op, words): (u8, [u64; 3]) = match *req {
+        DriverRequest::Probe => (OP_DR_PROBE, [0, 0, 0]),
+        DriverRequest::Irq { line } => (OP_DR_IRQ, [line as u64, 0, 0]),
+        DriverRequest::ReadBlocks {
+            lba,
+            sector_count,
+            shared_cap,
+        } => (
+            OP_DR_READ_BLOCKS,
+            [lba, sector_count as u64, shared_cap as u64],
+        ),
+        DriverRequest::WriteBlocks {
+            lba,
+            sector_count,
+            shared_cap,
+        } => (
+            OP_DR_WRITE_BLOCKS,
+            [lba, sector_count as u64, shared_cap as u64],
+        ),
+        DriverRequest::Quiesce => (OP_DR_QUIESCE, [0, 0, 0]),
+        DriverRequest::SendFrame { len } => (OP_DR_SEND_FRAME, [len as u64, 0, 0]),
+        DriverRequest::PollFrame => (OP_DR_POLL_FRAME, [0, 0, 0]),
+    };
+    let n = match op {
+        OP_DR_IRQ | OP_DR_SEND_FRAME => 1,
+        OP_DR_READ_BLOCKS | OP_DR_WRITE_BLOCKS => 3,
+        _ => 0,
+    };
+    // `from_words` cannot fail here: n <= 3 <= MSG_MAX_WORDS.
+    SmallMessage::from_words(Namespace::Driver.label(op), &words[..n])
+        .unwrap_or_else(|_| SmallMessage::new(Namespace::Driver.label(op)))
+}
+
+/// Decodes a `DriverRequest` from a `SmallMessage`.
+pub fn decode_driver_request(msg: &SmallMessage) -> Result<DriverRequest, DecodeError> {
+    match Namespace::from_label(msg.label) {
+        Some(Namespace::Driver) => {}
+        _ => return Err(DecodeError::WrongNamespace),
+    }
+    let (version, op) = label_parts(msg.label);
+    if version != PROTOCOL_VERSION {
+        return Err(DecodeError::VersionMismatch);
+    }
+    let w = msg.words();
+    let need = |n: usize| -> Result<(), DecodeError> {
+        if w.len() < n {
+            Err(DecodeError::Truncated)
+        } else {
+            Ok(())
+        }
+    };
+    match op {
+        OP_DR_PROBE => Ok(DriverRequest::Probe),
+        OP_DR_IRQ => {
+            need(1)?;
+            Ok(DriverRequest::Irq { line: w[0] as u32 })
+        }
+        OP_DR_READ_BLOCKS => {
+            need(3)?;
+            Ok(DriverRequest::ReadBlocks {
+                lba: w[0],
+                sector_count: w[1] as u32,
+                shared_cap: w[2] as u32,
+            })
+        }
+        OP_DR_WRITE_BLOCKS => {
+            need(3)?;
+            Ok(DriverRequest::WriteBlocks {
+                lba: w[0],
+                sector_count: w[1] as u32,
+                shared_cap: w[2] as u32,
+            })
+        }
+        OP_DR_QUIESCE => Ok(DriverRequest::Quiesce),
+        OP_DR_SEND_FRAME => {
+            need(1)?;
+            Ok(DriverRequest::SendFrame { len: w[0] as u32 })
+        }
+        OP_DR_POLL_FRAME => Ok(DriverRequest::PollFrame),
+        _ => Err(DecodeError::UnknownOpcode),
+    }
+}
+
+// DriverResponse opcodes — a separate small sequence from the request
+// opcodes above; the two are never decoded by the same function (each
+// side of the IPC knows which direction a given message is), so the
+// numbers may overlap in principle, but are kept sequential-and-distinct
+// here for readability when reading a raw trace.
+const OP_DRR_READY: u8 = 1;
+const OP_DRR_COMPLETED: u8 = 2;
+const OP_DRR_FAILED: u8 = 3;
+const OP_DRR_FRAME_SENT: u8 = 4;
+const OP_DRR_FRAME_RECEIVED: u8 = 5;
+
+/// Encodes a `DriverResponse` into a `SmallMessage`.
+///
+/// Word layout by variant:
+/// - `Ready`: `[sector_size, sector_count]`
+/// - `Completed`: `[sectors]`
+/// - `Failed`: `[code]`
+/// - `FrameSent`: `[]`
+/// - `FrameReceived`: `[len]`
+pub fn encode_driver_response(resp: &DriverResponse) -> SmallMessage {
+    let (op, words): (u8, [u64; 2]) = match *resp {
+        DriverResponse::Ready {
+            sector_size,
+            sector_count,
+        } => (OP_DRR_READY, [sector_size as u64, sector_count]),
+        DriverResponse::Completed { sectors } => (OP_DRR_COMPLETED, [sectors as u64, 0]),
+        DriverResponse::Failed { code } => (OP_DRR_FAILED, [code as u64, 0]),
+        DriverResponse::FrameSent => (OP_DRR_FRAME_SENT, [0, 0]),
+        DriverResponse::FrameReceived { len } => (OP_DRR_FRAME_RECEIVED, [len as u64, 0]),
+    };
+    let n = if op == OP_DRR_READY { 2 } else if op == OP_DRR_FRAME_SENT { 0 } else { 1 };
+    // `from_words` cannot fail here: n <= 2 <= MSG_MAX_WORDS.
+    SmallMessage::from_words(Namespace::Driver.label(op), &words[..n])
+        .unwrap_or_else(|_| SmallMessage::new(Namespace::Driver.label(op)))
+}
+
+/// Decodes a `DriverResponse` from a `SmallMessage`.
+pub fn decode_driver_response(msg: &SmallMessage) -> Result<DriverResponse, DecodeError> {
+    match Namespace::from_label(msg.label) {
+        Some(Namespace::Driver) => {}
+        _ => return Err(DecodeError::WrongNamespace),
+    }
+    let (version, op) = label_parts(msg.label);
+    if version != PROTOCOL_VERSION {
+        return Err(DecodeError::VersionMismatch);
+    }
+    let w = msg.words();
+    let need = |n: usize| -> Result<(), DecodeError> {
+        if w.len() < n {
+            Err(DecodeError::Truncated)
+        } else {
+            Ok(())
+        }
+    };
+    match op {
+        OP_DRR_READY => {
+            need(2)?;
+            Ok(DriverResponse::Ready {
+                sector_size: w[0] as u32,
+                sector_count: w[1],
+            })
+        }
+        OP_DRR_COMPLETED => {
+            need(1)?;
+            Ok(DriverResponse::Completed {
+                sectors: w[0] as u32,
+            })
+        }
+        OP_DRR_FAILED => {
+            need(1)?;
+            let code = match w[0] {
+                1 => DriverErrorCode::ProbeFailed,
+                2 => DriverErrorCode::OutOfRange,
+                3 => DriverErrorCode::BadSharedRegion,
+                4 => DriverErrorCode::DeviceIo,
+                5 => DriverErrorCode::Unsupported,
+                6 => DriverErrorCode::NoData,
+                7 => DriverErrorCode::DriverBusy,
+                _ => return Err(DecodeError::BadField),
+            };
+            Ok(DriverResponse::Failed { code })
+        }
+        OP_DRR_FRAME_SENT => Ok(DriverResponse::FrameSent),
+        OP_DRR_FRAME_RECEIVED => {
+            need(1)?;
+            Ok(DriverResponse::FrameReceived { len: w[0] as u32 })
+        }
+        _ => Err(DecodeError::UnknownOpcode),
+    }
+}
+
+// DisplayRequest opcodes (low byte of the label).
+const OP_DP_CREATE_SURFACE: u8 = 1;
+const OP_DP_COMMIT_BUFFER: u8 = 2;
+const OP_DP_DESTROY_SURFACE: u8 = 3;
+const OP_DP_SUBSCRIBE_INPUT: u8 = 4;
+const OP_DP_QUERY_OUTPUTS: u8 = 5;
+const OP_DP_POLL_INPUT_EVENT: u8 = 6;
+const OP_DP_POLL_MOUSE_EVENT: u8 = 7;
+
+/// Encodes a `DisplayRequest` into a `SmallMessage`.
+///
+/// Word layout by variant:
+/// - `CreateSurface`, `SubscribeInput`, `QueryOutputs`, `PollInputEvent`,
+///   `PollMouseEvent`: `[]`
+/// - `CommitBuffer`: `[surface, buffer_cap, width, height]`
+/// - `DestroySurface`: `[surface]`
+pub fn encode_display_request(req: &DisplayRequest) -> SmallMessage {
+    let (op, words): (u8, [u64; 4]) = match *req {
+        DisplayRequest::CreateSurface => (OP_DP_CREATE_SURFACE, [0, 0, 0, 0]),
+        DisplayRequest::CommitBuffer {
+            surface,
+            buffer_cap,
+            width,
+            height,
+        } => (
+            OP_DP_COMMIT_BUFFER,
+            [surface.0 as u64, buffer_cap as u64, width as u64, height as u64],
+        ),
+        DisplayRequest::DestroySurface { surface } => (OP_DP_DESTROY_SURFACE, [surface.0 as u64, 0, 0, 0]),
+        DisplayRequest::SubscribeInput => (OP_DP_SUBSCRIBE_INPUT, [0, 0, 0, 0]),
+        DisplayRequest::QueryOutputs => (OP_DP_QUERY_OUTPUTS, [0, 0, 0, 0]),
+        DisplayRequest::PollInputEvent => (OP_DP_POLL_INPUT_EVENT, [0, 0, 0, 0]),
+        DisplayRequest::PollMouseEvent => (OP_DP_POLL_MOUSE_EVENT, [0, 0, 0, 0]),
+    };
+    let n = match op {
+        OP_DP_COMMIT_BUFFER => 4,
+        OP_DP_DESTROY_SURFACE => 1,
+        _ => 0,
+    };
+    // `from_words` cannot fail here: n <= 4 <= MSG_MAX_WORDS.
+    SmallMessage::from_words(Namespace::Display.label(op), &words[..n])
+        .unwrap_or_else(|_| SmallMessage::new(Namespace::Display.label(op)))
+}
+
+/// Decodes a `DisplayRequest` from a `SmallMessage`.
+pub fn decode_display_request(msg: &SmallMessage) -> Result<DisplayRequest, DecodeError> {
+    match Namespace::from_label(msg.label) {
+        Some(Namespace::Display) => {}
+        _ => return Err(DecodeError::WrongNamespace),
+    }
+    let (version, op) = label_parts(msg.label);
+    if version != PROTOCOL_VERSION {
+        return Err(DecodeError::VersionMismatch);
+    }
+    let w = msg.words();
+    let need = |n: usize| -> Result<(), DecodeError> {
+        if w.len() < n {
+            Err(DecodeError::Truncated)
+        } else {
+            Ok(())
+        }
+    };
+    match op {
+        OP_DP_CREATE_SURFACE => Ok(DisplayRequest::CreateSurface),
+        OP_DP_COMMIT_BUFFER => {
+            need(4)?;
+            Ok(DisplayRequest::CommitBuffer {
+                surface: SurfaceHandle(w[0] as u32),
+                buffer_cap: w[1] as u32,
+                width: w[2] as u32,
+                height: w[3] as u32,
+            })
+        }
+        OP_DP_DESTROY_SURFACE => {
+            need(1)?;
+            Ok(DisplayRequest::DestroySurface {
+                surface: SurfaceHandle(w[0] as u32),
+            })
+        }
+        OP_DP_SUBSCRIBE_INPUT => Ok(DisplayRequest::SubscribeInput),
+        OP_DP_QUERY_OUTPUTS => Ok(DisplayRequest::QueryOutputs),
+        OP_DP_POLL_INPUT_EVENT => Ok(DisplayRequest::PollInputEvent),
+        OP_DP_POLL_MOUSE_EVENT => Ok(DisplayRequest::PollMouseEvent),
+        _ => Err(DecodeError::UnknownOpcode),
+    }
+}
+
+// DisplayResponse opcodes — a separate small sequence from the request
+// opcodes above, same "kept sequential-and-distinct for readability"
+// convention every other namespace here already follows.
+const OP_DPR_SURFACE_CREATED: u8 = 1;
+const OP_DPR_COMMITTED: u8 = 2;
+const OP_DPR_DESTROYED: u8 = 3;
+const OP_DPR_INPUT_SUBSCRIBED: u8 = 4;
+const OP_DPR_OUTPUT_TOPOLOGY: u8 = 5;
+const OP_DPR_ERROR: u8 = 6;
+const OP_DPR_INPUT_EVENT: u8 = 7;
+const OP_DPR_NO_INPUT_PENDING: u8 = 8;
+const OP_DPR_MOUSE_EVENT: u8 = 9;
+const OP_DPR_NO_MOUSE_EVENT_PENDING: u8 = 10;
+
+/// Encodes a `DisplayResponse` into a `SmallMessage`.
+///
+/// Word layout by variant:
+/// - `SurfaceCreated`: `[surface]`
+/// - `Committed`, `Destroyed`, `InputSubscribed`: `[]`
+/// - `OutputTopology`: `[output_count, primary_width, primary_height, primary_refresh_mhz]`
+/// - `Error`: `[code]`
+/// - `InputEvent`: `[keycode | (extended << 7), pressed]` — `extended`
+///   packs into bit 7 of the keycode word (always free before today: a
+///   `KeyEvent::keycode` is already `<= 0x7F`, see `DisplayResponse::
+///   InputEvent`'s own doc comment), not a third word.
+/// - `NoInputPending`: `[]`
+/// - `MouseEvent`: `[dx as u16 as u64, dy as u16 as u64, left|right<<1|middle<<2]`
+/// - `NoMouseEventPending`: `[]`
+pub fn encode_display_response(resp: &DisplayResponse) -> SmallMessage {
+    let (op, words): (u8, [u64; 4]) = match *resp {
+        DisplayResponse::SurfaceCreated { surface } => (OP_DPR_SURFACE_CREATED, [surface.0 as u64, 0, 0, 0]),
+        DisplayResponse::Committed => (OP_DPR_COMMITTED, [0, 0, 0, 0]),
+        DisplayResponse::Destroyed => (OP_DPR_DESTROYED, [0, 0, 0, 0]),
+        DisplayResponse::InputSubscribed => (OP_DPR_INPUT_SUBSCRIBED, [0, 0, 0, 0]),
+        DisplayResponse::OutputTopology {
+            output_count,
+            primary_width,
+            primary_height,
+            primary_refresh_mhz,
+        } => (
+            OP_DPR_OUTPUT_TOPOLOGY,
+            [
+                output_count as u64,
+                primary_width as u64,
+                primary_height as u64,
+                primary_refresh_mhz as u64,
+            ],
+        ),
+        DisplayResponse::Error { code } => (OP_DPR_ERROR, [code as u64, 0, 0, 0]),
+        DisplayResponse::InputEvent { keycode, pressed, extended } => {
+            let keycode_word = keycode as u64 | if extended { 0x80 } else { 0 };
+            (OP_DPR_INPUT_EVENT, [keycode_word, pressed as u64, 0, 0])
+        }
+        DisplayResponse::NoInputPending => (OP_DPR_NO_INPUT_PENDING, [0, 0, 0, 0]),
+        DisplayResponse::MouseEvent { dx, dy, left, right, middle } => (
+            OP_DPR_MOUSE_EVENT,
+            [
+                dx as u16 as u64,
+                dy as u16 as u64,
+                left as u64 | ((right as u64) << 1) | ((middle as u64) << 2),
+                0,
+            ],
+        ),
+        DisplayResponse::NoMouseEventPending => (OP_DPR_NO_MOUSE_EVENT_PENDING, [0, 0, 0, 0]),
+    };
+    let n = match op {
+        OP_DPR_OUTPUT_TOPOLOGY => 4,
+        OP_DPR_MOUSE_EVENT => 3,
+        OP_DPR_INPUT_EVENT => 2,
+        OP_DPR_SURFACE_CREATED | OP_DPR_ERROR => 1,
+        _ => 0,
+    };
+    // `from_words` cannot fail here: n <= 4 <= MSG_MAX_WORDS.
+    SmallMessage::from_words(Namespace::Display.label(op), &words[..n])
+        .unwrap_or_else(|_| SmallMessage::new(Namespace::Display.label(op)))
+}
+
+/// Decodes a `DisplayResponse` from a `SmallMessage`.
+pub fn decode_display_response(msg: &SmallMessage) -> Result<DisplayResponse, DecodeError> {
+    match Namespace::from_label(msg.label) {
+        Some(Namespace::Display) => {}
+        _ => return Err(DecodeError::WrongNamespace),
+    }
+    let (version, op) = label_parts(msg.label);
+    if version != PROTOCOL_VERSION {
+        return Err(DecodeError::VersionMismatch);
+    }
+    let w = msg.words();
+    let need = |n: usize| -> Result<(), DecodeError> {
+        if w.len() < n {
+            Err(DecodeError::Truncated)
+        } else {
+            Ok(())
+        }
+    };
+    match op {
+        OP_DPR_SURFACE_CREATED => {
+            need(1)?;
+            Ok(DisplayResponse::SurfaceCreated {
+                surface: SurfaceHandle(w[0] as u32),
+            })
+        }
+        OP_DPR_COMMITTED => Ok(DisplayResponse::Committed),
+        OP_DPR_DESTROYED => Ok(DisplayResponse::Destroyed),
+        OP_DPR_INPUT_SUBSCRIBED => Ok(DisplayResponse::InputSubscribed),
+        OP_DPR_OUTPUT_TOPOLOGY => {
+            need(4)?;
+            Ok(DisplayResponse::OutputTopology {
+                output_count: w[0] as u32,
+                primary_width: w[1] as u32,
+                primary_height: w[2] as u32,
+                primary_refresh_mhz: w[3] as u32,
+            })
+        }
+        OP_DPR_ERROR => {
+            need(1)?;
+            let code = match w[0] {
+                1 => DisplayErrorCode::BadSurface,
+                2 => DisplayErrorCode::BadBuffer,
+                3 => DisplayErrorCode::Unsupported,
+                _ => return Err(DecodeError::BadField),
+            };
+            Ok(DisplayResponse::Error { code })
+        }
+        OP_DPR_INPUT_EVENT => {
+            need(2)?;
+            Ok(DisplayResponse::InputEvent {
+                keycode: (w[0] & 0x7F) as u8,
+                pressed: w[1] != 0,
+                extended: w[0] & 0x80 != 0,
+            })
+        }
+        OP_DPR_NO_INPUT_PENDING => Ok(DisplayResponse::NoInputPending),
+        OP_DPR_MOUSE_EVENT => {
+            need(3)?;
+            Ok(DisplayResponse::MouseEvent {
+                dx: w[0] as u16 as i16,
+                dy: w[1] as u16 as i16,
+                left: w[2] & 1 != 0,
+                right: w[2] & 2 != 0,
+                middle: w[2] & 4 != 0,
+            })
+        }
+        OP_DPR_NO_MOUSE_EVENT_PENDING => Ok(DisplayResponse::NoMouseEventPending),
+        _ => Err(DecodeError::UnknownOpcode),
+    }
+}
+
+// MmRequest opcodes (low byte of the label).
+const OP_MM_REGISTER: u8 = 1;
+const OP_MM_UNREGISTER: u8 = 2;
+const OP_MM_QUERY_VICTIM: u8 = 3;
+const OP_MM_QUERY_TOTAL_RESIDENT: u8 = 4;
+const OP_MM_REGISTER_SWAP_REGION: u8 = 5;
+const OP_MM_UNREGISTER_SWAP_REGION: u8 = 6;
+const OP_MM_QUERY_SWAP_VICTIM: u8 = 7;
+const OP_MM_REGISTER_COMPUTE_POOL: u8 = 8;
+const OP_MM_QUERY_COMPUTE_POOL: u8 = 9;
+
+fn encode_compute_kind(kind: ComputeKind) -> u64 {
+    kind as u64
+}
+
+fn decode_compute_kind(word: u64) -> Result<ComputeKind, DecodeError> {
+    match word {
+        0 => Ok(ComputeKind::Cpu),
+        1 => Ok(ComputeKind::Gpu),
+        2 => Ok(ComputeKind::Npu),
+        3 => Ok(ComputeKind::Tpu),
+        4 => Ok(ComputeKind::Fpga),
+        _ => Err(DecodeError::BadField),
+    }
+}
+
+/// Encodes an `MmRequest` into a `SmallMessage`.
+///
+/// Word layout by variant:
+/// - `Register`: `[thread, resident_bytes, class]`
+/// - `Unregister`: `[thread]`
+/// - `QueryVictim`, `QueryTotalResident`, `QuerySwapVictim`: `[]`
+/// - `RegisterSwapRegion`: `[thread, region_id, bytes, last_touched_ns]`
+/// - `UnregisterSwapRegion`: `[thread, region_id]`
+/// - `RegisterComputePool`: `[pool_id, kind, capacity_bytes, used_bytes]`
+/// - `QueryComputePool`: `[bytes, has_preference (0/1), kind]`
+pub fn encode_mm_request(req: &MmRequest) -> SmallMessage {
+    let (op, words): (u8, [u64; 4]) = match *req {
+        MmRequest::Register {
+            thread,
+            resident_bytes,
+            class,
+        } => (
+            OP_MM_REGISTER,
+            [thread as u64, resident_bytes, class as u64, 0],
+        ),
+        MmRequest::Unregister { thread } => (OP_MM_UNREGISTER, [thread as u64, 0, 0, 0]),
+        MmRequest::QueryVictim => (OP_MM_QUERY_VICTIM, [0, 0, 0, 0]),
+        MmRequest::QueryTotalResident => (OP_MM_QUERY_TOTAL_RESIDENT, [0, 0, 0, 0]),
+        MmRequest::RegisterSwapRegion {
+            thread,
+            region_id,
+            bytes,
+            last_touched_ns,
+        } => (
+            OP_MM_REGISTER_SWAP_REGION,
+            [thread as u64, region_id as u64, bytes, last_touched_ns],
+        ),
+        MmRequest::UnregisterSwapRegion { thread, region_id } => (
+            OP_MM_UNREGISTER_SWAP_REGION,
+            [thread as u64, region_id as u64, 0, 0],
+        ),
+        MmRequest::QuerySwapVictim => (OP_MM_QUERY_SWAP_VICTIM, [0, 0, 0, 0]),
+        MmRequest::RegisterComputePool {
+            pool_id,
+            kind,
+            capacity_bytes,
+            used_bytes,
+        } => (
+            OP_MM_REGISTER_COMPUTE_POOL,
+            [pool_id as u64, encode_compute_kind(kind), capacity_bytes, used_bytes],
+        ),
+        MmRequest::QueryComputePool {
+            bytes,
+            preferred_kind,
+        } => {
+            let (has_pref, kind_word) = match preferred_kind {
+                Some(k) => (1, encode_compute_kind(k)),
+                None => (0, 0),
+            };
+            (OP_MM_QUERY_COMPUTE_POOL, [bytes, has_pref, kind_word, 0])
+        }
+    };
+    let n = match op {
+        OP_MM_REGISTER | OP_MM_REGISTER_SWAP_REGION | OP_MM_REGISTER_COMPUTE_POOL => 4,
+        OP_MM_QUERY_COMPUTE_POOL | OP_MM_UNREGISTER_SWAP_REGION => 3,
+        OP_MM_UNREGISTER => 1,
+        _ => 0,
+    };
+    // `from_words` cannot fail here: n <= 4 <= MSG_MAX_WORDS.
+    SmallMessage::from_words(Namespace::Mm.label(op), &words[..n])
+        .unwrap_or_else(|_| SmallMessage::new(Namespace::Mm.label(op)))
+}
+
+/// Decodes an `MmRequest` from a `SmallMessage`.
+pub fn decode_mm_request(msg: &SmallMessage) -> Result<MmRequest, DecodeError> {
+    match Namespace::from_label(msg.label) {
+        Some(Namespace::Mm) => {}
+        _ => return Err(DecodeError::WrongNamespace),
+    }
+    let (version, op) = label_parts(msg.label);
+    if version != PROTOCOL_VERSION {
+        return Err(DecodeError::VersionMismatch);
+    }
+    let w = msg.words();
+    let need = |n: usize| -> Result<(), DecodeError> {
+        if w.len() < n {
+            Err(DecodeError::Truncated)
+        } else {
+            Ok(())
+        }
+    };
+    match op {
+        OP_MM_REGISTER => {
+            need(3)?;
+            let class = match w[2] {
+                0 => ReclaimClass::Protected,
+                1 => ReclaimClass::Normal,
+                2 => ReclaimClass::Sacrificial,
+                _ => return Err(DecodeError::BadField),
+            };
+            Ok(MmRequest::Register {
+                thread: w[0] as u32,
+                resident_bytes: w[1],
+                class,
+            })
+        }
+        OP_MM_UNREGISTER => {
+            need(1)?;
+            Ok(MmRequest::Unregister { thread: w[0] as u32 })
+        }
+        OP_MM_QUERY_VICTIM => Ok(MmRequest::QueryVictim),
+        OP_MM_QUERY_TOTAL_RESIDENT => Ok(MmRequest::QueryTotalResident),
+        OP_MM_REGISTER_SWAP_REGION => {
+            need(4)?;
+            Ok(MmRequest::RegisterSwapRegion {
+                thread: w[0] as u32,
+                region_id: w[1] as u32,
+                bytes: w[2],
+                last_touched_ns: w[3],
+            })
+        }
+        OP_MM_UNREGISTER_SWAP_REGION => {
+            need(2)?;
+            Ok(MmRequest::UnregisterSwapRegion {
+                thread: w[0] as u32,
+                region_id: w[1] as u32,
+            })
+        }
+        OP_MM_QUERY_SWAP_VICTIM => Ok(MmRequest::QuerySwapVictim),
+        OP_MM_REGISTER_COMPUTE_POOL => {
+            need(4)?;
+            Ok(MmRequest::RegisterComputePool {
+                pool_id: w[0] as u32,
+                kind: decode_compute_kind(w[1])?,
+                capacity_bytes: w[2],
+                used_bytes: w[3],
+            })
+        }
+        OP_MM_QUERY_COMPUTE_POOL => {
+            need(3)?;
+            let preferred_kind = match w[1] {
+                0 => None,
+                1 => Some(decode_compute_kind(w[2])?),
+                _ => return Err(DecodeError::BadField),
+            };
+            Ok(MmRequest::QueryComputePool {
+                bytes: w[0],
+                preferred_kind,
+            })
+        }
+        _ => Err(DecodeError::UnknownOpcode),
+    }
+}
+
+// MmResponse opcodes — a separate small sequence from the request
+// opcodes above, same "kept sequential-and-distinct for readability"
+// convention every other namespace here already follows.
+const OP_MMR_REGISTERED: u8 = 1;
+const OP_MMR_UNREGISTERED: u8 = 2;
+const OP_MMR_VICTIM: u8 = 3;
+const OP_MMR_TOTAL_RESIDENT: u8 = 4;
+const OP_MMR_ERROR: u8 = 5;
+const OP_MMR_SWAP_REGION_REGISTERED: u8 = 6;
+const OP_MMR_SWAP_REGION_UNREGISTERED: u8 = 7;
+const OP_MMR_SWAP_VICTIM: u8 = 8;
+const OP_MMR_COMPUTE_POOL_REGISTERED: u8 = 9;
+const OP_MMR_COMPUTE_POOL_CHOSEN: u8 = 10;
+
+/// Encodes an `MmResponse` into a `SmallMessage`.
+///
+/// Word layout by variant:
+/// - `Registered`, `Unregistered`, `SwapRegionRegistered`,
+///   `SwapRegionUnregistered`, `ComputePoolRegistered`: `[]`
+/// - `Victim`, `ComputePoolChosen`: `[thread]`/`[pool_id]`
+/// - `TotalResident`: `[bytes]`
+/// - `SwapVictim`: `[thread, region_id]`
+/// - `Error`: `[code]`
+pub fn encode_mm_response(resp: &MmResponse) -> SmallMessage {
+    let (op, words): (u8, [u64; 2]) = match *resp {
+        MmResponse::Registered => (OP_MMR_REGISTERED, [0, 0]),
+        MmResponse::Unregistered => (OP_MMR_UNREGISTERED, [0, 0]),
+        MmResponse::Victim { thread } => (OP_MMR_VICTIM, [thread as u64, 0]),
+        MmResponse::TotalResident { bytes } => (OP_MMR_TOTAL_RESIDENT, [bytes, 0]),
+        MmResponse::SwapRegionRegistered => (OP_MMR_SWAP_REGION_REGISTERED, [0, 0]),
+        MmResponse::SwapRegionUnregistered => (OP_MMR_SWAP_REGION_UNREGISTERED, [0, 0]),
+        MmResponse::SwapVictim { thread, region_id } => {
+            (OP_MMR_SWAP_VICTIM, [thread as u64, region_id as u64])
+        }
+        MmResponse::ComputePoolRegistered => (OP_MMR_COMPUTE_POOL_REGISTERED, [0, 0]),
+        MmResponse::ComputePoolChosen { pool_id } => {
+            (OP_MMR_COMPUTE_POOL_CHOSEN, [pool_id as u64, 0])
+        }
+        MmResponse::Error { code } => (OP_MMR_ERROR, [code as u64, 0]),
+    };
+    let n = match op {
+        OP_MMR_REGISTERED
+        | OP_MMR_UNREGISTERED
+        | OP_MMR_SWAP_REGION_REGISTERED
+        | OP_MMR_SWAP_REGION_UNREGISTERED
+        | OP_MMR_COMPUTE_POOL_REGISTERED => 0,
+        OP_MMR_SWAP_VICTIM => 2,
+        _ => 1,
+    };
+    // `from_words` cannot fail here: n <= 2 <= MSG_MAX_WORDS.
+    SmallMessage::from_words(Namespace::Mm.label(op), &words[..n])
+        .unwrap_or_else(|_| SmallMessage::new(Namespace::Mm.label(op)))
+}
+
+/// Decodes an `MmResponse` from a `SmallMessage`.
+pub fn decode_mm_response(msg: &SmallMessage) -> Result<MmResponse, DecodeError> {
+    match Namespace::from_label(msg.label) {
+        Some(Namespace::Mm) => {}
+        _ => return Err(DecodeError::WrongNamespace),
+    }
+    let (version, op) = label_parts(msg.label);
+    if version != PROTOCOL_VERSION {
+        return Err(DecodeError::VersionMismatch);
+    }
+    let w = msg.words();
+    let need = |n: usize| -> Result<(), DecodeError> {
+        if w.len() < n {
+            Err(DecodeError::Truncated)
+        } else {
+            Ok(())
+        }
+    };
+    match op {
+        OP_MMR_REGISTERED => Ok(MmResponse::Registered),
+        OP_MMR_UNREGISTERED => Ok(MmResponse::Unregistered),
+        OP_MMR_VICTIM => {
+            need(1)?;
+            Ok(MmResponse::Victim { thread: w[0] as u32 })
+        }
+        OP_MMR_TOTAL_RESIDENT => {
+            need(1)?;
+            Ok(MmResponse::TotalResident { bytes: w[0] })
+        }
+        OP_MMR_SWAP_REGION_REGISTERED => Ok(MmResponse::SwapRegionRegistered),
+        OP_MMR_SWAP_REGION_UNREGISTERED => Ok(MmResponse::SwapRegionUnregistered),
+        OP_MMR_SWAP_VICTIM => {
+            need(2)?;
+            Ok(MmResponse::SwapVictim {
+                thread: w[0] as u32,
+                region_id: w[1] as u32,
+            })
+        }
+        OP_MMR_COMPUTE_POOL_REGISTERED => Ok(MmResponse::ComputePoolRegistered),
+        OP_MMR_COMPUTE_POOL_CHOSEN => {
+            need(1)?;
+            Ok(MmResponse::ComputePoolChosen { pool_id: w[0] as u32 })
+        }
+        OP_MMR_ERROR => {
+            need(1)?;
+            let code = match w[0] {
+                1 => MmErrorCode::Unsupported,
+                _ => return Err(DecodeError::BadField),
+            };
+            Ok(MmResponse::Error { code })
+        }
+        _ => Err(DecodeError::UnknownOpcode),
+    }
+}
+
+// NetBypassRequest opcodes (low byte of the label).
+const OP_NB_REQUEST_DIRECT_NIC: u8 = 1;
+const OP_NB_RELEASE: u8 = 2;
+const OP_NB_RELAY_FRAME: u8 = 3;
+
+/// Encodes a `NetBypassRequest` into a `SmallMessage`.
+///
+/// Word layout by variant:
+/// - `RequestDirectNic`: `[nic_id]`
+/// - `Release`: `[handle]`
+/// - `RelayFrame`: `[]`
+pub fn encode_net_bypass_request(req: &NetBypassRequest) -> SmallMessage {
+    let (op, words): (u8, [u64; 1]) = match *req {
+        NetBypassRequest::RequestDirectNic { nic_id } => (OP_NB_REQUEST_DIRECT_NIC, [nic_id as u64]),
+        NetBypassRequest::Release { handle } => (OP_NB_RELEASE, [handle.0 as u64]),
+        NetBypassRequest::RelayFrame => (OP_NB_RELAY_FRAME, [0]),
+    };
+    let n = if op == OP_NB_RELAY_FRAME { 0 } else { 1 };
+    // `from_words` cannot fail here: n <= 1 <= MSG_MAX_WORDS.
+    SmallMessage::from_words(Namespace::NetBypass.label(op), &words[..n])
+        .unwrap_or_else(|_| SmallMessage::new(Namespace::NetBypass.label(op)))
+}
+
+/// Decodes a `NetBypassRequest` from a `SmallMessage`.
+pub fn decode_net_bypass_request(msg: &SmallMessage) -> Result<NetBypassRequest, DecodeError> {
+    match Namespace::from_label(msg.label) {
+        Some(Namespace::NetBypass) => {}
+        _ => return Err(DecodeError::WrongNamespace),
+    }
+    let (version, op) = label_parts(msg.label);
+    if version != PROTOCOL_VERSION {
+        return Err(DecodeError::VersionMismatch);
+    }
+    let w = msg.words();
+    match op {
+        OP_NB_REQUEST_DIRECT_NIC => {
+            if w.is_empty() {
+                return Err(DecodeError::Truncated);
+            }
+            Ok(NetBypassRequest::RequestDirectNic { nic_id: w[0] as u32 })
+        }
+        OP_NB_RELEASE => {
+            if w.is_empty() {
+                return Err(DecodeError::Truncated);
+            }
+            Ok(NetBypassRequest::Release {
+                handle: DirectNicHandle(w[0] as u32),
+            })
+        }
+        OP_NB_RELAY_FRAME => Ok(NetBypassRequest::RelayFrame),
+        _ => Err(DecodeError::UnknownOpcode),
+    }
+}
+
+// NetBypassResponse opcodes — a separate small sequence from the request
+// opcodes above, same "kept sequential-and-distinct for readability"
+// convention every other namespace here already follows.
+const OP_NBR_GRANTED: u8 = 1;
+const OP_NBR_DENIED: u8 = 2;
+const OP_NBR_RELEASED: u8 = 3;
+const OP_NBR_RELAYED: u8 = 4;
+
+/// Encodes a `NetBypassResponse` into a `SmallMessage`.
+///
+/// Word layout by variant:
+/// - `Granted`: `[handle, rx_ring_cap, tx_ring_cap, ring_len]`
+/// - `Denied`, `Released`, `Relayed`: `[]`
+pub fn encode_net_bypass_response(resp: &NetBypassResponse) -> SmallMessage {
+    let (op, words): (u8, [u64; 4]) = match *resp {
+        NetBypassResponse::Granted {
+            handle,
+            rx_ring_cap,
+            tx_ring_cap,
+            ring_len,
+        } => (
+            OP_NBR_GRANTED,
+            [handle.0 as u64, rx_ring_cap as u64, tx_ring_cap as u64, ring_len as u64],
+        ),
+        NetBypassResponse::Denied => (OP_NBR_DENIED, [0, 0, 0, 0]),
+        NetBypassResponse::Released => (OP_NBR_RELEASED, [0, 0, 0, 0]),
+        NetBypassResponse::Relayed => (OP_NBR_RELAYED, [0, 0, 0, 0]),
+    };
+    let n = if op == OP_NBR_GRANTED { 4 } else { 0 };
+    // `from_words` cannot fail here: n <= 4 <= MSG_MAX_WORDS.
+    SmallMessage::from_words(Namespace::NetBypass.label(op), &words[..n])
+        .unwrap_or_else(|_| SmallMessage::new(Namespace::NetBypass.label(op)))
+}
+
+/// Decodes a `NetBypassResponse` from a `SmallMessage`.
+pub fn decode_net_bypass_response(msg: &SmallMessage) -> Result<NetBypassResponse, DecodeError> {
+    match Namespace::from_label(msg.label) {
+        Some(Namespace::NetBypass) => {}
+        _ => return Err(DecodeError::WrongNamespace),
+    }
+    let (version, op) = label_parts(msg.label);
+    if version != PROTOCOL_VERSION {
+        return Err(DecodeError::VersionMismatch);
+    }
+    let w = msg.words();
+    match op {
+        OP_NBR_GRANTED => {
+            if w.len() < 4 {
+                return Err(DecodeError::Truncated);
+            }
+            Ok(NetBypassResponse::Granted {
+                handle: DirectNicHandle(w[0] as u32),
+                rx_ring_cap: w[1] as u32,
+                tx_ring_cap: w[2] as u32,
+                ring_len: w[3] as u32,
+            })
+        }
+        OP_NBR_DENIED => Ok(NetBypassResponse::Denied),
+        OP_NBR_RELEASED => Ok(NetBypassResponse::Released),
+        OP_NBR_RELAYED => Ok(NetBypassResponse::Relayed),
+        _ => Err(DecodeError::UnknownOpcode),
+    }
+}
+
+// SecurityRequest opcodes (low byte of the label).
+const OP_SEC_CAP_GRANT: u8 = 1;
+const OP_SEC_CAP_REVOKE: u8 = 2;
+
+/// Encodes a `SecurityRequest` into a `SmallMessage`.
+///
+/// Word layout by variant:
+/// - `CapGrant`: `[target_service, cap, rights]`
+/// - `CapRevoke`: `[cap]`
+pub fn encode_security_request(req: &SecurityRequest) -> SmallMessage {
+    let (op, words): (u8, [u64; 3]) = match *req {
+        SecurityRequest::CapGrant {
+            target_service,
+            cap,
+            rights,
+        } => (
+            OP_SEC_CAP_GRANT,
+            [target_service as u64, cap as u64, rights as u64],
+        ),
+        SecurityRequest::CapRevoke { cap } => (OP_SEC_CAP_REVOKE, [cap as u64, 0, 0]),
+    };
+    let n = if op == OP_SEC_CAP_GRANT { 3 } else { 1 };
+    // `from_words` cannot fail here: n <= 3 <= MSG_MAX_WORDS.
+    SmallMessage::from_words(Namespace::Security.label(op), &words[..n])
+        .unwrap_or_else(|_| SmallMessage::new(Namespace::Security.label(op)))
+}
+
+/// Decodes a `SecurityRequest` from a `SmallMessage`.
+pub fn decode_security_request(msg: &SmallMessage) -> Result<SecurityRequest, DecodeError> {
+    match Namespace::from_label(msg.label) {
+        Some(Namespace::Security) => {}
+        _ => return Err(DecodeError::WrongNamespace),
+    }
+    let (version, op) = label_parts(msg.label);
+    if version != PROTOCOL_VERSION {
+        return Err(DecodeError::VersionMismatch);
+    }
+    let w = msg.words();
+    match op {
+        OP_SEC_CAP_GRANT => {
+            if w.len() < 3 {
+                return Err(DecodeError::Truncated);
+            }
+            Ok(SecurityRequest::CapGrant {
+                target_service: w[0] as u32,
+                cap: w[1] as u32,
+                rights: w[2] as u32,
+            })
+        }
+        OP_SEC_CAP_REVOKE => {
+            if w.is_empty() {
+                return Err(DecodeError::Truncated);
+            }
+            Ok(SecurityRequest::CapRevoke { cap: w[0] as u32 })
+        }
+        _ => Err(DecodeError::UnknownOpcode),
+    }
+}
+
+// SecurityResponse opcodes — a separate small sequence from the request
+// opcodes above, same "kept sequential-and-distinct for readability"
+// convention every other namespace here already follows.
+const OP_SECR_GRANTED: u8 = 1;
+const OP_SECR_REVOKED: u8 = 2;
+const OP_SECR_ERROR: u8 = 3;
+
+/// Encodes a `SecurityResponse` into a `SmallMessage`.
+///
+/// Word layout by variant:
+/// - `Granted`: `[dst]`
+/// - `Revoked`: `[freed]`
+/// - `Error`: `[code]`
+pub fn encode_security_response(resp: &SecurityResponse) -> SmallMessage {
+    let (op, word): (u8, u64) = match *resp {
+        SecurityResponse::Granted { dst } => (OP_SECR_GRANTED, dst as u64),
+        SecurityResponse::Revoked { freed } => (OP_SECR_REVOKED, freed as u64),
+        SecurityResponse::Error { code } => (OP_SECR_ERROR, code as u64),
+    };
+    // `from_words` cannot fail here: 1 <= MSG_MAX_WORDS.
+    SmallMessage::from_words(Namespace::Security.label(op), &[word])
+        .unwrap_or_else(|_| SmallMessage::new(Namespace::Security.label(op)))
+}
+
+/// Decodes a `SecurityResponse` from a `SmallMessage`.
+pub fn decode_security_response(msg: &SmallMessage) -> Result<SecurityResponse, DecodeError> {
+    match Namespace::from_label(msg.label) {
+        Some(Namespace::Security) => {}
+        _ => return Err(DecodeError::WrongNamespace),
+    }
+    let (version, op) = label_parts(msg.label);
+    if version != PROTOCOL_VERSION {
+        return Err(DecodeError::VersionMismatch);
+    }
+    let w = msg.words();
+    if w.is_empty() {
+        return Err(DecodeError::Truncated);
+    }
+    match op {
+        OP_SECR_GRANTED => Ok(SecurityResponse::Granted { dst: w[0] as u32 }),
+        OP_SECR_REVOKED => Ok(SecurityResponse::Revoked { freed: w[0] as u32 }),
+        OP_SECR_ERROR => {
+            let code = match w[0] {
+                1 => SecurityErrorCode::Unsupported,
+                2 => SecurityErrorCode::UnknownService,
+                3 => SecurityErrorCode::KernelRejected,
+                _ => return Err(DecodeError::BadField),
+            };
+            Ok(SecurityResponse::Error { code })
+        }
+        _ => Err(DecodeError::UnknownOpcode),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn roundtrip(req: FsRequest) {
+        let msg = encode_fs_request(&req);
+        assert_eq!(decode_fs_request(&msg), Ok(req));
+    }
+
+    #[test]
+    fn all_variants_roundtrip() {
+        roundtrip(FsRequest::Open {
+            path: PathId(7),
+            flags: OpenFlags::READ | OpenFlags::WRITE | OpenFlags::CREATE,
+        });
+        roundtrip(FsRequest::Read {
+            handle: FileHandle(3),
+            offset: 4096,
+            len: 512,
+            shared_cap: 9,
+        });
+        roundtrip(FsRequest::Write {
+            handle: FileHandle(3),
+            offset: 0,
+            len: 128,
+            shared_cap: 10,
+        });
+        roundtrip(FsRequest::Stat { path: PathId(1) });
+        roundtrip(FsRequest::Close {
+            handle: FileHandle(3),
+        });
+        roundtrip(FsRequest::RegisterPath {
+            len: 17,
+            shared_cap: 4,
+        });
+        roundtrip(FsRequest::ListDirectory {
+            path: PathId(2),
+            start_index: 32,
+            shared_cap: 6,
+        });
+        roundtrip(FsRequest::Delete { path: PathId(5) });
+        roundtrip(FsRequest::Rename {
+            from: PathId(5),
+            to: PathId(8),
+        });
+    }
+
+    #[test]
+    fn wrong_namespace_is_rejected() {
+        let msg = SmallMessage::new(Namespace::Driver.label(1));
+        assert_eq!(
+            decode_fs_request(&msg),
+            Err(DecodeError::WrongNamespace)
+        );
+    }
+
+    #[test]
+    fn version_mismatch_is_rejected() {
+        // Hand-build a label with namespace Fs but version 0.
+        let bad_label = ((Namespace::Fs as u64) << 56) | (0u64 << 8) | OP_STAT as u64;
+        let msg = SmallMessage::from_words(bad_label, &[1]).unwrap();
+        assert_eq!(
+            decode_fs_request(&msg),
+            Err(DecodeError::VersionMismatch)
+        );
+    }
+
+    #[test]
+    fn truncated_payload_is_rejected() {
+        let mut msg = SmallMessage::new(Namespace::Fs.label(OP_READ));
+        msg.push(1).unwrap(); // only 1 word, Read needs 4
+        assert_eq!(decode_fs_request(&msg), Err(DecodeError::Truncated));
+    }
+
+    fn fs_response_roundtrip(resp: FsResponse) {
+        let msg = encode_fs_response(&resp);
+        assert_eq!(decode_fs_response(&msg), Ok(resp));
+    }
+
+    #[test]
+    fn all_fs_response_variants_roundtrip() {
+        fs_response_roundtrip(FsResponse::Opened {
+            handle: FileHandle(3),
+        });
+        fs_response_roundtrip(FsResponse::Read { bytes: 512 });
+        fs_response_roundtrip(FsResponse::Written { bytes: 128 });
+        fs_response_roundtrip(FsResponse::Stat {
+            size: 4096,
+            is_dir: false,
+        });
+        fs_response_roundtrip(FsResponse::Stat {
+            size: 0,
+            is_dir: true,
+        });
+        fs_response_roundtrip(FsResponse::Closed);
+        fs_response_roundtrip(FsResponse::PathRegistered { path: PathId(9) });
+        fs_response_roundtrip(FsResponse::Error {
+            code: FsErrorCode::NotFound,
+        });
+        fs_response_roundtrip(FsResponse::DirEntries { count: 32, more: true });
+        fs_response_roundtrip(FsResponse::DirEntries { count: 3, more: false });
+        fs_response_roundtrip(FsResponse::Deleted);
+        fs_response_roundtrip(FsResponse::Renamed);
+    }
+
+    #[test]
+    fn fs_response_wrong_namespace_is_rejected() {
+        let msg = SmallMessage::new(Namespace::Driver.label(OP_FR_OPENED));
+        assert_eq!(
+            decode_fs_response(&msg),
+            Err(DecodeError::WrongNamespace)
+        );
+    }
+
+    #[test]
+    fn fs_response_bad_field_is_rejected() {
+        let msg = SmallMessage::from_words(Namespace::Fs.label(OP_FR_ERROR), &[99]).unwrap();
+        assert_eq!(decode_fs_response(&msg), Err(DecodeError::BadField));
+    }
+
+    fn driver_request_roundtrip(req: DriverRequest) {
+        let msg = encode_driver_request(&req);
+        assert_eq!(decode_driver_request(&msg), Ok(req));
+    }
+
+    #[test]
+    fn all_driver_request_variants_roundtrip() {
+        driver_request_roundtrip(DriverRequest::Probe);
+        driver_request_roundtrip(DriverRequest::Irq { line: 5 });
+        driver_request_roundtrip(DriverRequest::ReadBlocks {
+            lba: 4096,
+            sector_count: 8,
+            shared_cap: 3,
+        });
+        driver_request_roundtrip(DriverRequest::WriteBlocks {
+            lba: 0,
+            sector_count: 1,
+            shared_cap: 9,
+        });
+        driver_request_roundtrip(DriverRequest::Quiesce);
+        driver_request_roundtrip(DriverRequest::SendFrame { len: 60 });
+        driver_request_roundtrip(DriverRequest::PollFrame);
+    }
+
+    fn driver_response_roundtrip(resp: DriverResponse) {
+        let msg = encode_driver_response(&resp);
+        assert_eq!(decode_driver_response(&msg), Ok(resp));
+    }
+
+    #[test]
+    fn all_driver_response_variants_roundtrip() {
+        driver_response_roundtrip(DriverResponse::Ready {
+            sector_size: 512,
+            sector_count: 2048,
+        });
+        driver_response_roundtrip(DriverResponse::Completed { sectors: 8 });
+        driver_response_roundtrip(DriverResponse::Failed {
+            code: DriverErrorCode::DeviceIo,
+        });
+        driver_response_roundtrip(DriverResponse::Failed {
+            code: DriverErrorCode::NoData,
+        });
+        driver_response_roundtrip(DriverResponse::Failed {
+            code: DriverErrorCode::DriverBusy,
+        });
+        driver_response_roundtrip(DriverResponse::FrameSent);
+        driver_response_roundtrip(DriverResponse::FrameReceived { len: 60 });
+    }
+
+    #[test]
+    fn driver_request_wrong_namespace_is_rejected() {
+        let msg = SmallMessage::new(Namespace::Fs.label(OP_DR_PROBE));
+        assert_eq!(
+            decode_driver_request(&msg),
+            Err(DecodeError::WrongNamespace)
+        );
+    }
+
+    #[test]
+    fn driver_response_bad_field_is_rejected() {
+        let msg = SmallMessage::from_words(Namespace::Driver.label(OP_DRR_FAILED), &[99]).unwrap();
+        assert_eq!(decode_driver_response(&msg), Err(DecodeError::BadField));
+    }
+
+    fn display_request_roundtrip(req: DisplayRequest) {
+        let msg = encode_display_request(&req);
+        assert_eq!(decode_display_request(&msg), Ok(req));
+    }
+
+    #[test]
+    fn all_display_request_variants_roundtrip() {
+        display_request_roundtrip(DisplayRequest::CreateSurface);
+        display_request_roundtrip(DisplayRequest::CommitBuffer {
+            surface: SurfaceHandle(2),
+            buffer_cap: 5,
+            width: 1920,
+            height: 1080,
+        });
+        display_request_roundtrip(DisplayRequest::DestroySurface {
+            surface: SurfaceHandle(2),
+        });
+        display_request_roundtrip(DisplayRequest::SubscribeInput);
+        display_request_roundtrip(DisplayRequest::QueryOutputs);
+        display_request_roundtrip(DisplayRequest::PollInputEvent);
+        display_request_roundtrip(DisplayRequest::PollMouseEvent);
+    }
+
+    fn display_response_roundtrip(resp: DisplayResponse) {
+        let msg = encode_display_response(&resp);
+        assert_eq!(decode_display_response(&msg), Ok(resp));
+    }
+
+    #[test]
+    fn all_display_response_variants_roundtrip() {
+        display_response_roundtrip(DisplayResponse::SurfaceCreated {
+            surface: SurfaceHandle(2),
+        });
+        display_response_roundtrip(DisplayResponse::Committed);
+        display_response_roundtrip(DisplayResponse::Destroyed);
+        display_response_roundtrip(DisplayResponse::InputSubscribed);
+        display_response_roundtrip(DisplayResponse::OutputTopology {
+            output_count: 1,
+            primary_width: 1920,
+            primary_height: 1080,
+            primary_refresh_mhz: 60000,
+        });
+        display_response_roundtrip(DisplayResponse::Error {
+            code: DisplayErrorCode::BadBuffer,
+        });
+        display_response_roundtrip(DisplayResponse::InputEvent {
+            keycode: 0x1e,
+            pressed: true,
+            extended: false,
+        });
+        display_response_roundtrip(DisplayResponse::InputEvent {
+            keycode: 0x1e,
+            pressed: false,
+            extended: false,
+        });
+        // Up Arrow: keycode 0x48, the same byte Numpad-8 (non-extended)
+        // uses on the wire — only `extended` tells them apart, so this
+        // is the real ambiguity this field exists to resolve, round-
+        // tripped through the full codec.
+        display_response_roundtrip(DisplayResponse::InputEvent {
+            keycode: 0x48,
+            pressed: true,
+            extended: true,
+        });
+        display_response_roundtrip(DisplayResponse::InputEvent {
+            keycode: 0x48,
+            pressed: false,
+            extended: true,
+        });
+        display_response_roundtrip(DisplayResponse::NoInputPending);
+        display_response_roundtrip(DisplayResponse::MouseEvent {
+            dx: 5,
+            dy: -3,
+            left: true,
+            right: false,
+            middle: true,
+        });
+        // Negative dx too — proof the u16-roundtrip sign encoding works
+        // both ways, not just for dy.
+        display_response_roundtrip(DisplayResponse::MouseEvent {
+            dx: -128,
+            dy: 0,
+            left: false,
+            right: false,
+            middle: false,
+        });
+        display_response_roundtrip(DisplayResponse::NoMouseEventPending);
+    }
+
+    #[test]
+    fn display_request_wrong_namespace_is_rejected() {
+        let msg = SmallMessage::new(Namespace::Fs.label(OP_DP_CREATE_SURFACE));
+        assert_eq!(
+            decode_display_request(&msg),
+            Err(DecodeError::WrongNamespace)
+        );
+    }
+
+    #[test]
+    fn display_response_bad_field_is_rejected() {
+        let msg = SmallMessage::from_words(Namespace::Display.label(OP_DPR_ERROR), &[99]).unwrap();
+        assert_eq!(decode_display_response(&msg), Err(DecodeError::BadField));
+    }
+
+    #[test]
+    fn display_request_truncated_payload_is_rejected() {
+        let msg = SmallMessage::new(Namespace::Display.label(OP_DP_COMMIT_BUFFER));
+        assert_eq!(
+            decode_display_request(&msg),
+            Err(DecodeError::Truncated)
+        );
+    }
+
+    fn mm_request_roundtrip(req: MmRequest) {
+        let msg = encode_mm_request(&req);
+        assert_eq!(decode_mm_request(&msg), Ok(req));
+    }
+
+    #[test]
+    fn all_mm_request_variants_roundtrip() {
+        mm_request_roundtrip(MmRequest::Register {
+            thread: 3,
+            resident_bytes: 4096,
+            class: ReclaimClass::Sacrificial,
+        });
+        mm_request_roundtrip(MmRequest::Unregister { thread: 3 });
+        mm_request_roundtrip(MmRequest::QueryVictim);
+        mm_request_roundtrip(MmRequest::QueryTotalResident);
+        mm_request_roundtrip(MmRequest::RegisterSwapRegion {
+            thread: 3,
+            region_id: 1,
+            bytes: 65536,
+            last_touched_ns: 987654321,
+        });
+        mm_request_roundtrip(MmRequest::UnregisterSwapRegion {
+            thread: 3,
+            region_id: 1,
+        });
+        mm_request_roundtrip(MmRequest::QuerySwapVictim);
+        mm_request_roundtrip(MmRequest::RegisterComputePool {
+            pool_id: 2,
+            kind: ComputeKind::Gpu,
+            capacity_bytes: 1 << 30,
+            used_bytes: 1 << 20,
+        });
+        mm_request_roundtrip(MmRequest::QueryComputePool {
+            bytes: 4096,
+            preferred_kind: Some(ComputeKind::Npu),
+        });
+        mm_request_roundtrip(MmRequest::QueryComputePool {
+            bytes: 4096,
+            preferred_kind: None,
+        });
+    }
+
+    fn mm_response_roundtrip(resp: MmResponse) {
+        let msg = encode_mm_response(&resp);
+        assert_eq!(decode_mm_response(&msg), Ok(resp));
+    }
+
+    #[test]
+    fn all_mm_response_variants_roundtrip() {
+        mm_response_roundtrip(MmResponse::Registered);
+        mm_response_roundtrip(MmResponse::Unregistered);
+        mm_response_roundtrip(MmResponse::Victim { thread: 7 });
+        mm_response_roundtrip(MmResponse::Victim { thread: u32::MAX });
+        mm_response_roundtrip(MmResponse::TotalResident { bytes: 123456 });
+        mm_response_roundtrip(MmResponse::SwapRegionRegistered);
+        mm_response_roundtrip(MmResponse::SwapRegionUnregistered);
+        mm_response_roundtrip(MmResponse::SwapVictim {
+            thread: 3,
+            region_id: 1,
+        });
+        mm_response_roundtrip(MmResponse::SwapVictim {
+            thread: u32::MAX,
+            region_id: u32::MAX,
+        });
+        mm_response_roundtrip(MmResponse::ComputePoolRegistered);
+        mm_response_roundtrip(MmResponse::ComputePoolChosen { pool_id: 2 });
+        mm_response_roundtrip(MmResponse::ComputePoolChosen { pool_id: u32::MAX });
+        mm_response_roundtrip(MmResponse::Error {
+            code: MmErrorCode::Unsupported,
+        });
+    }
+
+    #[test]
+    fn mm_request_wrong_namespace_is_rejected() {
+        let msg = SmallMessage::new(Namespace::Fs.label(OP_MM_QUERY_VICTIM));
+        assert_eq!(decode_mm_request(&msg), Err(DecodeError::WrongNamespace));
+    }
+
+    #[test]
+    fn mm_request_bad_field_is_rejected() {
+        let msg = SmallMessage::from_words(Namespace::Mm.label(OP_MM_REGISTER), &[1, 2, 99]).unwrap();
+        assert_eq!(decode_mm_request(&msg), Err(DecodeError::BadField));
+    }
+
+    #[test]
+    fn mm_response_truncated_payload_is_rejected() {
+        let msg = SmallMessage::new(Namespace::Mm.label(OP_MMR_VICTIM));
+        assert_eq!(decode_mm_response(&msg), Err(DecodeError::Truncated));
+    }
+
+    #[test]
+    fn mm_request_bad_compute_kind_is_rejected() {
+        let msg = SmallMessage::from_words(
+            Namespace::Mm.label(OP_MM_REGISTER_COMPUTE_POOL),
+            &[1, 99, 1024, 0],
+        )
+        .unwrap();
+        assert_eq!(decode_mm_request(&msg), Err(DecodeError::BadField));
+    }
+
+    #[test]
+    fn mm_request_bad_has_preference_flag_is_rejected() {
+        let msg = SmallMessage::from_words(
+            Namespace::Mm.label(OP_MM_QUERY_COMPUTE_POOL),
+            &[1024, 2, 0],
+        )
+        .unwrap();
+        assert_eq!(decode_mm_request(&msg), Err(DecodeError::BadField));
+    }
+
+    fn net_bypass_request_roundtrip(req: NetBypassRequest) {
+        let msg = encode_net_bypass_request(&req);
+        assert_eq!(decode_net_bypass_request(&msg), Ok(req));
+    }
+
+    #[test]
+    fn all_net_bypass_request_variants_roundtrip() {
+        net_bypass_request_roundtrip(NetBypassRequest::RequestDirectNic { nic_id: 0 });
+        net_bypass_request_roundtrip(NetBypassRequest::Release {
+            handle: DirectNicHandle(1),
+        });
+        net_bypass_request_roundtrip(NetBypassRequest::RelayFrame);
+    }
+
+    fn net_bypass_response_roundtrip(resp: NetBypassResponse) {
+        let msg = encode_net_bypass_response(&resp);
+        assert_eq!(decode_net_bypass_response(&msg), Ok(resp));
+    }
+
+    #[test]
+    fn all_net_bypass_response_variants_roundtrip() {
+        net_bypass_response_roundtrip(NetBypassResponse::Granted {
+            handle: DirectNicHandle(1),
+            rx_ring_cap: 2,
+            tx_ring_cap: 3,
+            ring_len: 2,
+        });
+        net_bypass_response_roundtrip(NetBypassResponse::Denied);
+        net_bypass_response_roundtrip(NetBypassResponse::Released);
+        net_bypass_response_roundtrip(NetBypassResponse::Relayed);
+    }
+
+    #[test]
+    fn net_bypass_request_wrong_namespace_is_rejected() {
+        let msg = SmallMessage::new(Namespace::Fs.label(OP_NB_REQUEST_DIRECT_NIC));
+        assert_eq!(
+            decode_net_bypass_request(&msg),
+            Err(DecodeError::WrongNamespace)
+        );
+    }
+
+    #[test]
+    fn net_bypass_response_truncated_payload_is_rejected() {
+        let msg = SmallMessage::new(Namespace::NetBypass.label(OP_NBR_GRANTED));
+        assert_eq!(
+            decode_net_bypass_response(&msg),
+            Err(DecodeError::Truncated)
+        );
+    }
+
+    fn security_request_roundtrip(req: SecurityRequest) {
+        let msg = encode_security_request(&req);
+        assert_eq!(decode_security_request(&msg), Ok(req));
+    }
+
+    #[test]
+    fn all_security_request_variants_roundtrip() {
+        security_request_roundtrip(SecurityRequest::CapGrant {
+            target_service: 7,
+            cap: 3,
+            rights: 0b0011,
+        });
+        security_request_roundtrip(SecurityRequest::CapRevoke { cap: 3 });
+    }
+
+    fn security_response_roundtrip(resp: SecurityResponse) {
+        let msg = encode_security_response(&resp);
+        assert_eq!(decode_security_response(&msg), Ok(resp));
+    }
+
+    #[test]
+    fn all_security_response_variants_roundtrip() {
+        security_response_roundtrip(SecurityResponse::Granted { dst: 9 });
+        security_response_roundtrip(SecurityResponse::Revoked { freed: 4 });
+        security_response_roundtrip(SecurityResponse::Error {
+            code: SecurityErrorCode::Unsupported,
+        });
+        security_response_roundtrip(SecurityResponse::Error {
+            code: SecurityErrorCode::UnknownService,
+        });
+        security_response_roundtrip(SecurityResponse::Error {
+            code: SecurityErrorCode::KernelRejected,
+        });
+    }
+
+    #[test]
+    fn security_request_wrong_namespace_is_rejected() {
+        let msg = SmallMessage::new(Namespace::Fs.label(OP_SEC_CAP_GRANT));
+        assert_eq!(
+            decode_security_request(&msg),
+            Err(DecodeError::WrongNamespace)
+        );
+    }
+
+    #[test]
+    fn security_request_truncated_payload_is_rejected() {
+        let msg = SmallMessage::new(Namespace::Security.label(OP_SEC_CAP_GRANT));
+        assert_eq!(
+            decode_security_request(&msg),
+            Err(DecodeError::Truncated)
+        );
+    }
+
+    #[test]
+    fn security_response_bad_field_is_rejected() {
+        let msg =
+            SmallMessage::from_words(Namespace::Security.label(OP_SECR_ERROR), &[99]).unwrap();
+        assert_eq!(decode_security_response(&msg), Err(DecodeError::BadField));
+    }
+}
